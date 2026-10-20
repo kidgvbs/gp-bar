@@ -277,3 +277,22 @@ main thread (poi, quando il frontend carica la pagina):
 **Verifica:** build release, lancio, `sample` → main thread nel run loop (`nextEvent`/`BlockUntilNextEvent`), **zero mutex**; finestra interattiva e click sinistro sul lucchetto → pannello a fuoco (conferma visiva dell'utente). Config di produzione ripristinata: `visible: false`, policy Accessory, menu attached, pin `=0.25.0` mantenuto (unica config verificata sul campo; rilassarlo a 0.25.1 è lavoro futuro), deps objc2 di test rimosse, identifier ripristinato a `dev.gpbar.app`.
 
 **Residui aperti:** hardening §8.9 (umask log connect, validazione FQDN, verifica PID→path pre-kill); rivalutare il pin `=0.25.0` ora che la causa è nota; tracciare `Cargo.lock`.
+
+---
+
+## 9. Bug connect: SAML "cannot be run as root" con gpclient 3.1.0 (risolto)
+
+**Sintomo** (20 ottobre 2026, cookie SSO scaduto): il connect dal pannello fallisce; log applicativo:
+
+```
+INFO  SAML auth launch: gateway=false, clean=false, browser=external
+WARN  Failed to connect portal with prelogin: Command { std: "/Applications/GP Connect.app/Contents/Helpers/gpauth" "gp.imm.re" "--saml-request" "…" } cannot be run as root
+```
+
+I connect precedenti riuscivano solo grazie a `--cookie-cache` (cookie valido in `/var/root/.config/gpclient/`): con il cookie scaduto emerge il path SAML browser, mai esercitato prima.
+
+**Causa** (verificata nel sorgente, clone aggiornato in `reference/`): gpclient 3.1.0 su macOS gestisce l'auth browser esterna in **tre attori**: spawna l'helper `gpauth` di GP Connect con l'HTML `SAMLRequest`, l'helper apre il browser **come utente loggato**, e il redirect `globalprotectcallback:` è gestito da "GP Connect Login.app" (`crates/auth/src/callback/macos.rs` registra `com.yuezk.gpauth` come handler dello scheme). Lo spawn passa per `CommandExt::into_non_root` (`crates/gpapi/src/process/command_traits.rs`), che risolve l'utente "reale" da `SUDO_UID`/`PKEXEC_UID`/`DOAS_USER` (`crates/gpapi/src/process/users.rs`). Il contesto `osascript … with administrator privileges` **non imposta nessuna** delle tre → `get_non_root_user()` fallisce → "cannot be run as root". `desktop_session_env::apply` su macOS è un no-op: `SUDO_UID` è l'unico tassello mancante.
+
+**Fix**: `vpn.rs::build_connect_script` prefissa il comando con `SUDO_UID=$(stat -f %u /dev/console)` — l'UID dell'utente console è la controparte esatta di ciò che `sudo` metterebbe nell'env. Test unitario aggiornato.
+
+**Nota architetturale**: con gpclient 3.1.0 l'SSO browser su macOS **dipende da GP Connect installato** (helper `gpauth` + Login.app per il callback scheme). È il comportamento upstream (`GP_AUTH_BINARY` è comunque overridabile via env). Alternativa futura: modalità webview embedded di gpclient (`browser=embedded`) — anch'essa richiede però il drop a utente non-root, quindi `SUDO_UID` resta necessario.

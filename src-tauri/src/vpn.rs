@@ -382,6 +382,13 @@ pub fn build_connect_script(
   log_path: &Path,
 ) -> String {
   let mut script = String::new();
+  // gpclient 3.1.0 runs the SAML auth helper (GP Connect's `gpauth`) as the
+  // logged-in user; when gpclient itself is root it resolves that user from
+  // SUDO_UID / PKEXEC_UID / DOAS_USER (gpapi::process::users). osascript's
+  // "with administrator privileges" sets none of them, so publish the
+  // console user's UID ourselves — without it every browser-auth connect
+  // dies with "… cannot be run as root" as soon as the SSO cookie expires.
+  script.push_str("SUDO_UID=$(stat -f %u /dev/console) ");
   script.push_str(&osascript::sh_quote(&gpclient.to_string_lossy()));
   script.push_str(" --log-format json connect ");
   script.push_str(&osascript::sh_quote(portal));
@@ -454,6 +461,7 @@ mod tests {
       Path::new("/Users/test/Library/Logs/gp-bar/gpclient-connect.log"),
     );
     assert!(script.contains("'/opt/homebrew/bin/gpclient'"));
+    assert!(script.starts_with("SUDO_UID=$(stat -f %u /dev/console) "));
     assert!(script.contains("'gp.imm.re' --browser --auto-gateway --cookie-cache"));
     assert!(script.ends_with("& echo $!"));
   }
