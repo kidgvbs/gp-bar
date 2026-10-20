@@ -130,15 +130,17 @@ async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), 
 }
 
 #[tauri::command]
-async fn cancel(state: State<'_, AppContext>) -> Result<(), String> {
+async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
   let controller = state.controller.clone();
-  // Interrupting a worker we started needs root as well, so this also shows
-  // the admin dialog. Cancel is rare; the upcoming daemon removes the prompt.
-  if let Some(pid) = controller.connected_worker_pid() {
-    if let Err(error) = vpn::run_admin_script(vpn::build_kill_script(pid)).await {
-      eprintln!("gp-bar: cancel failed: {error}");
-    }
+  // Interrupt a connecting worker by unloading the one-shot launchd job:
+  // launchd terminates it, which runs the worker's own teardown instead of
+  // a blind kill. Needs root as well, so this also shows the admin dialog.
+  if let Err(error) =
+    vpn::run_admin_script(vpn::build_cancel_script(&vpn::daemon_plist_path())).await
+  {
+    eprintln!("gp-bar: cancel failed: {error}");
   }
+  controller.connect_failed(&app, "Connection canceled".to_string());
   Ok(())
 }
 
@@ -168,24 +170,26 @@ async fn do_connect(
     .map_err(|error| format!("cannot create the log directory: {error}"))?;
   let log_path = Config::connect_log_path();
 
-  let script = vpn::build_connect_script(&gpclient, portal, reuse_cookie, &log_path);
+  // Stage the launchd job first (see build_connect_plist): the worker must
+  // be born from launchd, not from the admin shell, to stay signalable.
+  let console_user = vpn::console_user();
+  let plist =
+    vpn::build_connect_plist(&gpclient, portal, reuse_cookie, &log_path, console_user.as_ref());
+  std::fs::write(vpn::staged_plist_path(), &plist)
+    .map_err(|error| format!("cannot stage the daemon job: {error}"))?;
+  let script = vpn::build_daemon_connect_script(
+    &vpn::staged_plist_path(),
+    &vpn::daemon_plist_path(),
+    &log_path,
+  );
+
   controller.begin_connect(&app, portal.to_string());
   let _ = app.emit("vpn-log-cleared", ());
 
   match vpn::run_admin_script(script).await {
-    Ok((stdout, _stderr)) => {
-      let worker_pid = stdout.trim().parse::<u32>().ok();
-      match worker_pid {
-        Some(pid) => {
-          controller.connect_started(&app, Some(pid));
-          Ok(())
-        }
-        None => {
-          controller.connect_failed(&app, "The privileged shell did not report a worker PID".to_string());
-          Err("connect failed".to_string())
-        }
-      }
-    }
+    // No worker PID comes back from launchd; the status poller adopts the
+    // worker from the lock file once the tunnel is established.
+    Ok(_) => Ok(()),
     Err(error) => {
       controller.connect_failed(&app, error.clone());
       Err(error)
@@ -206,9 +210,14 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     .ok_or_else(|| "gpclient not found".to_string())?;
 
   controller.begin_disconnect(&app);
-  if let Err(error) = vpn::run_admin_script(vpn::build_disconnect_script(&gpclient)).await {
+  let script = vpn::build_disconnect_script(&gpclient, &vpn::daemon_plist_path());
+  if let Err(error) = vpn::run_admin_script(script).await {
     eprintln!("gp-bar: disconnect failed: {error}");
-    // The status poller reconciles the phase from the lock file either way.
+    // Fail loud, never SIGKILL: the worker may ignore the signal (see
+    // build_connect_plist) and a killed worker skips the vpnc-script
+    // teardown, leaving macOS DNS settings pointing at VPN resolvers.
+    // The poller reports the still-connected truth from the lock file.
+    controller.disconnect_failed(&app, format!("disconnect failed: {error}"));
   }
   Ok(())
 }

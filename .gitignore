@@ -5,3 +5,4 @@ src-tauri/Cargo.lock
 reference/
 .DS_Store
 *.log
+.tokensave

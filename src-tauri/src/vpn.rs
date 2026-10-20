@@ -4,19 +4,22 @@
 //! The CLI is the component with no connection time limits; this module only
 //! starts it, watches its PID lock file and tails its JSON log lines:
 //!
-//! * connect: `/usr/bin/osascript` shows the admin password dialog, then runs
-//!   `gpclient --log-format json connect <portal> --browser --auto-gateway
-//!   [--cookie-cache] > <log> 2>&1 & echo $!` as root. The shell returns the
-//!   worker PID immediately; gpclient keeps running as root under launchd.
+//! * connect: `/usr/bin/osascript` shows the admin password dialog, then
+//!   installs and loads a one-shot launchd job (`daemon_plist_path`) that
+//!   runs `gpclient --log-format json connect <portal> --browser
+//!   --auto-gateway [--cookie-cache]` as a signalable child of launchd.
+//!   It must NOT be spawned straight from the admin shell: see
+//!   `daemon_plist_path` for the signal-deafness of `authtrampoline`
+//!   children on macOS 27.
 //! * status: `/var/run/gpclient.lock` is written once the tunnel is up and
 //!   removed on disconnect (it is world-readable), so its existence plus the
 //!   liveness of the PID it contains is the source of truth.
 //! * disconnect: `gpclient disconnect` signals the worker for a graceful
-//!   teardown of the tunnel.
+//!   teardown of the tunnel, verified against the lock file.
 
 use std::{
   fs,
-  path::Path,
+  path::{Path, PathBuf},
   process::Stdio,
   sync::{Arc, Mutex},
   time::Duration,
@@ -32,8 +35,12 @@ pub const LOCK_FILE: &str = "/var/run/gpclient.lock";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TAIL_INTERVAL: Duration = Duration::from_millis(400);
 
+// No serde rename: the frontend (src/main.ts render()), the CSS
+// `[data-phase="Connected"]` selector and the tray sync listener all expect
+// the variant names verbatim ("Connected"…). A `rename_all = "snake_case"`
+// here silently broke every panel state render (the switch fell through to
+// the Disconnected default).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
 pub enum Phase {
   Disconnected,
   Connecting,
@@ -88,10 +95,6 @@ impl VpnController {
     self.inner.lock().unwrap().state.clone()
   }
 
-  pub fn connected_worker_pid(&self) -> Option<u32> {
-    self.inner.lock().unwrap().worker_pid
-  }
-
   fn update(&self, app: &AppHandle, mutate: impl FnOnce(&mut Inner)) -> VpnState {
     let state = {
       let mut inner = self.inner.lock().unwrap();
@@ -126,13 +129,6 @@ impl VpnController {
     });
   }
 
-  /// Called when the privileged shell has started (or failed to start).
-  pub fn connect_started(&self, app: &AppHandle, worker_pid: Option<u32>) {
-    self.update(app, |inner| {
-      inner.worker_pid = worker_pid;
-    });
-  }
-
   pub fn connect_failed(&self, app: &AppHandle, error: String) {
     self.update(app, |inner| {
       inner.state.phase = Phase::Error;
@@ -147,6 +143,16 @@ impl VpnController {
       if inner.state.phase == Phase::Connected {
         inner.state.phase = Phase::Disconnecting;
       }
+    });
+  }
+
+  /// The privileged teardown failed: surface the failure instead of a
+  /// stuck "Disconnecting". The poller then reports the truth from the lock
+  /// file (still connected → Connected again).
+  pub fn disconnect_failed(&self, app: &AppHandle, error: String) {
+    self.update(app, |inner| {
+      inner.state.phase = Phase::Error;
+      inner.state.last_error = Some(error);
     });
   }
 
@@ -372,47 +378,195 @@ fn parse_gateway(message: &str) -> Option<String> {
   None
 }
 
-// -- command builders ---------------------------------------------------------
+// -- privileged launchd plumbing ----------------------------------------------
 
-/// Build the privileged script that launches gpclient detached.
-pub fn build_connect_script(
+/// Where GP Bar (unprivileged) stages the launchd job before installing it.
+pub fn staged_plist_path() -> PathBuf {
+  Config::log_dir().join("gp-worker.plist")
+}
+
+/// The one-shot launchd job loaded per connect.
+///
+/// The worker must be a child of launchd, not of `authtrampoline`. On
+/// macOS 27.0.1 (26A434) the root processes spawned by osascript's
+/// `do shell script … with administrator privileges`
+/// (`AuthorizationExecuteWithPrivileges`) never act on any catchable
+/// signal — proven with a plain C probe that installs handlers and
+/// `pause()`s: as root-from-authtrampoline SIGINT and SIGTERM are silently
+/// swallowed (even SIGHUP with no handler at all), while the same probe as
+/// uid 501, and a root probe spawned by launchd, terminate cleanly.
+/// gpclient tears the tunnel down on SIGINT to the lock-file PID, so a
+/// worker born under authtrampoline can never be disconnected:
+/// `gpclient disconnect` exits 0 having done nothing and the phase sticks
+/// at "Disconnecting" forever (SIGKILL works but skips the vpnc-script
+/// teardown that restores DNS settings and routes). Hence this
+/// RunAtLoad/no-KeepAlive job outside the auto-loaded
+/// `/Library/LaunchDaemons` directory: no boot-time autostart, root-owned
+/// once installed, and only loaded when GP Bar asks launchd to run it.
+pub fn daemon_plist_path() -> PathBuf {
+  PathBuf::from("/Library/Application Support/GP Bar/gp-worker.plist")
+}
+
+/// (uid, name) of the console user, from the ownership of /dev/console.
+///
+/// gpclient 3.1.0 spawns the SAML auth helper (GP Connect's `gpauth`) via
+/// `CommandExt::into_non_root`, which resolves the real user from
+/// SUDO_UID / PKEXEC_UID / DOAS_USER (gpapi::process::users); none exist in
+/// a launchd daemon, so the pair is provided through the job's
+/// EnvironmentVariables. Without it every browser-auth connect dies with
+/// "… cannot be run as root" as soon as the SSO cookie expires.
+pub fn console_user() -> Option<(String, String)> {
+  let stat = |flag: &str| -> Option<String> {
+    std::process::Command::new("/usr/bin/stat")
+      .args(["-f", flag, "/dev/console"])
+      .output()
+      .ok()
+      .filter(|out| out.status.success())
+      .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+      .filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+  };
+  Some((stat("%u")?, stat("%Su")?))
+}
+
+/// XML-escape a value for the job plist. Portals are user input: a raw `&`
+/// or `<` would corrupt the description launchd has to parse.
+fn xml_escape(value: &str) -> String {
+  let mut escaped = String::with_capacity(value.len());
+  for ch in value.chars() {
+    match ch {
+      '&' => escaped.push_str("&amp;"),
+      '<' => escaped.push_str("&lt;"),
+      '>' => escaped.push_str("&gt;"),
+      '"' => escaped.push_str("&quot;"),
+      '\'' => escaped.push_str("&apos;"),
+      _ => escaped.push(ch),
+    }
+  }
+  escaped
+}
+
+/// The launchd job: the same gpclient connect command line GP Bar used to
+/// run through osascript, unchanged except for its parent process.
+pub fn build_connect_plist(
   gpclient: &Path,
   portal: &str,
   reuse_cookie: bool,
   log_path: &Path,
+  console_user: Option<&(String, String)>,
 ) -> String {
-  let mut script = String::new();
-  // gpclient 3.1.0 runs the SAML auth helper (GP Connect's `gpauth`) as the
-  // logged-in user; when gpclient itself is root it resolves that user from
-  // SUDO_UID / PKEXEC_UID / DOAS_USER (gpapi::process::users). osascript's
-  // "with administrator privileges" sets none of them, so publish the
-  // console user's UID ourselves — without it every browser-auth connect
-  // dies with "… cannot be run as root" as soon as the SSO cookie expires.
-  script.push_str("SUDO_UID=$(stat -f %u /dev/console) ");
-  script.push_str(&osascript::sh_quote(&gpclient.to_string_lossy()));
-  script.push_str(" --log-format json connect ");
-  script.push_str(&osascript::sh_quote(portal));
-  script.push_str(" --browser --auto-gateway");
+  let mut argv = vec![
+    gpclient.to_string_lossy().into_owned(),
+    "--log-format".to_string(),
+    "json".to_string(),
+    "connect".to_string(),
+    portal.to_string(),
+    "--browser".to_string(),
+    "--auto-gateway".to_string(),
+  ];
   if reuse_cookie {
-    script.push_str(" --cookie-cache");
+    argv.push("--cookie-cache".to_string());
   }
-  script.push_str(" > ");
-  script.push_str(&osascript::sh_quote(&log_path.to_string_lossy()));
-  script.push_str(" 2>&1 & echo $!");
-  script
-}
+  let arguments = argv
+    .iter()
+    .map(|arg| format!("<string>{}</string>", xml_escape(arg)))
+    .collect::<Vec<_>>()
+    .join("");
 
-/// Build the privileged script that tears the tunnel down.
-pub fn build_disconnect_script(gpclient: &Path) -> String {
+  // HOME keeps the root worker's cookie cache where the AEWP worker kept
+  // it (/var/root/.config/gpclient) so --cookie-cache stays useful; the
+  // SUDO_* pair feeds gpclient's auth-helper privilege drop.
+  let mut environment = String::from(
+    "<key>HOME</key><string>/var/root</string>\
+     <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
+  );
+  if let Some((uid, name)) = console_user {
+    environment.push_str(&format!(
+      "<key>SUDO_UID</key><string>{}</string>\
+       <key>SUDO_USER</key><string>{}</string>",
+      xml_escape(uid),
+      xml_escape(name)
+    ));
+  }
+
+  let log_file = xml_escape(&log_path.to_string_lossy());
   format!(
-    "{} disconnect",
-    osascript::sh_quote(&gpclient.to_string_lossy())
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+     <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\
+     <plist version=\"1.0\"><dict>\
+     <key>Label</key><string>dev.gpbar.worker</string>\
+     <key>ProgramArguments</key><array>{arguments}</array>\
+     <key>EnvironmentVariables</key><dict>{environment}</dict>\
+     <key>StandardOutPath</key><string>{log_file}</string>\
+     <key>StandardErrorPath</key><string>{log_file}</string>\
+     <key>RunAtLoad</key><true/>\
+     </dict></plist>"
   )
 }
 
-/// Build the privileged script that interrupts a connecting worker.
-pub fn build_kill_script(pid: u32) -> String {
-  format!("kill -INT {pid}")
+/// Install the staged job and ask launchd to run it. One admin prompt.
+///
+/// `install` makes the job root-owned so launchd accepts it; the leading
+/// `unload` makes the load idempotent and recovers from a worker that
+/// exited outside GP Bar. NOTE: the staged file is written by the
+/// unprivileged app and installed by root, so there is a local TOCTOU
+/// window — only relevant on multi-user machines with hostile locals.
+pub fn build_daemon_connect_script(staged: &Path, plist_path: &Path, log_path: &Path) -> String {
+  let mut script = String::new();
+  // `install` does not create parent directories; the support dir is ours.
+  script.push_str("mkdir -p ");
+  script.push_str(&osascript::sh_quote(
+    &plist_path
+      .parent()
+      .unwrap_or_else(|| Path::new("/"))
+      .to_string_lossy(),
+  ));
+  script.push_str("; install -m 0644 -o root -g wheel ");
+  script.push_str(&osascript::sh_quote(&staged.to_string_lossy()));
+  script.push(' ');
+  script.push_str(&osascript::sh_quote(&plist_path.to_string_lossy()));
+  // Truncate the connect log: the tailer rewinds on shrink, this keeps a
+  // single source of truth for "new attempt".
+  script.push_str("; : > ");
+  script.push_str(&osascript::sh_quote(&log_path.to_string_lossy()));
+  script.push_str("; launchctl unload -w ");
+  script.push_str(&osascript::sh_quote(&plist_path.to_string_lossy()));
+  script.push_str(" 2>/dev/null; launchctl load -w ");
+  script.push_str(&osascript::sh_quote(&plist_path.to_string_lossy()));
+  script
+}
+
+/// Tear the tunnel down, and fail loudly if the worker does not stop.
+///
+/// `gpclient disconnect` signals the lock-file PID with SIGINT and exits 0
+/// whether or not the signal was acted on (gpapi swallows the delivery
+/// error), so the script polls the lock file for the worker's own cleanup
+/// instead of trusting the exit code. A non-zero exit surfaces the failure
+/// rather than leaving the panel stuck at "Disconnecting". The SIGKILL path
+/// is deliberately absent: a killed worker skips the vpnc-script teardown
+/// and leaves the macOS DNS settings pointing at VPN resolvers.
+pub fn build_disconnect_script(gpclient: &Path, plist_path: &Path) -> String {
+  let mut script = String::new();
+  script.push_str(&osascript::sh_quote(&gpclient.to_string_lossy()));
+  script.push_str(" disconnect; i=0; while [ $i -lt 20 ] && [ -e ");
+  script.push_str(LOCK_FILE);
+  script.push_str(" ]; do sleep 0.5; i=$((i+1)); done; ");
+  script.push_str("if [ -e ");
+  script.push_str(LOCK_FILE);
+  script.push_str(" ]; then echo 'the VPN worker did not stop' >&2; exit 1; fi; ");
+  script.push_str("launchctl unload -w ");
+  script.push_str(&osascript::sh_quote(&plist_path.to_string_lossy()));
+  script.push_str(" 2>/dev/null");
+  script
+}
+
+/// Interrupt a connecting worker: unloading the one-shot launchd job makes
+/// launchd terminate it, which runs the worker's own teardown instead of a
+/// blind kill.
+pub fn build_cancel_script(plist_path: &Path) -> String {
+  format!(
+    "launchctl unload -w {} 2>/dev/null",
+    osascript::sh_quote(&plist_path.to_string_lossy())
+  )
 }
 
 /// Run the admin script off-thread and return (stdout, stderr, exit_ok).
@@ -453,23 +607,53 @@ mod tests {
   use super::*;
 
   #[test]
-  fn connect_script_quotes_paths_and_arguments() {
-    let script = build_connect_script(
+  fn connect_plist_escapes_xml_and_keeps_arguments() {
+    let console = Some(("501".to_string(), "gab&riele".to_string()));
+    let plist = build_connect_plist(
       Path::new("/opt/homebrew/bin/gpclient"),
-      "gp.imm.re",
+      "gp.imm.re?a=1&b=2",
       true,
       Path::new("/Users/test/Library/Logs/gp-bar/gpclient-connect.log"),
+      console.as_ref(),
     );
-    assert!(script.contains("'/opt/homebrew/bin/gpclient'"));
-    assert!(script.starts_with("SUDO_UID=$(stat -f %u /dev/console) "));
-    assert!(script.contains("'gp.imm.re' --browser --auto-gateway --cookie-cache"));
-    assert!(script.ends_with("& echo $!"));
+    assert!(plist.contains("<string>/opt/homebrew/bin/gpclient</string>"));
+    assert!(plist.contains("<string>gp.imm.re?a=1&amp;b=2</string>"));
+    assert!(plist
+      .contains("<string>--auto-gateway</string><string>--cookie-cache</string>"));
+    assert!(plist.contains("<key>SUDO_UID</key><string>501</string>"));
+    assert!(plist.contains("<key>SUDO_USER</key><string>gab&amp;riele</string>"));
+    assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+    // Standard{Out,Error}Path carry the log the tailer follows.
+    assert!(plist.contains("<key>StandardOutPath</key>"));
   }
 
   #[test]
-  fn connect_script_without_cookie_cache() {
-    let script = build_connect_script(Path::new("/gpclient"), "p.example.com", false, Path::new("/log"));
-    assert!(!script.contains("--cookie-cache"));
+  fn connect_plist_without_cookie_cache_or_console_user() {
+    let plist =
+      build_connect_plist(Path::new("/gpclient"), "p.example.com", false, Path::new("/log"), None);
+    assert!(!plist.contains("--cookie-cache"));
+    assert!(!plist.contains("SUDO_UID"));
+  }
+
+  #[test]
+  fn daemon_connect_script_installs_and_loads() {
+    let script = build_daemon_connect_script(
+      Path::new("/Users/test/Library/Logs/gp-bar/gp-worker.plist"),
+      &daemon_plist_path(),
+      Path::new("/Users/test/Library/Logs/gp-bar/gpclient-connect.log"),
+    );
+    assert!(script.starts_with("mkdir -p '/Library/Application Support/GP Bar'; "));
+    assert!(script.contains("install -m 0644 -o root -g wheel "));
+    assert!(script.ends_with("launchctl load -w '/Library/Application Support/GP Bar/gp-worker.plist'"));
+  }
+
+  #[test]
+  fn disconnect_script_waits_for_the_lock_and_fails_loud() {
+    let script = build_disconnect_script(Path::new("/opt/homebrew/bin/gpclient"), &daemon_plist_path());
+    assert!(script.starts_with("'/opt/homebrew/bin/gpclient' disconnect; "));
+    assert!(script.contains("exit 1"));
+    assert!(script
+      .ends_with("launchctl unload -w '/Library/Application Support/GP Bar/gp-worker.plist' 2>/dev/null"));
   }
 
   #[test]

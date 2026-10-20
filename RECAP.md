@@ -296,3 +296,33 @@ I connect precedenti riuscivano solo grazie a `--cookie-cache` (cookie valido in
 **Fix**: `vpn.rs::build_connect_script` prefissa il comando con `SUDO_UID=$(stat -f %u /dev/console)` — l'UID dell'utente console è la controparte esatta di ciò che `sudo` metterebbe nell'env. Test unitario aggiornato.
 
 **Nota architetturale**: con gpclient 3.1.0 l'SSO browser su macOS **dipende da GP Connect installato** (helper `gpauth` + Login.app per il callback scheme). È il comportamento upstream (`GP_AUTH_BINARY` è comunque overridabile via env). Alternativa futura: modalità webview embedded di gpclient (`browser=embedded`) — anch'essa richiede però il drop a utente non-root, quindi `SUDO_UID` resta necessario.
+
+---
+
+## 10. Bug disconnect: "Disconnecting" per sempre — root figli di authtrampoline non ricevono segnali (risolto via launchd)
+
+**Sintomo**: Disconnect dal pannello → fase "Disconnecting" congelata, tunnel attivo, nessun errore nel log. Stesso identico comportamento nella GUI di GP Connect contro i worker avviati da GP Bar.
+
+**Cosa NON era** (tutto falsificato empiricamente):
+- Non era `gpclient disconnect`: SIGINT via sysinfo esce 0 anche a vuoto, ma `sudo kill -INT <pid>` come root non aveva **nessun** effetto.
+- Non era l'orfanizzazione (PPID 1): sonda root con parent vivo → ancora sorda (test B2).
+- Non era la sessione: sonda con `setsid` → ancora sorda (test C).
+- Non era il runtime tokio del worker (sample: driver su kevent, pompa su `__select`, ping nel tunnel ok) — e il problema si riproduceva identico con una sonda C di 20 righe senza tokio.
+- Non era il mittente: anche il `sudo kill` dell'utente da Terminal non aveva effetto.
+
+**Causa** (matrice di esperimenti con sonda C `sigtest.c` + `kinfo_proc` via `sysctl`):
+
+| Contesto di nascita | uid | Ascolta i segnali? |
+|---|---|---|
+| shell utente | 501 | ✅ |
+| authtrampoline/AEWP (osascript admin) | 501 | ✅ |
+| **authtrampoline/AEWP** | **root** | ❌ sordo (INT/TERM/HUP; solo KILL) |
+| **launchd (LaunchDaemon)** | **root** | ✅ |
+
+Su macOS 27.0.1 (26A434) beta, i processi **root generati da `AuthorizationExecuteWithPrivileges`** (il trampoline di `osascript … with administrator privileges`) non agiscono su nessun segnale catturabile: le disposition dicono "caught" (`kinfo_proc.p_sigcatch`), il `kill` ritorna 0, ma l'handler non viene mai eseguito — perfino un SIGHUP a disposition default non termina il processo. Ogni worker VPN nato in quel contesto è **indisconnettabile** per chiunque (GP Bar, GP Connect GUI, sudo manuale). Il fallback SIGKILL funziona ma **bypassa il teardown del vpnc-script**, lasciando le impostazioni DNS di macOS puntate sui resolver VPN e le rotte iniettate — rete rotta.
+
+**Fix** (commit): GP Bar non fa più nascere il worker da AEWP. Il connect installa e carica un **job launchd one-shot** (`/Library/Application Support/GP Bar/gp-worker.plist`, `RunAtLoad`, no KeepAlive, fuori da `/Library/LaunchDaemons` → niente autostart al boot): il worker nasce figlio di launchd, root e **signalable**. `SUDO_UID`/`SUDO_USER` dell'utente console passati via `EnvironmentVariables` del job (per il drop dell'helper SAML, vedi §9). Il disconnect è fail-loud: `gpclient disconnect` + polling del lock file (max 10s) + `exit 1` se il worker non scende; **nessun SIGKILL automatico** per design. Nota: `install` non crea le directory padre — serve `mkdir -p`.
+
+**Verifica end-to-end**: giro completo da GP Bar — disconnect del worker CLI-born ✓, connect via launchd ✓ (job `dev.gpbar.worker`, worker session leader), disconnect del worker launchd-born ✓ (DNS ripristinati dal vpnc-script, lock rimosso, fase Disconnected).
+
+**Residui**: (a) la sordità AEWP-root è un difetto della beta macOS da segnalare ad Apple (FB); (b) TOCTOU locale sul file staged prima dell'`install` root (rilevante solo su macchine multi-utente ostili); (c) il log connect resta root-owned (umask) — vedi §8.9; (d) `Cargo.lock` ancora ignorato.
