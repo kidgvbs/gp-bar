@@ -5,7 +5,7 @@
 //! none of the proprietary GUI licensing machinery: connections last as long
 //! as the portal allows, with no client-side time limit.
 
-#![cfg_attr(not(debug_assertions), tauri::windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
 mod icons;
