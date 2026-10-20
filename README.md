@@ -48,13 +48,36 @@ npm run tauri build     # produces src-tauri/target/release/bundle/macos/GP Bar.
 Drag `GP Bar.app` into `/Applications` and launch it; its icon appears in the
 menu bar.
 
+## Usage
+
+The padlock lives in the menu bar:
+
+* **Left click** — open the GP Bar panel: VPN status, connect/disconnect,
+  live gateway log, portal picker.
+* **Right click** — open the tray menu: Connect / Disconnect / Quit.
+
 ## Development
 
 ```sh
 npm run tauri dev   # vite + cargo debug run
-cargo test          # unit tests (shell escaping, log parsing, icons)
-npm run icons       # regenerate src-tauri/icons/* (drawn in scripts/gen-app-icon.mjs)
+cargo test           # unit tests (shell escaping, log parsing, icons)
+npm run icons        # regenerate src-tauri/icons/* (drawn in scripts/gen-app-icon.mjs)
+npm run tauri build # release bundle
 ```
+
+The release bundle comes out linker-signed with a derived identifier that
+does not match the bundle id — re-align it after every build:
+
+```sh
+codesign --force --sign - --identifier dev.gpbar.app \
+  "src-tauri/target/release/bundle/macos/GP Bar.app"
+```
+
+`tray-icon` is pinned to `=0.25.0` as the configuration verified on this
+machine. (The early "menu attach" theories about the macOS 27 beta turned out
+to be red herrings — the app was frozen by a poller deadlock, since fixed in
+`vpn.rs`; see `RECAP.md` §8.12. The pin stays only until 0.25.1 is explicitly
+re-verified.)
 
 ## Configuration
 

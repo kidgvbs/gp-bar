@@ -12,18 +12,26 @@ mod icons;
 mod osascript;
 mod vpn;
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use tauri::{
+use tauri::{AppHandle, Emitter, Listener, Manager, PhysicalPosition, State, WindowEvent};
+use tray_icon::{
   menu::{Menu, MenuItem, PredefinedMenuItem},
-  tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-  AppHandle, Emitter, Listener, Manager, PhysicalPosition, State, WindowEvent,
+  Icon, TrayIcon, TrayIconBuilder,
 };
 
 use config::Config;
 use vpn::{Phase, VpnController, VpnState};
 
 const TRAY_ID: &str = "gp-bar";
+
+// tray-icon and muda handles are `Rc`-based and single-threaded: they are
+// created on the main thread in `setup` and kept alive here for the whole
+// lifetime of the app.
+thread_local! {
+  static TRAY: RefCell<Option<(TrayIcon, Menu)>> = const { RefCell::new(None) };
+}
 
 struct AppContext {
   controller: Arc<VpnController>,
@@ -207,28 +215,25 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
 
 // -- panel window ---------------------------------------------------------------
 
-fn toggle_panel(app: &AppHandle, tray_rect: Option<tauri::Rect>) {
+fn show_panel(app: &AppHandle) {
   let Some(window) = app.get_webview_window("main") else {
     return;
   };
 
-  if window.is_visible().unwrap_or(false) {
-    let _ = window.hide();
-    return;
-  }
-
-  if let Some(rect) = tray_rect {
-    if let Ok(size) = window.outer_size() {
-      // The tray rect carries Position/Size enums; resolve both to physical
-      // pixels using this window's scale factor (a physical value passes
-      // through to_physical unchanged).
-      let scale = window.scale_factor().unwrap_or(2.0);
-      let pos: tauri::PhysicalPosition<i32> = rect.position.to_physical(scale);
-      let rect_size: tauri::PhysicalSize<u32> = rect.size.to_physical(scale);
-      let x = (pos.x as f64 + rect_size.width as f64 / 2.0 - size.width as f64 / 2.0).max(0.0);
-      let y = pos.y as f64 + rect_size.height as f64 + 6.0;
-      let position: tauri::PhysicalPosition<i32> = PhysicalPosition::new(x as i32, y as i32);
-      let _ = window.set_position(position);
+  // Anchor the panel just below the menu bar. Opened from a tray click the
+  // cursor sits on the icon itself (menu-bar height); opened from the menu
+  // it sits a few items further down. Either way it approximates the icon.
+  if let Ok(size) = window.outer_size() {
+    if let Ok(cursor) = window.cursor_position() {
+      let mut x = (cursor.x - size.width as f64 / 2.0).max(0.0);
+      // Keep the panel on the screen that holds the cursor.
+      if let Ok(Some(monitor)) = app.monitor_from_point(cursor.x, cursor.y) {
+        let max_x =
+          monitor.position().x as f64 + monitor.size().width as f64 - size.width as f64;
+        x = x.min(max_x.max(0.0));
+      }
+      let y = (cursor.y + 18.0).max(32.0);
+      let _ = window.set_position(PhysicalPosition::new(x as i32, y as i32));
     }
   }
 
@@ -236,22 +241,28 @@ fn toggle_panel(app: &AppHandle, tray_rect: Option<tauri::Rect>) {
   let _ = window.set_focus();
 }
 
-fn sync_tray_with_state(app: &AppHandle) {
-  let Some(state) = app.try_state::<AppContext>() else { return };
-  let phase = state.controller.snapshot().phase;
-  let Some(tray) = app.tray_by_id(TRAY_ID) else { return };
-
-  let connected = phase == Phase::Connected;
-  let _ = tray.set_icon(Some(icons::padlock_icon(connected)));
-  let _ = tray.set_icon_as_template(true);
-  let tooltip = match phase {
-    Phase::Connected => "GP Bar — Connected",
-    Phase::Connecting => "GP Bar — Connecting…",
-    Phase::Disconnecting => "GP Bar — Disconnecting…",
-    Phase::Error => "GP Bar — Error",
-    Phase::Disconnected => "GP Bar — Disconnected",
-  };
-  let _ = tray.set_tooltip(Some(tooltip));
+fn sync_tray_with_state(app: &AppHandle, phase: Phase) {
+  // tray-icon handles are main-thread only, and vpn-state events are emitted
+  // from the status poller's worker task, so hop to the main thread.
+  let _ = app.run_on_main_thread(move || {
+    let connected = phase == Phase::Connected;
+    let tooltip = match phase {
+      Phase::Connected => "GP Bar — Connected",
+      Phase::Connecting => "GP Bar — Connecting…",
+      Phase::Disconnecting => "GP Bar — Disconnecting…",
+      Phase::Error => "GP Bar — Error",
+      Phase::Disconnected => "GP Bar — Disconnected",
+    };
+    let image = icons::padlock_icon(connected);
+    TRAY.with(|slot| {
+      let guard = slot.borrow();
+      let Some((tray, _menu)) = guard.as_ref() else { return };
+      if let Ok(icon) = Icon::from_rgba(image.rgba().to_vec(), image.width(), image.height()) {
+        let _ = tray.set_icon_with_as_template(Some(icon), true);
+      }
+      let _ = tray.set_tooltip(Some(tooltip));
+    });
+  });
 }
 
 // -- entry ------------------------------------------------------------------------
@@ -266,6 +277,39 @@ fn main() {
       controller: controller.clone(),
       config: Mutex::new(Config::load()),
     })
+    // Menu selections. On macOS the tray menu is presented by AppKit itself
+    // (see `setup`), but its items still surface here through muda.
+    .on_menu_event(|app, event| match event.id.as_ref() {
+      "show" => show_panel(app),
+      "connect" => {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+          let state = app.state::<AppContext>();
+          let (portal, reuse) = {
+            let cfg = state.config.lock().unwrap();
+            (cfg.selected.clone(), cfg.reuse_cookie)
+          };
+          if let Some(portal) = portal {
+            if let Err(error) = do_connect(app.clone(), &state, &portal, reuse).await {
+              eprintln!("gp-bar: tray connect failed: {error}");
+            }
+          }
+        });
+      }
+      "disconnect" => {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+          let state = app.state::<AppContext>();
+          if let Err(error) = do_disconnect(app.clone(), &state).await {
+            eprintln!("gp-bar: tray disconnect failed: {error}");
+          }
+        });
+      }
+      "quit" => {
+        app.exit(0);
+      }
+      _ => {}
+    })
     .on_window_event(|window, event| {
       // Popover behaviour: dismiss the panel when it loses focus.
       if let WindowEvent::Focused(false) = event {
@@ -274,83 +318,72 @@ fn main() {
     })
     .setup(move |app| {
       // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
-      #[cfg(target_os = "macos")]
       let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-      let show_item = MenuItem::with_id(app, "show", "Show GP Bar", true, None::<&str>)?;
-      let connect_item = MenuItem::with_id(app, "connect", "Connect to selected portal", true, None::<&str>)?;
-      let disconnect_item = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
-      let quit_item = MenuItem::with_id(app, "quit", "Quit GP Bar", true, None::<&str>)?;
-      let menu = Menu::with_items(
-        app,
-        &[
-          &show_item,
-          &PredefinedMenuItem::separator(app)?,
-          &connect_item,
-          &disconnect_item,
-          &PredefinedMenuItem::separator(app)?,
-          &quit_item,
-        ],
-      )?;
+      let show_item = MenuItem::with_id("show", "Show GP Bar", true, None);
+      let connect_item = MenuItem::with_id("connect", "Connect to selected portal", true, None);
+      let disconnect_item = MenuItem::with_id("disconnect", "Disconnect", true, None);
+      let quit_item = MenuItem::with_id("quit", "Quit GP Bar", true, None);
+      let menu = Menu::with_items(&[
+        &show_item,
+        &PredefinedMenuItem::separator(),
+        &connect_item,
+        &disconnect_item,
+        &PredefinedMenuItem::separator(),
+        &quit_item,
+      ])?;
 
-      let _tray = TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icons::padlock_icon(false))
-        .icon_as_template(true)
-        .tooltip("GP Bar")
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-          "show" => toggle_panel(app, None),
-          "connect" => {
-            let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-              let state = app.state::<AppContext>();
-              let (portal, reuse) = {
-                let cfg = state.config.lock().unwrap();
-                (cfg.selected.clone(), cfg.reuse_cookie)
-              };
-              if let Some(portal) = portal {
-                if let Err(error) = do_connect(app.clone(), &state, &portal, reuse).await {
-                  eprintln!("gp-bar: tray connect failed: {error}");
-                }
-              }
-            });
-          }
-          "disconnect" => {
-            let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-              let state = app.state::<AppContext>();
-              if let Err(error) = do_disconnect(app.clone(), &state).await {
-                eprintln!("gp-bar: tray disconnect failed: {error}");
-              }
-            });
-          }
-          "quit" => {
-            app.exit(0);
-          }
-          _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-          if let TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            rect,
+      let image = icons::padlock_icon(false);
+      let icon = Icon::from_rgba(image.rgba().to_vec(), image.width(), image.height())
+        .map_err(|error| format!("invalid tray icon: {error}"))?;
+
+      // Tray created directly (not through tauri::tray), pinned to 0.25.0 —
+      // the configuration empirically verified on this machine. The early
+      // "menu attach" theories around macOS 27 beta were red herrings: the
+      // tray had always worked, but the app was frozen by a poller deadlock
+      // (see vpn::update). With menu-on-left-click off, a left click
+      // surfaces as a raw event in the handler below and opens the panel;
+      // a right click lets tray-icon present the native menu.
+      let tray = TrayIconBuilder::new()
+        .with_id(TRAY_ID)
+        .with_icon(icon)
+        .with_icon_as_template(true)
+        .with_tooltip("GP Bar")
+        .with_menu(Box::new(menu.clone()))
+        .with_menu_on_left_click(false)
+        .build()?;
+
+      // Keep the tray and menu handles alive for the lifetime of the app.
+      TRAY.with(|slot| *slot.borrow_mut() = Some((tray, menu)));
+
+      // This handler replaces tauri's global TrayIconEvent dispatcher (the
+      // app no longer keeps a tauri tray of its own), so raw tray events
+      // surface here directly. One click on the padlock opens the panel —
+      // the same interaction model as GP Connect.
+      let click_handle = app.handle().clone();
+      tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+        match event {
+          tray_icon::TrayIconEvent::Click {
+            button: tray_icon::MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
             ..
-          } = event
-          {
-            let app = tray.app_handle().clone();
-            toggle_panel(&app, Some(rect));
-          }
-        })
-        .build(app)?;
+          } => show_panel(&click_handle),
+          _ => {}
+        }
+      }));
 
       vpn::spawn_status_poller(app.handle().clone(), poller_controller);
       vpn::spawn_log_tailer(app.handle().clone(), tailer_controller);
 
-      // Reflect state transitions onto the tray icon and tooltip.
+      // Reflect state transitions onto the tray icon and tooltip. Read the
+      // phase from the event payload instead of calling `snapshot()`:
+      // listeners run synchronously on the emitting thread, and re-locking
+      // the controller here deadlocked the poller (see vpn::update).
       let icon_handle = app.handle().clone();
-      app.listen_any("vpn-state", move |_event| {
-        sync_tray_with_state(&icon_handle);
+      app.listen_any("vpn-state", move |event| {
+        if let Ok(state) = serde_json::from_str::<VpnState>(event.payload()) {
+          sync_tray_with_state(&icon_handle, state.phase);
+        }
       });
 
       Ok(())

@@ -22,7 +22,7 @@ use std::{
   time::Duration,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tauri::{AppHandle, Emitter};
 
@@ -32,7 +32,7 @@ pub const LOCK_FILE: &str = "/var/run/gpclient.lock";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TAIL_INTERVAL: Duration = Duration::from_millis(400);
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
   Disconnected,
@@ -42,7 +42,7 @@ pub enum Phase {
   Error,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VpnState {
   pub phase: Phase,
   pub portal: Option<String>,
@@ -93,9 +93,23 @@ impl VpnController {
   }
 
   fn update(&self, app: &AppHandle, mutate: impl FnOnce(&mut Inner)) -> VpnState {
-    let mut inner = self.inner.lock().unwrap();
-    mutate(&mut inner);
-    let state = inner.state.clone();
+    let state = {
+      let mut inner = self.inner.lock().unwrap();
+      let before = inner.state.clone();
+      mutate(&mut inner);
+      if inner.state == before {
+        // Nothing observable changed (e.g. a poll tick with the same
+        // phase): skip the event instead of waking every listener.
+        return before;
+      }
+      inner.state.clone()
+      // The guard is dropped here, BEFORE emitting. `Emitter::emit` runs
+      // Rust listeners synchronously on this thread; emitting while still
+      // holding the guard self-deadlocked the poller the moment any
+      // listener read the state back through `snapshot()`, freezing the
+      // main thread on its next `get_state` and stalling the whole
+      // NSApplication run loop (dead tray, dead window).
+    };
     let _ = app.emit("vpn-state", &state);
     state
   }
