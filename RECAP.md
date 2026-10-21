@@ -326,3 +326,34 @@ Su macOS 27.0.1 (26A434) beta, i processi **root generati da `AuthorizationExecu
 **Verifica end-to-end**: giro completo da GP Bar — disconnect del worker CLI-born ✓, connect via launchd ✓ (job `dev.gpbar.worker`, worker session leader), disconnect del worker launchd-born ✓ (DNS ripristinati dal vpnc-script, lock rimosso, fase Disconnected).
 
 **Residui**: (a) la sordità AEWP-root è un difetto della beta macOS da segnalare ad Apple (FB); (b) TOCTOU locale sul file staged prima dell'`install` root (rilevante solo su macchine multi-utente ostili); (c) il log connect resta root-owned (umask) — vedi §8.9; (d) `Cargo.lock` ancora ignorato.
+
+---
+
+## 11. Elevazione admin senza prompt: perché sudo -A non basta, e le due soluzioni in campo (21 ottobre 2026)
+
+**Obiettivo**: zero prompt su connect/disconnect. Le tre soluzioni candidate, con esiti empirici:
+
+### Matrice pam_tid / `-A` (soluzione 2, chiusa)
+
+| Contesto | Prompt | Touch ID? |
+|---|---|---|
+| Terminal: `sudo <cmd>` | password | ✅ sì (`pam_tid` via `/etc/pam.d/sudo_local`) |
+| Terminal: `sudo -A <cmd>` (askpass) | dialog password | ❌ no |
+| App/pty + `sudo -A` | dialog password | ❌ no |
+
+Il flag `-A`/askpass **sopprime il modulo biometrico** (la conversazione askpass bypassa `pam_tid`): nessuna via askpass potrà mai dare Touch ID. Lo anticipava la nota del doc utente; verificato empiricamente su questo seed. La password sarebbe comunque gestita dal nostro processo — da evitare.
+
+### Soluzione 3 (scelta per `main`): wrapper root-owned + sudoers NOPASSWD
+
+- `/usr/local/lib/gp-bar/admin`: wrapper shell root-owned 0755, **operazioni fisse** (`selftest|start <portal> <0|1>|stop|cancel`), argomenti validati internamente (charset portale `[A-Za-z0-9._-]`, flag 0|1), **nessun path dal caller** (sarebbe privesc), plist del job launchd **generato internamente** (chiude il residuo TOCTOU §10(b)).
+- `/etc/sudoers.d/gp-bar`: `<utente> ALL=(root) NOPASSWD: /usr/local/lib/gp-bar/admin` — solo quel path. L'app usa `sudo -n`: nessun prompt, nessuna credenziale nel processo, fallimento mappato in istruzioni di setup una-tantum.
+- Installazione: `sudo bash "<bundle>/Contents/Resources/scripts/setup-admin.sh"` (in Terminal, dove Touch ID funziona) — idempotente, selftest end-to-end incluso.
+- Rischio residuo accettato e documentato: qualunque processo utente può attivare/disattivare la VPN, nulla di più.
+
+### Soluzione 1 (in test su branch `solution-1-smappservice`)
+
+SMAppService daemon + XPC (via `objc2-service-management` 0.3.2 + bindiggi `xpc_*` raw, validate in un probe compilato). Sviluppata su worktree `~/Rust/gp-bar-solution1` da un sub-agent, da collaudare separatamente prima di eventualmente promuoverla.
+
+### Bug del pulsante Connect (risolto, commit 15bbed7)
+
+`state.portal` nasceva `None` e solo `begin_connect` lo impostava; il menu nativo del tray (rimosso in 707cc8a) era l'unica path che lo seedava da `config.selected`. Risultato: app appena avviata → Connect disabilitato per sempre, segnalato "bloccato dopo il primo disconnect". Fix: `note_selected_portal`/`apply_selected_portal` (solo fasi idle Disconnected/Error), chiamati da setup e add/remove/select portal.
