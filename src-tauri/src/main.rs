@@ -70,7 +70,7 @@ struct VersionInfo {
 }
 
 #[tauri::command]
-fn add_portal(state: State<'_, AppContext>, portal: String) -> Result<(), String> {
+fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
   let portal = portal.trim().to_string();
   if portal.is_empty() {
     return Err("Portal is empty".to_string());
@@ -78,33 +78,48 @@ fn add_portal(state: State<'_, AppContext>, portal: String) -> Result<(), String
   if !portal.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
     return Err("Portal may only contain letters, digits, dots, dashes and underscores".to_string());
   }
-  let mut cfg = state.config.lock().unwrap();
-  if !cfg.portals.contains(&portal) {
-    cfg.portals.push(portal.clone());
-  }
-  if cfg.selected.is_none() {
-    cfg.selected = Some(portal);
-  }
-  cfg.save()
+  let selected = {
+    let mut cfg = state.config.lock().unwrap();
+    if !cfg.portals.contains(&portal) {
+      cfg.portals.push(portal.clone());
+    }
+    if cfg.selected.is_none() {
+      cfg.selected = Some(portal);
+    }
+    cfg.save()?;
+    cfg.selected.clone()
+  };
+  state.controller.note_selected_portal(&app, selected);
+  Ok(())
 }
 
 #[tauri::command]
-fn remove_portal(state: State<'_, AppContext>, portal: String) -> Result<(), String> {
-  let mut cfg = state.config.lock().unwrap();
-  cfg.portals.retain(|p| p != &portal);
-  if cfg.selected.as_deref() == Some(portal.as_str()) {
-    cfg.selected = cfg.portals.first().cloned();
-  }
-  cfg.save()
+fn remove_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
+  let selected = {
+    let mut cfg = state.config.lock().unwrap();
+    cfg.portals.retain(|p| p != &portal);
+    if cfg.selected.as_deref() == Some(portal.as_str()) {
+      cfg.selected = cfg.portals.first().cloned();
+    }
+    cfg.save()?;
+    cfg.selected.clone()
+  };
+  state.controller.note_selected_portal(&app, selected);
+  Ok(())
 }
 
 #[tauri::command]
-fn select_portal(state: State<'_, AppContext>, portal: String) -> Result<(), String> {
-  let mut cfg = state.config.lock().unwrap();
-  if cfg.portals.contains(&portal) {
-    cfg.selected = Some(portal);
-  }
-  cfg.save()
+fn select_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
+  let selected = {
+    let mut cfg = state.config.lock().unwrap();
+    if cfg.portals.contains(&portal) {
+      cfg.selected = Some(portal);
+    }
+    cfg.save()?;
+    cfg.selected.clone()
+  };
+  state.controller.note_selected_portal(&app, selected);
+  Ok(())
 }
 
 #[tauri::command]
@@ -363,6 +378,13 @@ fn main() {
     .setup(move |app| {
       // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
       let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+      // Seed the idle state with the selected portal so the Connect button
+      // is reachable in a fresh session. The removed native tray menu used
+      // to be the implicit seeding path (it connected straight from
+      // `config.selected`); without this a restart left the button dead.
+      let selected = app.state::<AppContext>().config.lock().unwrap().selected.clone();
+      controller.note_selected_portal(app.handle(), selected);
 
       // Tray through tauri's own API, NOT a raw tray-icon one: tauri claims
       // the global TrayIconEvent handler (an OnceLock: first setter wins,

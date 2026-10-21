@@ -205,6 +205,28 @@ impl VpnController {
       inner.state.gateway = gateway;
     });
   }
+
+  /// Apply a portal selection from the config to the idle state.
+  ///
+  /// `state.portal` is the only hint the panel has that a Connect target
+  /// exists: the Connect button stays disabled while it is null. The old
+  /// native tray menu seeded it implicitly by connecting straight from
+  /// `config.selected`; with the menu gone, a fresh session (or an app
+  /// restart while a terminal-started worker holds the lock) left the
+  /// button dead after the first disconnect. Only applies while idle:
+  /// during Connecting/Connected/Disconnecting `portal` describes the
+  /// in-flight operation and must not be rewritten by a selection change.
+  pub fn note_selected_portal(&self, app: &AppHandle, portal: Option<String>) {
+    self.update(app, |inner| apply_selected_portal(inner, portal));
+  }
+}
+
+/// Pure half of `VpnController::note_selected_portal`, so the state machine
+/// stays unit-testable without an AppHandle.
+fn apply_selected_portal(inner: &mut Inner, portal: Option<String>) {
+  if matches!(inner.state.phase, Phase::Disconnected | Phase::Error) {
+    inner.state.portal = portal;
+  }
 }
 
 /// What the PID lock file tells us right now.
@@ -574,14 +596,16 @@ pub async fn run_admin_script(script: String) -> Result<(String, String), String
   tauri::async_runtime::spawn_blocking(move || osascript::run_as_admin(&script))
     .await
     .map_err(|e| format!("join error: {e}"))?
-    .map_err(|e| format!("osascript failed to run: {e}"))
+    .map_err(|e| format!("sudo failed to run: {e}"))
     .and_then(|output| {
       let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
       let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
       if output.status.success() {
         Ok((stdout, stderr))
       } else {
-        let reason = if stderr.contains("User canceled") {
+        let reason = if stderr.contains("User canceled")
+          || stderr.contains("no password was provided")
+        {
           "Authorization was canceled".to_string()
         } else {
           stderr
@@ -667,5 +691,36 @@ mod tests {
       Some("gtw-2".to_string())
     );
     assert_eq!(parse_gateway("Unrelated message"), None);
+  }
+
+  #[test]
+  fn selected_portal_updates_idle_state_only() {
+    // Idle: the selection becomes the Connect target the panel enables.
+    let mut idle = Inner::default();
+    apply_selected_portal(&mut idle, Some("gp.imm.re".to_string()));
+    assert_eq!(idle.state.portal.as_deref(), Some("gp.imm.re"));
+    // And clears again when the last portal is removed.
+    apply_selected_portal(&mut idle, None);
+    assert_eq!(idle.state.portal, None);
+
+    // After an error the user may retarget the next attempt.
+    let mut errored = Inner::default();
+    errored.state.phase = Phase::Error;
+    apply_selected_portal(&mut errored, Some("next.example".to_string()));
+    assert_eq!(errored.state.portal.as_deref(), Some("next.example"));
+
+    // In flight: `portal` describes the operation, not the selection, and
+    // must survive selection changes and cleanups.
+    let mut connecting = Inner::default();
+    connecting.state.phase = Phase::Connecting;
+    connecting.state.portal = Some("old.example".to_string());
+    apply_selected_portal(&mut connecting, Some("new.example".to_string()));
+    assert_eq!(connecting.state.portal.as_deref(), Some("old.example"));
+
+    let mut disconnecting = Inner::default();
+    disconnecting.state.phase = Phase::Disconnecting;
+    disconnecting.state.portal = Some("keep.example".to_string());
+    apply_selected_portal(&mut disconnecting, None);
+    assert_eq!(disconnecting.state.portal.as_deref(), Some("keep.example"));
   }
 }

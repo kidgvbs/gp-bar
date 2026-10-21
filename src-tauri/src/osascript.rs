@@ -1,10 +1,23 @@
-//! Running shell commands with administrator privileges through
-//! `osascript`, which shows the native macOS password dialog.
+//! Admin elevation: `sudo -A`, with Touch ID when the system allows it.
+//!
+//! sudo authenticates through PAM, and `/etc/pam.d/sudo` includes
+//! `/etc/pam.d/sudo_local` FIRST: with `auth sufficient pam_tid.so` enabled
+//! there, the admin prompt is Touch ID (or Apple Watch). The askpass helper
+//! below only provides the classic password dialog when biometrics are
+//! unavailable or fail. This replaces the old
+//! `do shell script … with administrator privileges` path, whose dialog
+//! ignores PAM entirely (no Touch ID) and whose root children are
+//! signal-deaf on this macOS beta (see vpn.rs).
 
 use std::{
+  fs,
   io,
+  os::unix::fs::PermissionsExt,
+  path::PathBuf,
   process::{Command, Output},
 };
+
+use crate::config::Config;
 
 /// Quote a single argument for a POSIX shell.
 pub fn sh_quote(value: &str) -> String {
@@ -22,25 +35,52 @@ pub fn sh_quote(value: &str) -> String {
   quoted
 }
 
-/// Escape a shell script for embedding inside an AppleScript string literal
-/// (`do shell script "…"`).
-pub fn applescript_escape(script: &str) -> String {
-  script.replace('\\', "\\\\").replace('"', "\\\"")
+/// The askpass helper sudo invokes when Touch ID is not an option. It runs
+/// as the invoking user, shows a native password dialog and prints the
+/// answer; canceling the dialog exits non-zero, which sudo reports as a
+/// canceled authentication.
+const ASKPASS_SCRIPT: &str = r#"#!/bin/sh
+# GP Bar sudo askpass: password fallback when Touch ID is unavailable.
+exec /usr/bin/osascript -e 'display dialog "GP Bar needs your administrator password to manage the VPN tunnel:" default answer "" with hidden answer' -e 'text returned of result'
+"#;
+
+/// Where the askpass helper lives (user-owned, written once).
+fn askpass_path() -> PathBuf {
+  Config::config_dir().join("sudo-askpass.sh")
 }
 
-/// Run a shell command as root, blocking until it finishes.
+/// Make sure the askpass helper exists and is executable; return its path.
+fn ensure_askpass_helper() -> io::Result<PathBuf> {
+  let path = askpass_path();
+  if let Some(dir) = path.parent() {
+    fs::create_dir_all(dir)?;
+  }
+  fs::write(&path, ASKPASS_SCRIPT)?;
+  fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+  Ok(path)
+}
+
+/// Run a shell script as root through `sudo -A`, blocking until it exits.
 ///
 /// Returns the command output. A non-zero exit does not panic; the caller
-/// inspects `Output`. The user can cancel the password dialog, in which case
-/// osascript exits with an error like "User canceled.".
+/// inspects `Output`. The script text goes into a user-owned 0600 file
+/// instead of the command line, where `ps` would expose it; the same
+/// local-TOCTOU caveat as the staged launchd plist applies (single-user
+/// machines: irrelevant). The user can cancel the Touch ID/password
+/// prompt, in which case sudo exits non-zero with "no password was
+/// provided" and the fallback in `run_admin_script` maps it to a cancel.
 pub fn run_as_admin(script: &str) -> io::Result<Output> {
-  let applescript = format!(
-    "do shell script \"{}\" with administrator privileges",
-    applescript_escape(script)
-  );
-  Command::new("/usr/bin/osascript")
-    .arg("-e")
-    .arg(applescript)
+  let helper = ensure_askpass_helper()?;
+  let dir = Config::log_dir();
+  fs::create_dir_all(&dir)?;
+  let script_path = dir.join("admin.sh");
+  fs::write(&script_path, script)?;
+  fs::set_permissions(&script_path, fs::Permissions::from_mode(0o600))?;
+  Command::new("/usr/bin/sudo")
+    .env("SUDO_ASKPASS", helper)
+    .arg("-A")
+    .arg("/bin/sh")
+    .arg(&script_path)
     .output()
 }
 
@@ -56,8 +96,11 @@ mod tests {
   }
 
   #[test]
-  fn escapes_applescript_string_literals() {
-    assert_eq!(applescript_escape("say \"hi\""), "say \\\"hi\\\"");
-    assert_eq!(applescript_escape("a\\b"), "a\\\\b");
+  fn askpass_is_a_hidden_password_dialog() {
+    assert!(ASKPASS_SCRIPT.trim_start().starts_with("#!/bin/sh"));
+    assert!(ASKPASS_SCRIPT.contains("with hidden answer"));
+    // No double quotes inside the single-quoted AppleScript literal would
+    // break; the dialog text must not contain any.
+    assert!(ASKPASS_SCRIPT.lines().count() == 3);
   }
 }
