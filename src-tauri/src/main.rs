@@ -12,13 +12,13 @@ mod icons;
 mod osascript;
 mod vpn;
 
-use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter, Listener, Manager, PhysicalPosition, State, WindowEvent};
-use tray_icon::{
-  menu::{Menu, MenuItem, PredefinedMenuItem},
-  Icon, TrayIcon, TrayIconBuilder,
+use tauri::{
+  tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+  AppHandle, Emitter, Listener, Manager, PhysicalPosition, State, WindowEvent,
 };
 
 use config::Config;
@@ -26,16 +26,16 @@ use vpn::{Phase, VpnController, VpnState};
 
 const TRAY_ID: &str = "gp-bar";
 
-// tray-icon and muda handles are `Rc`-based and single-threaded: they are
-// created on the main thread in `setup` and kept alive here for the whole
-// lifetime of the app.
-thread_local! {
-  static TRAY: RefCell<Option<(TrayIcon, Menu)>> = const { RefCell::new(None) };
-}
-
 struct AppContext {
   controller: Arc<VpnController>,
   config: Mutex<Config>,
+  /// When the panel was last hidden, to tell "the click that dismissed it"
+  /// apart from a fresh open request (see `toggle_panel`).
+  panel_hidden_at: Mutex<Option<Instant>>,
+  /// While an admin password dialog is up it steals the panel's focus; keep
+  /// the panel on screen so the user can watch the Connecting/Disconnecting
+  /// state (see `pin_panel`).
+  panel_pinned: AtomicBool,
 }
 
 // -- commands -----------------------------------------------------------------
@@ -135,13 +135,20 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Stri
   // Interrupt a connecting worker by unloading the one-shot launchd job:
   // launchd terminates it, which runs the worker's own teardown instead of
   // a blind kill. Needs root as well, so this also shows the admin dialog.
+  pin_panel(&app, true);
   if let Err(error) =
     vpn::run_admin_script(vpn::build_cancel_script(&vpn::daemon_plist_path())).await
   {
     eprintln!("gp-bar: cancel failed: {error}");
   }
+  pin_panel(&app, false);
   controller.connect_failed(&app, "Connection canceled".to_string());
   Ok(())
+}
+
+#[tauri::command]
+fn quit(app: AppHandle) {
+  app.exit(0);
 }
 
 // -- shared action logic --------------------------------------------------------
@@ -186,7 +193,10 @@ async fn do_connect(
   controller.begin_connect(&app, portal.to_string());
   let _ = app.emit("vpn-log-cleared", ());
 
-  match vpn::run_admin_script(script).await {
+  pin_panel(&app, true);
+  let result = vpn::run_admin_script(script).await;
+  pin_panel(&app, false);
+  match result {
     // No worker PID comes back from launchd; the status poller adopts the
     // worker from the lock file once the tunnel is established.
     Ok(_) => Ok(()),
@@ -211,7 +221,10 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
 
   controller.begin_disconnect(&app);
   let script = vpn::build_disconnect_script(&gpclient, &vpn::daemon_plist_path());
-  if let Err(error) = vpn::run_admin_script(script).await {
+  pin_panel(&app, true);
+  let result = vpn::run_admin_script(script).await;
+  pin_panel(&app, false);
+  if let Err(error) = result {
     eprintln!("gp-bar: disconnect failed: {error}");
     // Fail loud, never SIGKILL: the worker may ignore the signal (see
     // build_connect_plist) and a killed worker skips the vpnc-script
@@ -224,24 +237,61 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
 
 // -- panel window ---------------------------------------------------------------
 
-fn show_panel(app: &AppHandle) {
+fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
   let Some(window) = app.get_webview_window("main") else {
     return;
   };
+  let state = app.state::<AppContext>();
 
-  // Anchor the panel just below the menu bar. Opened from a tray click the
-  // cursor sits on the icon itself (menu-bar height); opened from the menu
-  // it sits a few items further down. Either way it approximates the icon.
-  if let Ok(size) = window.outer_size() {
-    if let Ok(cursor) = window.cursor_position() {
-      let mut x = (cursor.x - size.width as f64 / 2.0).max(0.0);
-      // Keep the panel on the screen that holds the cursor.
-      if let Ok(Some(monitor)) = app.monitor_from_point(cursor.x, cursor.y) {
-        let max_x =
-          monitor.position().x as f64 + monitor.size().width as f64 - size.width as f64;
-        x = x.min(max_x.max(0.0));
-      }
-      let y = (cursor.y + 18.0).max(32.0);
+  // Native popover toggle: a click while the panel is open dismisses it.
+  if window.is_visible().unwrap_or(false) {
+    let _ = window.hide();
+    *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
+    return;
+  }
+
+  // Race: the very click that opened the tray icon also made the panel lose
+  // focus, and `on_window_event` already hid it a few milliseconds ago. If
+  // that happened within this window, this is the SAME physical click — keep
+  // the panel closed instead of reopening it behind the user's back.
+  let just_hidden = state
+    .panel_hidden_at
+    .lock()
+    .unwrap()
+    .is_some_and(|hidden| hidden.elapsed() < Duration::from_millis(250));
+  *state.panel_hidden_at.lock().unwrap() = None;
+  if just_hidden {
+    return;
+  }
+
+  // Anchor the panel under the tray icon: the event carries the icon's
+  // global rect, and macOS physical coordinates are global (primary monitor
+  // at 0,0, others e.g. negative to its left), so clamp against the bounds
+  // of the monitor that HOLDS the icon — never against 0, which would drag
+  // the panel back onto the primary screen.
+  let anchor = anchor.or_else(|| {
+    window
+      .cursor_position()
+      .ok()
+      .map(|cursor| (cursor.x, cursor.y + 18.0))
+  });
+
+  if let (Some((ax, ay)), Ok(size)) = (anchor, window.outer_size()) {
+    if let Ok(Some(monitor)) = app.monitor_from_point(ax, ay) {
+      let origin = monitor.position();
+      let msize = monitor.size();
+      // `outer_size` is physical ON THE CURRENT MONITOR: re-project it onto
+      // the anchor monitor so the panel lands correctly when it hops between
+      // retina and 1x displays (720 vs 360 physical px for the same panel).
+      let scale = window.scale_factor().unwrap_or(1.0);
+      let panel_w = size.width as f64 / scale * monitor.scale_factor() as f64;
+      let x = (ax - panel_w / 2.0).clamp(
+        origin.x as f64,
+        (origin.x + msize.width as i32) as f64 - panel_w,
+      );
+      // Right under the menu bar: the tray-rect anchor already sits at the
+      // bottom of the menu bar, so this is as high as the panel can go.
+      let y = ay.max(origin.y as f64 + 24.0 * monitor.scale_factor() as f64);
       let _ = window.set_position(PhysicalPosition::new(x as i32, y as i32));
     }
   }
@@ -250,10 +300,26 @@ fn show_panel(app: &AppHandle) {
   let _ = window.set_focus();
 }
 
+fn pin_panel(app: &AppHandle, pinned: bool) {
+  app
+    .state::<AppContext>()
+    .panel_pinned
+    .store(pinned, Ordering::Relaxed);
+  // Hand focus back to the still-visible panel when the dialog is gone, so
+  // the next click elsewhere dismisses it again as usual.
+  if !pinned {
+    if let Some(window) = app.get_webview_window("main") {
+      if window.is_visible().unwrap_or(false) {
+        let _ = window.set_focus();
+      }
+    }
+  }
+}
+
 fn sync_tray_with_state(app: &AppHandle, phase: Phase) {
-  // tray-icon handles are main-thread only, and vpn-state events are emitted
-  // from the status poller's worker task, so hop to the main thread.
-  let _ = app.run_on_main_thread(move || {
+  // State events are emitted from the status poller's worker task, but
+  // tauri's TrayIcon hops to the main thread itself (run_item_main_thread).
+  if let Some(tray) = app.tray_by_id(TRAY_ID) {
     let connected = phase == Phase::Connected;
     let tooltip = match phase {
       Phase::Connected => "GP Bar — Connected",
@@ -263,15 +329,9 @@ fn sync_tray_with_state(app: &AppHandle, phase: Phase) {
       Phase::Disconnected => "GP Bar — Disconnected",
     };
     let image = icons::padlock_icon(connected);
-    TRAY.with(|slot| {
-      let guard = slot.borrow();
-      let Some((tray, _menu)) = guard.as_ref() else { return };
-      if let Ok(icon) = Icon::from_rgba(image.rgba().to_vec(), image.width(), image.height()) {
-        let _ = tray.set_icon_with_as_template(Some(icon), true);
-      }
-      let _ = tray.set_tooltip(Some(tooltip));
-    });
-  });
+    let _ = tray.set_icon_with_as_template(Some(image), true);
+    let _ = tray.set_tooltip(Some(tooltip));
+  }
 }
 
 // -- entry ------------------------------------------------------------------------
@@ -285,101 +345,69 @@ fn main() {
     .manage(AppContext {
       controller: controller.clone(),
       config: Mutex::new(Config::load()),
-    })
-    // Menu selections. On macOS the tray menu is presented by AppKit itself
-    // (see `setup`), but its items still surface here through muda.
-    .on_menu_event(|app, event| match event.id.as_ref() {
-      "show" => show_panel(app),
-      "connect" => {
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-          let state = app.state::<AppContext>();
-          let (portal, reuse) = {
-            let cfg = state.config.lock().unwrap();
-            (cfg.selected.clone(), cfg.reuse_cookie)
-          };
-          if let Some(portal) = portal {
-            if let Err(error) = do_connect(app.clone(), &state, &portal, reuse).await {
-              eprintln!("gp-bar: tray connect failed: {error}");
-            }
-          }
-        });
-      }
-      "disconnect" => {
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-          let state = app.state::<AppContext>();
-          if let Err(error) = do_disconnect(app.clone(), &state).await {
-            eprintln!("gp-bar: tray disconnect failed: {error}");
-          }
-        });
-      }
-      "quit" => {
-        app.exit(0);
-      }
-      _ => {}
+      panel_hidden_at: Mutex::new(None),
+      panel_pinned: AtomicBool::new(false),
     })
     .on_window_event(|window, event| {
-      // Popover behaviour: dismiss the panel when it loses focus.
+      // Popover behaviour: dismiss the panel when it loses focus — except
+      // while `panel_pinned` is set, i.e. an admin password dialog is up and
+      // the user is mid connect/disconnect watching the state updates.
       if let WindowEvent::Focused(false) = event {
-        let _ = window.hide();
+        let state = window.state::<AppContext>();
+        if !state.panel_pinned.load(Ordering::Relaxed) {
+          let _ = window.hide();
+          *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
+        }
       }
     })
     .setup(move |app| {
       // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
       let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-      let show_item = MenuItem::with_id("show", "Show GP Bar", true, None);
-      let connect_item = MenuItem::with_id("connect", "Connect to selected portal", true, None);
-      let disconnect_item = MenuItem::with_id("disconnect", "Disconnect", true, None);
-      let quit_item = MenuItem::with_id("quit", "Quit GP Bar", true, None);
-      let menu = Menu::with_items(&[
-        &show_item,
-        &PredefinedMenuItem::separator(),
-        &connect_item,
-        &disconnect_item,
-        &PredefinedMenuItem::separator(),
-        &quit_item,
-      ])?;
-
+      // Tray through tauri's own API, NOT a raw tray-icon one: tauri claims
+      // the global TrayIconEvent handler (an OnceLock: first setter wins,
+      // `build()` runs before `setup`) and drops events for trays it does
+      // not manage, so a raw tray never sees a single click here. Through
+      // tauri's builder the clicks flow through on_tray_icon_event instead.
+      //
+      // NO menu is attached on purpose: on this macOS beta the status-item
+      // button opens a natively attached menu itself on left click and the
+      // click never reaches our event handler (only enter/leave/move/right
+      // events arrive — see the debug log). Without a menu there is nothing
+      // for the button to open, clicks flow to us, and the panel takes over
+      // (quit lives in the panel footer).
       let image = icons::padlock_icon(false);
-      let icon = Icon::from_rgba(image.rgba().to_vec(), image.width(), image.height())
-        .map_err(|error| format!("invalid tray icon: {error}"))?;
-
-      // Tray created directly (not through tauri::tray), pinned to 0.25.0 —
-      // the configuration empirically verified on this machine. The early
-      // "menu attach" theories around macOS 27 beta were red herrings: the
-      // tray had always worked, but the app was frozen by a poller deadlock
-      // (see vpn::update). With menu-on-left-click off, a left click
-      // surfaces as a raw event in the handler below and opens the panel;
-      // a right click lets tray-icon present the native menu.
-      let tray = TrayIconBuilder::new()
-        .with_id(TRAY_ID)
-        .with_icon(icon)
-        .with_icon_as_template(true)
-        .with_tooltip("GP Bar")
-        .with_menu(Box::new(menu.clone()))
-        .with_menu_on_left_click(false)
-        .build()?;
-
-      // Keep the tray and menu handles alive for the lifetime of the app.
-      TRAY.with(|slot| *slot.borrow_mut() = Some((tray, menu)));
-
-      // This handler replaces tauri's global TrayIconEvent dispatcher (the
-      // app no longer keeps a tauri tray of its own), so raw tray events
-      // surface here directly. One click on the padlock opens the panel —
-      // the same interaction model as GP Connect.
-      let click_handle = app.handle().clone();
-      tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
-        match event {
-          tray_icon::TrayIconEvent::Click {
-            button: tray_icon::MouseButton::Left,
-            button_state: tray_icon::MouseButtonState::Up,
+      let _tray = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(image)
+        .icon_as_template(true)
+        .tooltip("GP Bar")
+        .on_tray_icon_event(|tray, event| {
+          // Left click toggles the panel (right click does nothing: the
+          // dropdown menu is incompatible with this macOS beta, which opens
+          // a natively attached menu on left click itself). React on
+          // mouse-DOWN: it arrives within milliseconds of the focus-loss
+          // hide, keeping the race guard in toggle_panel reliable.
+          if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Down,
+            rect,
             ..
-          } => show_panel(&click_handle),
-          _ => {}
-        }
-      }));
+          } = event
+          {
+            let (rx, ry) = match rect.position {
+              tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
+              tauri::Position::Logical(l) => (l.x, l.y),
+            };
+            let rh = match rect.size {
+              tauri::Size::Physical(s) => s.height as f64,
+              tauri::Size::Logical(s) => s.height,
+            };
+            // Global coordinates of the tray icon: anchor the panel right
+            // below it (see toggle_panel).
+            toggle_panel(tray.app_handle(), Some((rx, ry + rh)));
+          }
+        })
+        .build(app)?;
 
       vpn::spawn_status_poller(app.handle().clone(), poller_controller);
       vpn::spawn_log_tailer(app.handle().clone(), tailer_controller);
@@ -407,7 +435,8 @@ fn main() {
       set_reuse_cookie,
       connect,
       disconnect,
-      cancel
+      cancel,
+      quit
     ])
     .run(tauri::generate_context!())
     .expect("error while running gp-bar");

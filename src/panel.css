@@ -264,6 +264,18 @@ footer {
   font-size: 10px;
   color: rgba(128, 128, 128, 0.7);
   text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.btn.quit {
+  background: rgba(128, 128, 128, 0.2);
+  color: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 6px;
 }
 
 .hidden {

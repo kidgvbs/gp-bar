@@ -192,6 +192,10 @@ copyLog.addEventListener("click", async () => {
   setTimeout(() => (copyLog.textContent = "⧉"), 1200);
 });
 
+document.getElementById("quit-btn")!.addEventListener("click", () => {
+  invoke("quit");
+});
+
 await listen<VpnState>("vpn-state", (e) => render(e.payload));
 await listen<LogEvent>("vpn-log", (e) => appendLog(e.payload));
 await listen("vpn-log-cleared", () => {
