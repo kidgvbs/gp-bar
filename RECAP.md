@@ -352,7 +352,14 @@ Il flag `-A`/askpass **sopprime il modulo biometrico** (la conversazione askpass
 
 ### Soluzione 1 (in test su branch `solution-1-smappservice`)
 
-SMAppService daemon + XPC (via `objc2-service-management` 0.3.2 + bindiggi `xpc_*` raw, validate in un probe compilato). Sviluppata su worktree `~/Rust/gp-bar-solution1` da un sub-agent, da collaudare separatamente prima di eventualmente promuoverla.
+SMAppService daemon + XPC (via `objc2-service-management` 0.3.2 + bindiggi `xpc_*` raw). Sviluppata su worktree `~/Rust/gp-bar-solution1` da un sub-agent.
+
+**Probe `SMProbe.app` validato end-to-end su questa beta (21/10/2026):** registration OK da bundle in path stabile (`~/Applications`) firmato ad-hoc → `SMAppServiceStatus` 1 (Enabled); ping → `ok=true daemon_uid=0 echo=ping`. Il daemon parte on-demand via Mach service come root. Lezioni del probe:
+- **Register da binario nudo in cartella temp → NotFound/EPERM**: SMAppService/BTM non riconosce l'app (non in LaunchServices, percorso non di installazione). Il record BTM resta in `RequiresApproval`. Serve: bundle in path stabile + `open` (registrazione LS).
+- **L'enum status in questa SDK**: 0=NotRegistered, 1=Enabled, 2=RequiresApproval, 3=NotFound (il `Debug` di objc2 stampa il raw quando non matcha — in questa beta 3 non è mappato? in realtà 3=NotFound matcha; i valori vanno letti dall'header, non intuiti).
+- **"Consenti in background"**: il toggle in Impostazioni di Sistema → Elementi di login è la controparte manuale dell'approvazione; con l'approvazione già attiva, `register` va a Enabled senza nuovo prompt.
+- **Client XPC**: dopo `send_with_reply_sync` + reply, la `xpc_connection_cancel` genera un event `XPC_ERROR_CONNECTION_CANCELLED` — benigno, non un errore del daemon.
+- **Nota di sicurezza valida per la soluzione 1 reale**: il bundle col daemon root deve vivere in un percorso **non riscrivibile dall'utente** (idealmente `/Applications`): un helper root dentro `~/Applications` è sostituibile dall'utente = privesc. Fix applicata sul branch anche per la risoluzione gpclient (`3a6d75b`): il daemon esegue solo i candidate Homebrew fissi, mai path dal config utente.
 
 ### Bug del pulsante Connect (risolto, commit 15bbed7)
 
