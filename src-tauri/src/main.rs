@@ -201,16 +201,20 @@ async fn do_connect(
   // Same charset the daemon re-checks: no shell metacharacters reach argv.
   proto::validate_portal(portal)?;
 
+  controller.begin_connect(&app, portal.to_string());
+  let _ = app.emit("vpn-log-cleared", ());
+
   // Register the helper daemon on first use: the ONE place a system
   // authorization prompt can appear (afterwards `status` is Enabled and
-  // everything runs promptless over XPC).
+  // everything runs promptless over XPC). Done AFTER begin_connect so a
+  // failure lands in the Error state instead of vanishing silently.
   pin_panel(&app, true);
   let register = helper::ensure_ready().await;
   pin_panel(&app, false);
-  register?;
-
-  controller.begin_connect(&app, portal.to_string());
-  let _ = app.emit("vpn-log-cleared", ());
+  if let Err(error) = register {
+    controller.connect_failed(&app, error.clone());
+    return Err(error);
+  }
 
   // The root daemon truncates the connect log and spawns gpclient as its
   // own child (SUDO_UID/SUDO_USER of the console user in its env); the

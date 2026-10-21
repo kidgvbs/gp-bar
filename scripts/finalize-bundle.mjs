@@ -21,11 +21,11 @@ execSync("cargo build --release --bin gp-helper", {
   stdio: ["ignore", "ignore", "inherit"],
 });
 
-const bundle = join("src-tauri", "target", "release", "bundle", "macos", "GP Bar.app");
+const bundle = join("src-tauri", "target", "release", "bundle", "macos", "GP Bar S1.app");
 const macos = join(bundle, "Contents", "MacOS");
 cpSync(join("src-tauri", "target", "release", "gp-helper"), join(macos, "gp-helper"));
 
-execSync(`codesign --force --sign - --identifier dev.gpbar.app "${bundle}"`, {
+execSync(`codesign --force --sign - --identifier dev.gpbar.s1 "${bundle}"`, {
   stdio: "inherit",
 });
 console.log(`finalized bundle: ${bundle} (sidecar gp-helper + ad-hoc re-sign)`);

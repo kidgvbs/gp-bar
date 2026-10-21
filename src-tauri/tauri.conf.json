@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "GP Bar",
+  "productName": "GP Bar S1",
   "version": "0.1.0",
-  "identifier": "dev.gpbar.app",
+  "identifier": "dev.gpbar.s1",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
