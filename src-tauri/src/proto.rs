@@ -83,17 +83,16 @@ pub fn validate_portal(portal: &str) -> Result<(), String> {
 pub const GPCLIENT_CANDIDATES: [&str; 2] =
   ["/opt/homebrew/bin/gpclient", "/usr/local/bin/gpclient"];
 
-/// Resolve the gpclient executable: a configured absolute path wins (when
-/// the file exists), otherwise the Homebrew candidates. Mirrors
-/// `config::Config::resolve_gpclient` for the daemon, which must not depend
-/// on tauri or the app's Config type.
-pub fn resolve_gpclient(configured: Option<&str>) -> Option<PathBuf> {
-  if let Some(configured) = configured {
-    let path = Path::new(configured);
-    if path.is_file() {
-      return Some(path.to_path_buf());
-    }
-  }
+/// Resolve the gpclient executable from the fixed Homebrew candidates only.
+///
+/// Deliberately NOT honoring the user config's `gpclient_path` (unlike the
+/// app-side `config::Config::resolve_gpclient`, which stays user-side for
+/// the version display): the config file is user-writable, and a root
+/// daemon executing a path from it would be a full privilege escalation for
+/// any process running as the user — far beyond the documented residual
+/// risk of "any user process can toggle the VPN". No caller-controlled
+/// paths, ever.
+pub fn resolve_gpclient() -> Option<PathBuf> {
   GPCLIENT_CANDIDATES
     .iter()
     .map(PathBuf::from)
@@ -164,18 +163,20 @@ mod tests {
   }
 
   #[test]
-  fn resolves_gpclient_like_the_app_config() {
-    // Pure check: an absolute path to an existing file wins.
-    let exe = std::env::current_exe().unwrap();
-    assert_eq!(
-      resolve_gpclient(Some(exe.to_string_lossy().into_owned().as_str())),
-      Some(exe.clone())
-    );
-    // A configured path that does not exist falls back to detection, which
-    // is empty on machines without Homebrew gpclient.
-    assert_eq!(
-      resolve_gpclient(Some("/nonexistent/gpclient")),
-      resolve_gpclient(None)
+  fn resolves_gpclient_from_fixed_candidates_only() {
+    // The result is one of the fixed candidates (or none): a user-writable
+    // config path must never influence what the root daemon executes.
+    let resolved = resolve_gpclient();
+    let expected = GPCLIENT_CANDIDATES
+      .iter()
+      .map(PathBuf::from)
+      .find(|candidate: &PathBuf| candidate.is_file());
+    assert_eq!(resolved, expected);
+    assert!(
+      resolved.is_none()
+        || GPCLIENT_CANDIDATES
+          .iter()
+          .any(|c| resolved.as_deref() == Some(Path::new(c)))
     );
   }
 }

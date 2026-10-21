@@ -198,25 +198,6 @@ fn home_of(uid: u32) -> Option<PathBuf> {
   }
 }
 
-/// The console user's `gpclient_path` override from their gp-bar config.
-/// Mirrors the app's `Config::resolve_gpclient` precedence: the daemon
-/// resolves the binary itself, nothing arrives over the wire.
-fn configured_gpclient(home: &Path) -> Option<String> {
-  let raw = fs::read_to_string(
-    home
-      .join("Library")
-      .join("Application Support")
-      .join("gp-bar")
-      .join("config.json"),
-  )
-  .ok()?;
-  serde_json::from_str::<serde_json::Value>(&raw)
-    .ok()?
-    .get("gpclient_path")?
-    .as_str()
-    .map(str::to_string)
-}
-
 /// Where the app's log tailer expects the connect log: the console user's
 /// `~/Library/Logs/gp-bar/gpclient-connect.log` (see `config::Config`).
 fn connect_log_path(home: &Path) -> PathBuf {
@@ -242,8 +223,8 @@ fn start(state: &Arc<State>, portal: &str, reuse_cookie: bool) -> Result<(), Str
     console_user().ok_or_else(|| "cannot determine the console user".to_string())?;
   let home = home_of(uid).ok_or_else(|| "cannot resolve the console user's home".to_string())?;
 
-  let gpclient = proto::resolve_gpclient(configured_gpclient(&home).as_deref())
-    .ok_or_else(|| "gpclient not found (Homebrew locations or the configured path)".to_string())?;
+  let gpclient = proto::resolve_gpclient()
+    .ok_or_else(|| "gpclient not found (Homebrew locations only; the root daemon must not execute user-configured paths)".to_string())?;
 
   let log_path = connect_log_path(&home);
   if let Some(dir) = log_path.parent() {
@@ -323,10 +304,7 @@ fn is_exited(exited: &Arc<ExitPair>) -> bool {
 
 /// `gpclient disconnect` + poll the lock file, failing loud (never SIGKILL).
 fn stop(_state: &Arc<State>) -> Result<(), String> {
-  let (uid, _) = console_user().ok_or_else(|| "cannot determine the console user".to_string())?;
-  let home = home_of(uid).ok_or_else(|| "cannot resolve the console user's home".to_string())?;
-  let gpclient = proto::resolve_gpclient(configured_gpclient(&home).as_deref())
-    .ok_or_else(|| "gpclient not found".to_string())?;
+  let gpclient = proto::resolve_gpclient().ok_or_else(|| "gpclient not found".to_string())?;
 
   let output = Command::new(&gpclient)
     .arg("disconnect")
