@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Main panel permissions",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-set-size"]
 }

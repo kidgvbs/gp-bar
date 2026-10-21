@@ -41,9 +41,12 @@
         <button id="action-btn" class="btn primary">Connect</button>
       </section>
 
-      <section class="log-block">
+      <section class="log-block collapsed" id="log-block">
         <div class="log-header">
-          <span>Activity</span>
+          <button class="log-toggle" id="log-toggle" type="button" title="Toggle activity log">
+            <span class="chevron">&#9656;</span>
+            <span>Activity</span>
+          </button>
           <button id="copy-log" class="icon-btn" title="Copy log">&#9114;</button>
         </div>
         <pre id="log" class="log"></pre>

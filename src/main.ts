@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { LogicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type Phase = "Disconnected" | "Connecting" | "Connected" | "Disconnecting" | "Error";
 
@@ -42,6 +44,34 @@ const actionBtn = document.getElementById("action-btn") as HTMLButtonElement;
 const logEl = document.getElementById("log")!;
 const copyLog = document.getElementById("copy-log")!;
 const versionsEl = document.getElementById("versions")!;
+const logBlock = document.getElementById("log-block")!;
+const logToggle = document.getElementById("log-toggle")!;
+
+// -- activity log disclosure -----------------------------------------------------
+// The panel window is a fixed-size popover: the full size comes from
+// tauri.conf.json (captured here at startup), and with the log collapsed the
+// window shrinks to the natural height of the remaining content.
+
+const win = getCurrentWindow();
+const [winScale, winInner] = await Promise.all([win.scaleFactor(), win.innerSize()]);
+const fullWidth = winInner.width / winScale;
+const fullHeight = winInner.height / winScale;
+
+function collapsedHeight(): number {
+  const app = document.getElementById("app")!;
+  app.style.height = "auto";
+  const height = app.getBoundingClientRect().height;
+  app.style.height = "";
+  return height;
+}
+
+logToggle.addEventListener("click", () => {
+  const collapsed = logBlock.classList.toggle("collapsed");
+  win.setSize(new LogicalSize(fullWidth, Math.ceil(collapsed ? collapsedHeight() : fullHeight)));
+});
+
+// The log starts collapsed: fit the window to the content right away.
+win.setSize(new LogicalSize(fullWidth, Math.ceil(collapsedHeight())));
 
 let currentPhase: Phase = "Disconnected";
 let connectedSince: number | null = null;
@@ -206,6 +236,6 @@ await listen("vpn-log-cleared", () => {
 await refreshPortals();
 
 const versions = await invoke<{ app_version: string; gpclient_version: string }>("get_versions");
-versionsEl.textContent = `GP Bar ${versions.app_version} · gpclient ${versions.gpclient_version}`;
+versionsEl.textContent = `GP Bar ${versions.app_version} · ${versions.gpclient_version}`;
 
 setInterval(tickDuration, 1000);
