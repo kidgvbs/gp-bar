@@ -60,7 +60,10 @@ impl Config {
     let path = Self::config_dir().join("config.json");
     match fs::read_to_string(&path) {
       Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
-        eprintln!("gp-bar: ignoring invalid config {}: {error}", path.display());
+        eprintln!(
+          "gp-bar: ignoring invalid config {}: {error}",
+          path.display()
+        );
         Config::default()
       }),
       Err(_) => Config::default(),

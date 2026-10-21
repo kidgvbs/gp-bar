@@ -330,6 +330,12 @@ footer {
   border-radius: 6px;
 }
 
+/* Privileged helper install state (registered via SMAppService). */
+.helper-status {
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
 .btn.quit:hover:not(:disabled) {
   background: rgba(255, 69, 58, 0.3);
 }

@@ -15,27 +15,61 @@ the CLI by hand:
 sudo gpclient connect gp.imm.re --browser --auto-gateway --cookie-cache
 ```
 
-* **Connect** — shows the native macOS administrator password dialog
-  (`osascript ... with administrator privileges`), then starts
-  `gpclient` as root, detached. The SSO login opens in your default browser.
+* **Connect** — asks the `gp-helper` LaunchDaemon (root, registered once
+  with SMAppService) over XPC to start `gpclient` as root, detached. The
+  SSO login opens in your default browser.
 * **Status** — `gpclient` writes its PID to `/var/run/gpclient.lock` once the
   tunnel is up and removes it on disconnect; GP Bar watches that file to know
   whether the VPN is up (even if it was started from a terminal, or before GP
   Bar launched).
 * **Live activity** — gpclient runs with `--log-format json`, so its records
   (`{timestamp, level, target, message}`) stream into the panel in real time.
-* **Disconnect** — runs `gpclient disconnect` for a graceful teardown
-  (one admin prompt).
+* **Disconnect** — asks the daemon to run `gpclient disconnect` for a
+  graceful teardown and verifies it against the PID lock file.
 
 Because the root `gpclient` worker runs detached (reparented to launchd),
 the VPN survives GP Bar restarts and logouts of the app.
 
 ## Privileges
 
-Creating the tunnel requires root. The current version shows the native
-admin dialog once per connect and once per disconnect — the same prompts you
-would get with `sudo` in a terminal. A follow-up version will add an optional
-launchd daemon so the password is only needed at install time.
+Creating the tunnel requires root. GP Bar ships a small `gp-helper`
+LaunchDaemon and registers it **once** through `SMAppService`: on the
+first connect macOS shows a single system authorization prompt, and from
+then on every connect/disconnect/cancel runs promptless over XPC (the
+mach service `dev.gpbar.helper`).
+
+* The daemon only executes fixed operations (`start`/`stop`/`cancel`/
+  `selftest`) with scalar, re-validated arguments — no paths travel over
+  the wire, and `gpclient` is always spawned directly (`Command`, never
+  `sh -c`).
+* The daemon plist lives inside the app bundle
+  (`Contents/Library/LaunchDaemons/dev.gpbar.helper.plist`) and is
+  written by the app at registration time, so the bundle must live in a
+  **stable, user-writable** location (`~/Applications` is ideal).
+* Because `Program` in the plist is an absolute path into the bundle, a
+  rebuild that keeps the same path does **not** need re-registration:
+  just re-copy the bundle over the old one (the finalize step re-signs
+  it) and relaunch. Re-register only if the bundle moves.
+* Registration requires the whole bundle to be code-signed — the
+  `build:bundle` script ad-hoc re-signs it with the bundle identifier.
+
+Dev cycle:
+
+```sh
+npm run build:bundle               # tauri build + sidecar + ad-hoc re-sign
+rm -rf ~/Applications/"GP Bar.app" # optional: clean copy
+cp -R "src-tauri/target/release/bundle/macos/GP Bar.app" ~/Applications/
+```
+
+Verify the daemon after the first connect:
+
+```sh
+sudo launchctl print system/dev.gpbar.helper   # state, pid (root), mach service
+```
+
+To unregister (e.g. after moving the bundle): run GP Bar's binary with the
+daemon gone — `SMAppService::unregister` is exercised by the code path in
+`src-tauri/src/helper.rs` when the plist goes stale on the next connect.
 
 ## Install
 
@@ -59,19 +93,16 @@ The padlock lives in the menu bar:
 ## Development
 
 ```sh
-npm run tauri dev   # vite + cargo debug run
-cargo test           # unit tests (shell escaping, log parsing, icons)
+npm run tauri dev   # vite + cargo debug run (helper registration needs the bundle: dev runs unprivileged)
+cargo test           # unit tests (protocol validation, log parsing, icons)
 npm run icons        # regenerate src-tauri/icons/* (drawn in scripts/gen-app-icon.mjs)
-npm run tauri build # release bundle
+npm run build:bundle # release bundle + gp-helper sidecar + ad-hoc re-sign
 ```
 
-The release bundle comes out linker-signed with a derived identifier that
-does not match the bundle id — re-align it after every build:
-
-```sh
-codesign --force --sign - --identifier dev.gpbar.app \
-  "src-tauri/target/release/bundle/macos/GP Bar.app"
-```
+The re-sign is part of `build:bundle` (`scripts/finalize-bundle.mjs`):
+the release bundle comes out linker-signed with a derived identifier that
+does not match the bundle id, and both the bundle and the `gp-helper`
+sidecar must be signed for `SMAppService` registration.
 
 `tray-icon` is pinned to `=0.25.0` as the configuration verified on this
 machine. (The early "menu attach" theories about the macOS 27 beta turned out

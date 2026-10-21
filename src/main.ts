@@ -44,6 +44,7 @@ const actionBtn = document.getElementById("action-btn") as HTMLButtonElement;
 const logEl = document.getElementById("log")!;
 const copyLog = document.getElementById("copy-log")!;
 const versionsEl = document.getElementById("versions")!;
+const helperStatusEl = document.getElementById("helper-status")!;
 const logBlock = document.getElementById("log-block")!;
 const logToggle = document.getElementById("log-toggle")!;
 
@@ -185,6 +186,9 @@ actionBtn.addEventListener("click", async () => {
     await invoke("cancel");
   } else {
     await invoke("connect", { portal: portalSelect.value, reuseCookie: cookieCache.checked });
+    // The first connect may have gone through the one-time helper
+    // registration; reflect the new install state in the footer.
+    await refreshHelperStatus();
   }
 });
 
@@ -237,5 +241,27 @@ await refreshPortals();
 
 const versions = await invoke<{ app_version: string; gpclient_version: string }>("get_versions");
 versionsEl.textContent = `GP Bar ${versions.app_version} · ${versions.gpclient_version}`;
+
+// Privileged helper install state: "enabled" after the one-time system
+// registration prompt, "not installed" before the first connect.
+async function refreshHelperStatus() {
+  try {
+    const status = await invoke<"enabled" | "requires_approval" | "not_found" | "not_registered">(
+      "get_helper_status"
+    );
+    const labels = {
+      enabled: "helper: enabled",
+      requires_approval: "helper: needs approval",
+      not_found: "helper: app bundle missing",
+      not_registered: "helper: not installed",
+    };
+    helperStatusEl.textContent = labels[status] ?? `helper: ${status}`;
+    helperStatusEl.title = "Privileged gp-helper daemon (registered once via SMAppService)";
+  } catch {
+    helperStatusEl.textContent = "";
+  }
+}
+await refreshHelperStatus();
+setInterval(refreshHelperStatus, 15_000);
 
 setInterval(tickDuration, 1000);

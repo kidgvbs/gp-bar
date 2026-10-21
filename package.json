@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "icons": "node scripts/gen-app-icon.mjs"
+    "icons": "node scripts/gen-app-icon.mjs",
+    "build:bundle": "npm run tauri build && node scripts/finalize-bundle.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"

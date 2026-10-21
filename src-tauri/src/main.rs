@@ -8,9 +8,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod helper;
 mod icons;
-mod osascript;
+mod proto;
 mod vpn;
+mod xpc;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,9 +77,8 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
   if portal.is_empty() {
     return Err("Portal is empty".to_string());
   }
-  if !portal.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
-    return Err("Portal may only contain letters, digits, dots, dashes and underscores".to_string());
-  }
+  // Same charset rule the gp-helper daemon re-checks (defense in depth).
+  proto::validate_portal(&portal)?;
   let selected = {
     let mut cfg = state.config.lock().unwrap();
     if !cfg.portals.contains(&portal) {
@@ -94,7 +95,11 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
 }
 
 #[tauri::command]
-fn remove_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
+fn remove_portal(
+  app: AppHandle,
+  state: State<'_, AppContext>,
+  portal: String,
+) -> Result<(), String> {
   let selected = {
     let mut cfg = state.config.lock().unwrap();
     cfg.portals.retain(|p| p != &portal);
@@ -109,7 +114,11 @@ fn remove_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -
 }
 
 #[tauri::command]
-fn select_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
+fn select_portal(
+  app: AppHandle,
+  state: State<'_, AppContext>,
+  portal: String,
+) -> Result<(), String> {
   let selected = {
     let mut cfg = state.config.lock().unwrap();
     if cfg.portals.contains(&portal) {
@@ -147,18 +156,21 @@ async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), 
 #[tauri::command]
 async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
   let controller = state.controller.clone();
-  // Interrupt a connecting worker by unloading the one-shot launchd job:
-  // launchd terminates it, which runs the worker's own teardown instead of
-  // a blind kill. Needs root as well, so this also shows the admin dialog.
-  pin_panel(&app, true);
-  if let Err(error) =
-    vpn::run_admin_script(vpn::build_cancel_script(&vpn::daemon_plist_path())).await
-  {
+  // Interrupt a connecting worker through the root daemon: SIGTERM the
+  // worker GP Bar's helper spawned, so it runs its own teardown. No admin
+  // prompt: the helper is already registered.
+  if let Err(error) = helper::cancel().await {
     eprintln!("gp-bar: cancel failed: {error}");
+    controller.connect_failed(&app, format!("cancel failed: {error}"));
+    return Ok(());
   }
-  pin_panel(&app, false);
   controller.connect_failed(&app, "Connection canceled".to_string());
   Ok(())
+}
+
+#[tauri::command]
+fn get_helper_status() -> helper::HelperStatus {
+  helper::status()
 }
 
 #[tauri::command]
@@ -178,42 +190,34 @@ async fn do_connect(
 
   match controller.snapshot().phase {
     Phase::Connected | Phase::Connecting | Phase::Disconnecting => {
-      return Err(format!("cannot connect while {:?}", controller.snapshot().phase));
+      return Err(format!(
+        "cannot connect while {:?}",
+        controller.snapshot().phase
+      ));
     }
     Phase::Disconnected | Phase::Error => {}
   }
 
-  let cfg = state.config.lock().unwrap().clone();
-  let gpclient = cfg.resolve_gpclient().ok_or_else(|| {
-    "gpclient not found. Install it with `brew install gpclient` or set its path in the config file.".to_string()
-  })?;
+  // Same charset the daemon re-checks: no shell metacharacters reach argv.
+  proto::validate_portal(portal)?;
 
-  std::fs::create_dir_all(Config::log_dir())
-    .map_err(|error| format!("cannot create the log directory: {error}"))?;
-  let log_path = Config::connect_log_path();
-
-  // Stage the launchd job first (see build_connect_plist): the worker must
-  // be born from launchd, not from the admin shell, to stay signalable.
-  let console_user = vpn::console_user();
-  let plist =
-    vpn::build_connect_plist(&gpclient, portal, reuse_cookie, &log_path, console_user.as_ref());
-  std::fs::write(vpn::staged_plist_path(), &plist)
-    .map_err(|error| format!("cannot stage the daemon job: {error}"))?;
-  let script = vpn::build_daemon_connect_script(
-    &vpn::staged_plist_path(),
-    &vpn::daemon_plist_path(),
-    &log_path,
-  );
+  // Register the helper daemon on first use: the ONE place a system
+  // authorization prompt can appear (afterwards `status` is Enabled and
+  // everything runs promptless over XPC).
+  pin_panel(&app, true);
+  let register = helper::ensure_ready().await;
+  pin_panel(&app, false);
+  register?;
 
   controller.begin_connect(&app, portal.to_string());
   let _ = app.emit("vpn-log-cleared", ());
 
-  pin_panel(&app, true);
-  let result = vpn::run_admin_script(script).await;
-  pin_panel(&app, false);
+  // The root daemon truncates the connect log and spawns gpclient as its
+  // own child (SUDO_UID/SUDO_USER of the console user in its env); the
+  // status poller adopts the worker from the lock file once the tunnel is
+  // up, and the log tailer streams its JSON records into the panel.
+  let result = helper::start(portal, reuse_cookie).await;
   match result {
-    // No worker PID comes back from launchd; the status poller adopts the
-    // worker from the lock file once the tunnel is established.
     Ok(_) => Ok(()),
     Err(error) => {
       controller.connect_failed(&app, error.clone());
@@ -229,22 +233,15 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     Phase::Disconnecting => return Ok(()),
     _ => return Err("not connected".to_string()),
   }
-  let cfg = state.config.lock().unwrap().clone();
-  let gpclient = cfg
-    .resolve_gpclient()
-    .ok_or_else(|| "gpclient not found".to_string())?;
 
   controller.begin_disconnect(&app);
-  let script = vpn::build_disconnect_script(&gpclient, &vpn::daemon_plist_path());
-  pin_panel(&app, true);
-  let result = vpn::run_admin_script(script).await;
-  pin_panel(&app, false);
-  if let Err(error) = result {
+  // `gpclient disconnect` via the daemon, verified against the lock file
+  // (10s): the daemon fails loud instead of leaving a stuck
+  // "Disconnecting", and never SIGKILLs (a killed worker skips the
+  // vpnc-script teardown that restores DNS settings and routes). The
+  // poller reports the still-connected truth from the lock file.
+  if let Err(error) = helper::stop().await {
     eprintln!("gp-bar: disconnect failed: {error}");
-    // Fail loud, never SIGKILL: the worker may ignore the signal (see
-    // build_connect_plist) and a killed worker skips the vpnc-script
-    // teardown, leaving macOS DNS settings pointing at VPN resolvers.
-    // The poller reports the still-connected truth from the lock file.
     controller.disconnect_failed(&app, format!("disconnect failed: {error}"));
   }
   Ok(())
@@ -383,7 +380,13 @@ fn main() {
       // is reachable in a fresh session. The removed native tray menu used
       // to be the implicit seeding path (it connected straight from
       // `config.selected`); without this a restart left the button dead.
-      let selected = app.state::<AppContext>().config.lock().unwrap().selected.clone();
+      let selected = app
+        .state::<AppContext>()
+        .config
+        .lock()
+        .unwrap()
+        .selected
+        .clone();
       controller.note_selected_portal(app.handle(), selected);
 
       // Tray through tauri's own API, NOT a raw tray-icon one: tauri claims
@@ -451,6 +454,7 @@ fn main() {
       get_state,
       get_config,
       get_versions,
+      get_helper_status,
       add_portal,
       remove_portal,
       select_portal,

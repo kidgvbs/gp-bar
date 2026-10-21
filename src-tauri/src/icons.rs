@@ -53,11 +53,7 @@ fn padlock_coverage(x: f32, y: f32, connected: bool) -> f32 {
 
   // Where the shackle exists: above the cut line the ring shows, below it
   // the ring is irrelevant (the body covers the joint).
-  let leg_cut = if connected || x <= 11.0 {
-    10.5
-  } else {
-    6.9
-  };
+  let leg_cut = if connected || x <= 11.0 { 10.5 } else { 6.9 };
   let shackle = if y < leg_cut { ring } else { 1.0 };
 
   let body_fill = 1.0 - smoothstep(-0.5, 0.5, body);
@@ -71,8 +67,8 @@ fn padlock_coverage(x: f32, y: f32, connected: bool) -> f32 {
     alpha *= 1.0 - cap;
   } else {
     // Keyhole: a small circle plus a stem, cut out of the body.
-    let hole = sd_circle(x, y, 11.0, 12.4, 1.6)
-      .min(sd_rounded_rect(x, y, 11.0, 14.7, 0.65, 1.5, 0.6));
+    let hole =
+      sd_circle(x, y, 11.0, 12.4, 1.6).min(sd_rounded_rect(x, y, 11.0, 14.7, 0.65, 1.5, 0.6));
     let cut = 1.0 - smoothstep(-0.5, 0.5, hole);
     // The cut only applies inside the body area.
     if body < 0.5 {
