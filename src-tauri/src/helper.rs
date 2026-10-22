@@ -7,11 +7,14 @@
 //! app (user, Tauri) ──XPC (mach service dev.gpbar.helper)──> gp-helper (root daemon)
 //! ```
 //!
-//! * The daemon is registered ONCE through `SMAppService`: the plist must
-//!   live inside the app bundle (`Contents/Library/LaunchDaemons/`) at
-//!   registration time. GP Bar ships it as a plain resource, and copies it
-//!   into place at runtime — the app lives in `~/Applications`, which is
-//!   user-writable.
+//! * The daemon is registered ONCE through `SMAppService`: the plist ships
+//!   INSIDE the app bundle at build time
+//!   (`Contents/Library/LaunchDaemons/dev.gpbar.helper.plist`, written by
+//!   `scripts/finalize-bundle.mjs` BEFORE the ad-hoc codesign step, so the
+//!   plist is covered by the bundle signature — BTM requirement). Nothing
+//!   is written into the bundle at runtime: a runtime re-sign would change
+//!   the cdhash at every launch and is our prime suspect for the BTM
+//!   quarantina (RECAP.md §13).
 //! * `Program` in the daemon plist is an ABSOLUTE path into the bundle, so
 //!   a registered app must not move; a rebuild that keeps the same path
 //!   does NOT need re-registration (launchd re-reads the plist at every
@@ -19,13 +22,16 @@
 //! * Every privileged operation is a fixed XPC message with scalar
 //!   arguments; nothing arbitrary travels over the wire.
 //!
+//! Turnover: the daemon is `KeepAlive`, so a rebuild does NOT replace a
+//! resident one. Before every operation the client handshakes on
+//! `BUILD_REV` (baked into both binaries at build time by `build.rs`) and
+//! asks a stale daemon to terminate itself; launchd then re-spawns the
+//! helper from the NEW binary on disk.
+//!
 //! XPC sync replies must not be requested from event handlers
 //! (`connection.h`); every call here runs through `spawn_blocking`.
 
-use std::{
-  fs,
-  path::{Path, PathBuf},
-};
+use std::time::Duration;
 
 use block2::RcBlock;
 use objc2_foundation::NSString;
@@ -59,138 +65,6 @@ impl HelperStatus {
   }
 }
 
-// -- bundle plumbing ----------------------------------------------------------------
-
-/// `…/GP Bar.app`, from the running executable path.
-///
-/// `None` outside a real bundle (`cargo run` / `tauri dev`): helper
-/// registration only makes sense from the installed app.
-pub fn app_bundle() -> Option<PathBuf> {
-  let exe = std::env::current_exe().ok()?;
-  let macos = exe.parent()?; // Contents/MacOS
-  let contents = macos.parent()?; // Contents
-  if !contents.join("Info.plist").is_file() {
-    return None;
-  }
-  Some(contents.parent()?.to_path_buf())
-}
-
-/// `…/GP Bar.app/Contents/Library/LaunchDaemons/dev.gpbar.helper.plist` —
-/// where SMAppService looks for `DAEMON_PLIST`.
-pub fn daemon_plist_path() -> Option<PathBuf> {
-  app_bundle().map(|bundle| {
-    bundle
-      .join("Contents")
-      .join("Library")
-      .join("LaunchDaemons")
-      .join(proto::DAEMON_PLIST)
-  })
-}
-
-/// The `gp-helper` sidecar inside the bundle (Tauri strips the target-triple
-/// suffix from `externalBin` entries when copying into `Contents/MacOS`).
-pub fn helper_binary() -> Option<PathBuf> {
-  app_bundle().map(|bundle| bundle.join("Contents").join("MacOS").join("gp-helper"))
-}
-
-/// Re-sign the app bundle ad-hoc, covering the just-written LaunchDaemons
-/// plist (see `sync_daemon_plist`). `codesign` walks nested executables, so
-/// the `gp-helper` sidecar is signed too. User-owned bundle: no admin needed.
-fn re_sign_bundle() -> Result<(), String> {
-  let bundle =
-    app_bundle().ok_or_else(|| "GP Bar is not running from an app bundle".to_string())?;
-  let output = std::process::Command::new("/usr/bin/codesign")
-    .arg("--force")
-    .arg("--sign")
-    .arg("-")
-    .arg("--identifier")
-    .arg(proto::BUNDLE_IDENTIFIER)
-    .arg(&bundle)
-    .output()
-    .map_err(|e| format!("cannot run codesign: {e}"))?;
-  if !output.status.success() {
-    return Err(format!(
-      "re-signing the bundle failed: {}",
-      String::from_utf8_lossy(&output.stderr).trim()
-    ));
-  }
-  Ok(())
-}
-
-/// The LaunchDaemon plist SMAppService installs.
-///
-/// * `MachServices` + `RunAtLoad false`: launchd boots the daemon on demand
-///   when the first client looks up the Mach service.
-/// * `KeepAlive true`: once booted it STAYS up, so the XPC service answers
-///   instantly; the VPN worker lives in its own one-shot launchd job (see
-///   `proto::build_worker_plist`), so the daemon needs no child bookkeeping.
-/// * `Standard{Out,Error}Path`: the daemon's own log, on the connect-log
-///   layout the app already tails (the worker's log is a separate file).
-pub fn build_daemon_plist(helper: &Path) -> String {
-  let daemon_log = crate::config::Config::log_dir().join("gp-helper.log");
-  format!(
-    r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key><string>dev.gpbar.helper</string>
-	<key>ProgramArguments</key>
-	<array><string>{helper}</string></array>
-	<key>MachServices</key>
-	<dict><key>dev.gpbar.helper</key><true/></dict>
-	<key>KeepAlive</key><true/>
-	<key>RunAtLoad</key><false/>
-	<key>StandardOutPath</key><string>{log}</string>
-	<key>StandardErrorPath</key><string>{log}</string>
-</dict>
-</plist>
-"#,
-    helper = proto::xml_escape(&helper.to_string_lossy()),
-    log = proto::xml_escape(&daemon_log.to_string_lossy()),
-  )
-}
-
-/// The plist the bundle should carry right now (`None` outside a bundle).
-fn expected_plist() -> Option<String> {
-  helper_binary().map(|helper| build_daemon_plist(&helper))
-}
-
-/// Make sure the in-bundle plist exists and matches the current bundle path.
-///
-/// The app runs from a user-writable location (`~/Applications`), so a plain
-/// file write is enough — no admin privileges. A stale plist (bundle moved)
-/// is detected by the caller through `status`/`plist_is_current` and fixed
-/// by `unregister` + `register`.
-///
-/// BTM requires the LaunchDaemons plist to be **covered by the bundle
-/// signature** when `register` loads it (error -67054, "Codesigning failure
-/// loading plist"): a plist written at runtime lands *outside* the sealed
-/// resources, so the bundle is re-signed ad-hoc here (the same step
-/// `scripts/finalize-bundle.mjs` performs at build time; the user owns the
-/// bundle, so no admin prompt). With a real Developer ID distribution the
-/// plist ships at build time and this becomes a no-op via `plist_is_current`.
-fn sync_daemon_plist() -> Result<PathBuf, String> {
-  let (path, content) = match (daemon_plist_path(), expected_plist()) {
-    (Some(path), Some(content)) => (path, content),
-    _ => return Err("GP Bar is not running from an app bundle: install it (e.g. into ~/Applications) to use the privileged helper".to_string()),
-  };
-  if let Some(dir) = path.parent() {
-    fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-  }
-  fs::write(&path, &content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-  re_sign_bundle()?;
-  Ok(path)
-}
-
-fn plist_is_current() -> bool {
-  match (daemon_plist_path(), expected_plist()) {
-    (Some(path), Some(content)) => {
-      fs::read_to_string(&path).ok().as_deref() == Some(content.as_str())
-    }
-    _ => false,
-  }
-}
-
 // -- SMAppService ------------------------------------------------------------------
 
 fn daemon_service() -> objc2::rc::Retained<SMAppService> {
@@ -209,22 +83,14 @@ pub fn status() -> HelperStatus {
 }
 
 /// Blocking register (system authorization prompt when needed). Call through
-/// `spawn_blocking`.
+/// `spawn_blocking`. The LaunchDaemons plist ships with the bundle (written
+/// at build time by `scripts/finalize-bundle.mjs`), so there is nothing to
+/// sync here — and no runtime re-sign: a plist re-written (and re-signed)
+/// after the fact would land outside the sealed BTM record.
 pub fn register() -> Result<(), String> {
-  if plist_is_current() && status().is_ready() {
+  if status().is_ready() {
     return Ok(());
   }
-  // The plist changed since registration (bundle moved/rebuilt in place):
-  // launchd would keep booting the stale Program, so re-register.
-  if !plist_is_current() && status().is_ready() {
-    if let Err(error) = unsafe { daemon_service().unregisterAndReturnError() } {
-      eprintln!(
-        "gp-bar: unregistering the moved helper failed: {}",
-        error.localizedDescription()
-      );
-    }
-  }
-  sync_daemon_plist()?;
   match unsafe { daemon_service().registerAndReturnError() } {
     Ok(()) => Ok(()),
     Err(error) => Err(format!(
@@ -256,7 +122,8 @@ pub struct StartReply {
   pub worker_pid: i64,
 }
 
-fn call(op: &str, portal: Option<&str>, reuse_cookie: bool) -> Result<serde_json::Value, String> {
+/// Open a client connection to the helper's Mach service.
+fn open() -> Result<xpc::xpc_connection_t, String> {
   let conn = xpc::create_client(proto::SERVICE);
   if conn.is_null() {
     return Err("cannot create a connection to the GP Bar helper".to_string());
@@ -268,7 +135,17 @@ fn call(op: &str, portal: Option<&str>, reuse_cookie: bool) -> Result<serde_json
   });
   xpc::set_event_handler(conn, on_error);
   xpc::resume(conn);
+  Ok(conn)
+}
 
+/// Send one operation and parse the sync reply (`{ok, error?, pid, uid,
+/// version?}`).
+fn request(
+  conn: xpc::xpc_connection_t,
+  op: &str,
+  portal: Option<&str>,
+  reuse_cookie: bool,
+) -> Result<serde_json::Value, String> {
   let msg = xpc::dict_new();
   xpc::dict_set_string(msg, proto::KEY_OP, op);
   if let Some(portal) = portal {
@@ -284,7 +161,11 @@ fn call(op: &str, portal: Option<&str>, reuse_cookie: bool) -> Result<serde_json
     let error = xpc::dict_get_string(reply, proto::KEY_ERROR);
     let pid = xpc::dict_get_int64(reply, proto::KEY_PID);
     let uid = xpc::dict_get_int64(reply, proto::KEY_UID);
-    let value = serde_json::json!({ "pid": pid, "uid": uid });
+    let version = xpc::dict_get_string(reply, proto::KEY_VERSION);
+    let mut value = serde_json::json!({ "pid": pid, "uid": uid });
+    if let Some(version) = version {
+      value["version"] = serde_json::json!(version);
+    }
     if ok {
       Ok(value)
     } else {
@@ -294,6 +175,50 @@ fn call(op: &str, portal: Option<&str>, reuse_cookie: bool) -> Result<serde_json
     Err("the GP Bar helper daemon is unreachable".to_string())
   };
   xpc::release(reply);
+  result
+}
+
+/// Does a daemon reporting `remote` need to be turned over? A daemon from a
+/// different build (stale `BUILD_REV`) must be replaced before serving.
+fn daemon_is_stale(remote: &str) -> bool {
+  remote != env!("BUILD_REV")
+}
+
+/// One full operation: handshake on `BUILD_REV`, turn over a stale daemon,
+/// then run the requested op on a fresh connection.
+fn call(op: &str, portal: Option<&str>, reuse_cookie: bool) -> Result<serde_json::Value, String> {
+  let conn = open()?;
+  // Version handshake: the KeepAlive daemon survives rebuilds, so make sure
+  // the resident binary matches this app before trusting it with the op.
+  let daemon_rev = request(conn, proto::OP_GET_VERSION, None, false)
+    .ok()
+    .and_then(|value| {
+      value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    });
+  if let Some(rev) = &daemon_rev {
+    if daemon_is_stale(rev) {
+      eprintln!(
+        "gp-bar: helper daemon rev {rev} != app rev {}: requesting turnover",
+        env!("BUILD_REV")
+      );
+      let _ = request(conn, proto::OP_TERMINATE_SELF, None, false);
+      xpc::cancel(conn);
+      // launchd KeepAlive re-spawns the daemon from the NEW binary on disk.
+      std::thread::sleep(Duration::from_millis(proto::TURNOVER_SETTLE_MS));
+      let conn = open()?;
+      let result = request(conn, op, portal, reuse_cookie);
+      xpc::cancel(conn);
+      return result;
+    }
+  } else {
+    // Pre-handshake daemon (older build): nothing we can ask it to do that
+    // it does not know; just proceed with the op.
+    eprintln!("gp-bar: helper daemon did not report a version; skipping turnover handshake");
+  }
+  let result = request(conn, op, portal, reuse_cookie);
   xpc::cancel(conn);
   result
 }
@@ -341,25 +266,20 @@ mod tests {
   use super::*;
 
   #[test]
-  fn plist_carries_mach_services_and_the_absolute_helper_path() {
-    let plist = build_daemon_plist(Path::new(
-      "/Users/me/Applications/GP Bar.app/Contents/MacOS/gp-helper",
-    ));
-    assert!(plist.contains("<key>Label</key><string>dev.gpbar.helper</string>"));
-    assert!(plist.contains(
-      "<array><string>/Users/me/Applications/GP Bar.app/Contents/MacOS/gp-helper</string></array>"
-    ));
-    assert!(plist.contains("<key>MachServices</key>"));
-    assert!(plist.contains("<key>dev.gpbar.helper</key><true/>"));
-    assert!(plist.contains("<key>RunAtLoad</key><false/>"));
-    assert!(plist.contains("<key>KeepAlive</key><true/>"));
-  }
-
-  #[test]
   fn status_labels_are_short_and_stable() {
     assert_eq!(HelperStatus::Enabled.label(), "enabled");
     assert_eq!(HelperStatus::NotRegistered.label(), "not installed");
     assert!(HelperStatus::Enabled.is_ready());
     assert!(!HelperStatus::NotRegistered.is_ready());
+  }
+
+  #[test]
+  fn turnover_compares_against_the_baked_build_rev() {
+    // The daemon rev is a build identifier baked at compile time: any
+    // mismatch turns the daemon over, an exact match does not.
+    assert!(daemon_is_stale("0000000"));
+    assert!(daemon_is_stale(""));
+    assert!(!daemon_is_stale(env!("BUILD_REV")));
+    assert!(!env!("BUILD_REV").is_empty());
   }
 }
