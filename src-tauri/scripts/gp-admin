@@ -67,6 +67,21 @@ start)
   log_dir="$home/Library/Logs/gp-bar"
   log_path="$log_dir/gpclient-connect.log"
   mkdir -p "$DAEMON_DIR" "$log_dir"
+
+  # A leftover lock from a crashed worker (or a forced reboot) would make the
+  # next gpclient refuse to start ("another instance is running"). If the PID
+  # it names is gone, the lock is stale: remove it before starting. We are
+  # root here, so kill -0 sees root PIDs too.
+  if [ -f "$LOCK" ]; then
+    old_pid=$(cat "$LOCK" 2>/dev/null || true)
+    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+      echo "gp-admin: removing stale lock file (PID $old_pid is gone)" >&2
+      rm -f "$LOCK"
+    else
+      die "a VPN worker is already running (PID $old_pid)"
+    fi
+  fi
+
   # One log per attempt: the panel tailer rewinds on shrink, so truncating
   # here is the "new attempt" signal (same contract as the old flow).
   : > "$log_path"
