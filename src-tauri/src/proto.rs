@@ -24,8 +24,9 @@ use std::{
 
 /// The Mach service name both the LaunchDaemon plist (`MachServices`) and
 /// the app-side client look up.
-/// The app bundle identifier (tauri.conf.json `identifier`), used when
-/// re-signing the bundle ad-hoc at runtime — see `helper::re_sign_bundle`.
+/// The app bundle identifier (tauri.conf.json `identifier`), used by
+/// `scripts/finalize-bundle.mjs` when signing the bundle ad-hoc at build
+/// time (the only signing step: nothing is re-signed at runtime anymore).
 pub const BUNDLE_IDENTIFIER: &str = "dev.gpbar.s1";
 
 pub const SERVICE: &CStr = c"dev.gpbar.helper";
@@ -46,6 +47,9 @@ pub const KEY_ERROR: &CStr = c"error";
 pub const KEY_PID: &CStr = c"pid";
 /// uid of the daemon (`selftest` reply): 0 proves the whole chain.
 pub const KEY_UID: &CStr = c"uid";
+/// `BUILD_REV` of the answering daemon (`get_version` reply): the client
+/// compares it against its own to turn a stale daemon over.
+pub const KEY_VERSION: &CStr = c"version";
 
 // -- operations --------------------------------------------------------------------
 
@@ -53,6 +57,18 @@ pub const OP_START: &str = "start";
 pub const OP_STOP: &str = "stop";
 pub const OP_CANCEL: &str = "cancel";
 pub const OP_SELFTEST: &str = "selftest";
+/// Handshake op: the daemon replies with its `BUILD_REV` (see `build.rs`).
+/// The client uses it to detect a daemon from a stale build.
+pub const OP_GET_VERSION: &str = "get_version";
+/// Ask the daemon to exit(0): the reply is sent FIRST, then the daemon
+/// exits and launchd `KeepAlive` re-spawns it from the new binary on disk
+/// (the daemon is resident: nothing but a rebuild-aware exit replaces it).
+pub const OP_TERMINATE_SELF: &str = "terminate_self";
+
+/// How long the client waits after `terminate_self` before reconnecting:
+/// launchd must re-spawn the daemon from the fresh binary for the retry to
+/// land on the NEW code and not on a dying socket.
+pub const TURNOVER_SETTLE_MS: u64 = 300;
 
 // -- shared policy -----------------------------------------------------------------
 
@@ -268,6 +284,11 @@ mod tests {
     assert_eq!(OP_STOP, "stop");
     assert_eq!(OP_CANCEL, "cancel");
     assert_eq!(OP_SELFTEST, "selftest");
+    assert_eq!(OP_GET_VERSION, "get_version");
+    assert_eq!(OP_TERMINATE_SELF, "terminate_self");
+    // The turnover settle delay only needs to outlive a daemon exit + spawn;
+    // a third of a second is plenty for launchd KeepAlive.
+    assert!(TURNOVER_SETTLE_MS >= 300);
   }
 
   #[test]

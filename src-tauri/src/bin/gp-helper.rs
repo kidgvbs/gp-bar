@@ -20,6 +20,11 @@
 //! * `cancel` — unload the one-shot job: launchd terminates the worker,
 //!   which runs its own teardown instead of a blind kill.
 //! * `selftest` — reply with the daemon uid (0 proves the chain).
+//! * `get_version` — reply with this daemon's `BUILD_REV` (from `build.rs`)
+//!   so the client can detect a stale daemon after a rebuild.
+//! * `terminate_self` — reply Ok, then exit(0): launchd `KeepAlive` then
+//!   re-spawns the daemon from the NEW binary on disk (the automatic
+//!   turnover — see `helper::call`).
 //!
 //! No paths travel over the wire; the portal is re-validated here with the
 //! same charset as the app (`proto::validate_portal`).
@@ -103,8 +108,15 @@ fn main() {
 
 // -- replies ------------------------------------------------------------------------
 
-/// Reply `{ok, error?, pid, uid}` on the request's remote connection.
-fn reply(_state: &State, message: xpc::xpc_object_t, ok: bool, error: Option<&str>) {
+/// Reply `{ok, error?, pid, uid, version?}` on the request's remote
+/// connection. `version` is set only by `get_version`.
+fn reply(
+  _state: &State,
+  message: xpc::xpc_object_t,
+  ok: bool,
+  error: Option<&str>,
+  version: Option<&str>,
+) {
   let reply = xpc::make_reply(message);
   if reply.is_null() {
     eprintln!("gp-helper: message carried no reply context (one-way send)");
@@ -113,6 +125,9 @@ fn reply(_state: &State, message: xpc::xpc_object_t, ok: bool, error: Option<&st
   xpc::dict_set_bool(reply, proto::KEY_OK, ok);
   if let Some(error) = error {
     xpc::dict_set_string(reply, proto::KEY_ERROR, error);
+  }
+  if let Some(version) = version {
+    xpc::dict_set_string(reply, proto::KEY_VERSION, version);
   }
   xpc::reply_set_int64(reply, proto::KEY_PID, 0);
   xpc::reply_set_int64(reply, proto::KEY_UID, unsafe { libc::getuid() } as i64);
@@ -128,6 +143,12 @@ fn handle_message(state: &Arc<State>, message: xpc::xpc_object_t) {
   }
   let op = xpc::dict_get_string(message, proto::KEY_OP).unwrap_or_default();
   eprintln!("gp-helper: op={op}");
+  if op == proto::OP_GET_VERSION {
+    // Handshake: report this daemon's BUILD_REV so the client can detect a
+    // stale (pre-rebuild) daemon and ask for a turnover.
+    reply(state, message, true, None, Some(env!("BUILD_REV")));
+    return;
+  }
   let (ok, error) = match op.as_str() {
     proto::OP_START => {
       let portal = xpc::dict_get_string(message, proto::KEY_PORTAL).unwrap_or_default();
@@ -146,9 +167,21 @@ fn handle_message(state: &Arc<State>, message: xpc::xpc_object_t) {
       Err(error) => (false, Some(error)),
     },
     proto::OP_SELFTEST => (true, None),
+    proto::OP_TERMINATE_SELF => {
+      // Reply Ok below, THEN exit: launchd KeepAlive re-spawns the daemon
+      // from the NEW binary on disk (this one is resident, a rebuild alone
+      // would never replace it). The exit runs on a timer thread so the
+      // reply is flushed before the process goes away.
+      eprintln!("gp-helper: terminate_self requested; exiting for turnover");
+      std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        std::process::exit(0);
+      });
+      (true, None)
+    }
     _ => (false, Some("unknown operation".to_string())),
   };
-  reply(state, message, ok, error.as_deref());
+  reply(state, message, ok, error.as_deref(), None);
 }
 
 // -- console user / paths ------------------------------------------------------------
