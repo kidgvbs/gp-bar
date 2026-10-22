@@ -33,17 +33,13 @@ execSync("cargo build --release --bin gp-helper", {
   stdio: ["ignore", "ignore", "inherit"],
 });
 
-// Absolute path: the daemon plist's ProgramArguments must point at the
-// installed bundle from launchd's perspective (no cwd), like the runtime
-// version did.
-const bundle = resolve(
-  "src-tauri",
-  "target",
-  "release",
-  "bundle",
-  "macos",
-  "GP Bar S1.app",
-);
+// The bundle path defaults to the freshly built one; pass an explicit path
+// to finalize a bundle that was ALREADY copied somewhere stable (the install
+// flow: `cp -R` to ~/Applications, then re-run this script with that path).
+// The plist's ProgramArguments is absolute, so it must be rewritten against
+// the FINAL location — a bundle moved after the plist was baked would point
+// launchd at the build tree, and break as soon as `target/` is cleaned.
+const bundle = resolve(process.argv[2] ?? join("src-tauri", "target", "release", "bundle", "macos", "GP Bar S1.app"));
 const macos = join(bundle, "Contents", "MacOS");
 cpSync(join("src-tauri", "target", "release", "gp-helper"), join(macos, "gp-helper"));
 
