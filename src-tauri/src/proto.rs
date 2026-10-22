@@ -65,6 +65,89 @@ pub const LOCK_FILE: &str = "/var/run/gpclient.lock";
 /// `gpclient disconnect` (and after SIGTERM on cancel) before failing loud.
 pub const GRACEFUL_STOP_TIMEOUT_SECS: u64 = 10;
 
+// -- the one-shot launchd job for the VPN worker --------------------------------------
+//
+// On macOS 27.0.1 (26A434) a root worker born as a child of the gp-helper
+// daemon (itself a launchd child) is signal-deaf, exactly like the
+// authtrampoline/AEWP children of the October incident: `gpclient
+// disconnect` exits 0, the lock file never goes, the phase sticks. Only
+// workers born DIRECTLY of launchd stay signalable (RECAP.md). The daemon
+// therefore generates and loads a one-shot launchd job per connect — the
+// same design as the sudoers wrapper of solution 3, executed with root
+// privileges from the XPC daemon instead of sudo.
+
+/// Label of the one-shot worker job.
+pub const WORKER_LABEL: &str = "dev.gpbar.s1.worker";
+
+/// Where the daemon installs the worker job. Distinct from solution 3's
+/// `/Library/Application Support/GP Bar/` so the two installs never clash.
+pub const WORKER_PLIST: &str = "/Library/Application Support/GP Bar S1/gp-worker.plist";
+
+/// XML-escape a value for a plist. The portal is charset-validated, but the
+/// paths come from system APIs: stay safe by construction.
+pub fn xml_escape(value: &str) -> String {
+  let mut escaped = String::with_capacity(value.len());
+  for ch in value.chars() {
+    match ch {
+      '&' => escaped.push_str("&amp;"),
+      '<' => escaped.push_str("&lt;"),
+      '>' => escaped.push_str("&gt;"),
+      '"' => escaped.push_str("&quot;"),
+      '\'' => escaped.push_str("&apos;"),
+      _ => escaped.push(ch),
+    }
+  }
+  escaped
+}
+
+/// The one-shot launchd job plist the daemon loads per connect.
+///
+/// `RunAtLoad` + no `KeepAlive`, outside `/Library/LaunchDaemons` (no boot
+/// autostart): loaded only when the daemon asks launchd to run it.
+pub fn build_worker_plist(
+  gpclient: &Path,
+  portal: &str,
+  reuse_cookie: bool,
+  log_path: &Path,
+  uid: &str,
+  name: &str,
+) -> String {
+  let args = proto_connect_argv_xml(gpclient, portal, reuse_cookie);
+  format!(
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>{label}</string>
+	<key>ProgramArguments</key><array>{args}</array>
+	<key>EnvironmentVariables</key><dict>
+		<key>HOME</key><string>/var/root</string>
+		<key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>SUDO_UID</key><string>{uid}</string>
+		<key>SUDO_USER</key><string>{name}</string>
+	</dict>
+	<key>StandardOutPath</key><string>{log}</string>
+	<key>StandardErrorPath</key><string>{log}</string>
+	<key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"#,
+    label = WORKER_LABEL,
+    args = args,
+    uid = xml_escape(uid),
+    name = xml_escape(name),
+    log = xml_escape(&log_path.to_string_lossy()),
+  )
+}
+
+/// ProgramArguments as XML strings (shares `connect_argv`'s ordering).
+fn proto_connect_argv_xml(gpclient: &Path, portal: &str, reuse_cookie: bool) -> String {
+  connect_argv(gpclient, portal, reuse_cookie)
+    .iter()
+    .map(|arg| format!("<string>{}</string>", xml_escape(arg)))
+    .collect()
+}
+
 /// Portal charset, identical to `add_portal` in main.rs. Re-checked in the
 /// daemon so a malicious client cannot smuggle shell metacharacters or
 /// traversal segments into argv.
@@ -124,6 +207,27 @@ pub fn connect_argv(gpclient: &Path, portal: &str, reuse_cookie: bool) -> Vec<St
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn worker_plist_carries_the_connect_job_and_env() {
+    let plist = build_worker_plist(
+      Path::new("/opt/homebrew/bin/gpclient"),
+      "gp.imm.re",
+      true,
+      Path::new("/Users/test/Library/Logs/gp-bar/gpclient-connect.log"),
+      "501",
+      "test",
+    );
+    assert!(plist.contains("<string>dev.gpbar.s1.worker</string>"));
+    assert!(plist.contains("<string>--log-format</string><string>json</string>"));
+    assert!(plist.contains("<string>gp.imm.re</string>"));
+    assert!(plist.contains("<string>--cookie-cache</string>"));
+    assert!(plist.contains("<key>SUDO_UID</key><string>501</string>"));
+    assert!(plist.contains("<key>StandardOutPath</key>"));
+    assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+    // KeepAlive must stay absent: one-shot only, no autorestart.
+    assert!(!plist.contains("KeepAlive"));
+  }
 
   #[test]
   fn portals_are_validated_with_the_add_portal_charset() {

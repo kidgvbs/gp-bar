@@ -121,12 +121,13 @@ fn re_sign_bundle() -> Result<(), String> {
 ///
 /// * `MachServices` + `RunAtLoad false`: launchd boots the daemon on demand
 ///   when the first client looks up the Mach service.
-/// * `KeepAlive true`: once booted it STAYS up. Decision: the worker must
-///   remain manageable via XPC (stop/cancel) for the whole tunnel lifetime,
-///   and `cancel` needs the child PID only the live daemon remembers — a
-///   daemon that exits between `start` and `cancel` would lose it. Cost: a
-///   sleeping root process between connections (personal tool: accepted).
+/// * `KeepAlive true`: once booted it STAYS up, so the XPC service answers
+///   instantly; the VPN worker lives in its own one-shot launchd job (see
+///   `proto::build_worker_plist`), so the daemon needs no child bookkeeping.
+/// * `Standard{Out,Error}Path`: the daemon's own log, on the connect-log
+///   layout the app already tails (the worker's log is a separate file).
 pub fn build_daemon_plist(helper: &Path) -> String {
+  let daemon_log = crate::config::Config::log_dir().join("gp-helper.log");
   format!(
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -139,26 +140,14 @@ pub fn build_daemon_plist(helper: &Path) -> String {
 	<dict><key>dev.gpbar.helper</key><true/></dict>
 	<key>KeepAlive</key><true/>
 	<key>RunAtLoad</key><false/>
+	<key>StandardOutPath</key><string>{log}</string>
+	<key>StandardErrorPath</key><string>{log}</string>
 </dict>
 </plist>
 "#,
-    helper = xml_escape(&helper.to_string_lossy())
+    helper = proto::xml_escape(&helper.to_string_lossy()),
+    log = proto::xml_escape(&daemon_log.to_string_lossy()),
   )
-}
-
-fn xml_escape(value: &str) -> String {
-  let mut escaped = String::with_capacity(value.len());
-  for ch in value.chars() {
-    match ch {
-      '&' => escaped.push_str("&amp;"),
-      '<' => escaped.push_str("&lt;"),
-      '>' => escaped.push_str("&gt;"),
-      '"' => escaped.push_str("&quot;"),
-      '\'' => escaped.push_str("&apos;"),
-      _ => escaped.push(ch),
-    }
-  }
-  escaped
 }
 
 /// The plist the bundle should carry right now (`None` outside a bundle).

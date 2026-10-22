@@ -3,18 +3,22 @@
 //!
 //! It executes ONLY fixed operations with scalar arguments:
 //!
-//! * `start` — resolve `gpclient` (console user's config override, then the
-//!   Homebrew candidates: mirrors `config::Config::resolve_gpclient`), spawn
-//!   it DIRECTLY (`Command`, never `sh -c`) as a child of this daemon, with
-//!   stdout/stderr on the connect log and the `SUDO_UID`/`SUDO_USER` pair of
-//!   the console user in its environment (the SAML `--browser` flow drops
-//!   privileges through that pair; without it the browser auth dies with
-//!   "… cannot be run as root").
-//! * `stop` — `gpclient disconnect`, then poll `/var/run/gpclient.lock` for
-//!   the worker's own cleanup; fail LOUD if it never goes (never SIGKILL: a
-//!   killed worker skips the vpnc-script teardown and leaves the system DNS
-//!   pointing at VPN resolvers).
-//! * `cancel` — SIGTERM the connecting worker and wait for its exit.
+//! * `start` — resolve `gpclient` (Homebrew candidates only: a root daemon
+//!   must not execute user-configured paths), validate the portal, then
+//!   generate and LOAD a one-shot launchd job running the connect. The
+//!   worker is born a DIRECT child of launchd: on macOS 27.0.1 (26A434)
+//!   root workers born any other way (authtrampoline, or a child of this
+//!   daemon) are signal-deaf and can never be disconnected gracefully
+//!   (RECAP.md). stdout/stderr land on the user's connect log (the job's
+//!   StandardOutPath), with the `SUDO_UID`/`SUDO_USER` pair of the console
+//!   user in the environment (the SAML `--browser` flow drops privileges
+//!   through that pair).
+//! * `stop` — `gpclient disconnect`, then poll `/var/run/gpclient.lock`
+//!   for the worker's own cleanup; fail LOUD if it never goes (never
+//!   SIGKILL: a killed worker skips the vpnc-script teardown and leaves
+//!   the system DNS pointing at VPN resolvers), then unload the job.
+//! * `cancel` — unload the one-shot job: launchd terminates the worker,
+//!   which runs its own teardown instead of a blind kill.
 //! * `selftest` — reply with the daemon uid (0 proves the chain).
 //!
 //! No paths travel over the wire; the portal is re-validated here with the
@@ -36,25 +40,17 @@ use std::{
   fs,
   os::unix::fs::PermissionsExt,
   path::{Path, PathBuf},
-  process::{Command, Stdio},
-  sync::{Arc, Condvar, Mutex},
+  process::Command,
+  sync::Arc,
   time::{Duration, Instant},
 };
 
 use block2::RcBlock;
 
-/// `Mutex<bool>` + `Condvar`: set once the reaper collected the worker.
-type ExitPair = (Mutex<bool>, Condvar);
-
-struct Worker {
-  pid: u32,
-  exited: Arc<ExitPair>,
-}
-
+/// No daemon-side bookkeeping: the worker lives in a launchd job (pid from
+/// the lock file), so there is no child to reap or remember.
 #[derive(Default)]
-struct State {
-  worker: Mutex<Option<Worker>>,
-}
+struct State {}
 
 fn main() {
   let uid = unsafe { libc::getuid() };
@@ -108,14 +104,7 @@ fn main() {
 // -- replies ------------------------------------------------------------------------
 
 /// Reply `{ok, error?, pid, uid}` on the request's remote connection.
-fn reply(state: &State, message: xpc::xpc_object_t, ok: bool, error: Option<&str>) {
-  let worker_pid = state
-    .worker
-    .lock()
-    .unwrap()
-    .as_ref()
-    .map(|w| w.pid as i64)
-    .unwrap_or(0);
+fn reply(_state: &State, message: xpc::xpc_object_t, ok: bool, error: Option<&str>) {
   let reply = xpc::make_reply(message);
   if reply.is_null() {
     eprintln!("gp-helper: message carried no reply context (one-way send)");
@@ -125,7 +114,7 @@ fn reply(state: &State, message: xpc::xpc_object_t, ok: bool, error: Option<&str
   if let Some(error) = error {
     xpc::dict_set_string(reply, proto::KEY_ERROR, error);
   }
-  xpc::reply_set_int64(reply, proto::KEY_PID, worker_pid);
+  xpc::reply_set_int64(reply, proto::KEY_PID, 0);
   xpc::reply_set_int64(reply, proto::KEY_UID, unsafe { libc::getuid() } as i64);
   let remote = xpc::remote_connection(message);
   xpc::send(remote, reply);
@@ -210,7 +199,7 @@ fn connect_log_path(home: &Path) -> PathBuf {
 
 // -- operations ---------------------------------------------------------------------
 
-fn start(state: &Arc<State>, portal: &str, reuse_cookie: bool) -> Result<(), String> {
+fn start(_state: &Arc<State>, portal: &str, reuse_cookie: bool) -> Result<(), String> {
   proto::validate_portal(portal)?;
 
   // Defense in depth: the app only calls start while idle, and a worker
@@ -232,74 +221,56 @@ fn start(state: &Arc<State>, portal: &str, reuse_cookie: bool) -> Result<(), Str
   }
   // Truncate like the old `: > log` in the admin script: the app's log
   // tailer rewinds on shrink, so this marks a fresh connection attempt.
-  let log = fs::OpenOptions::new()
-    .create(true)
-    .write(true)
-    .truncate(true)
-    .open(&log_path)
-    .map_err(|e| format!("cannot truncate {}: {e}", log_path.display()))?;
-  // Keep it readable by the user app that tails it (the daemon's umask is
-  // not guaranteed to be 022).
+  // The job's StandardOutPath then appends the worker's output to it.
+  fs::write(&log_path, b"").map_err(|e| format!("cannot truncate {}: {e}", log_path.display()))?;
   let _ = fs::set_permissions(&log_path, fs::Permissions::from_mode(0o644));
 
-  let argv = proto::connect_argv(&gpclient, portal, reuse_cookie);
-  let log_err = log
-    .try_clone()
-    .map_err(|e| format!("cannot clone the log handle: {e}"))?;
-  let mut child = Command::new(&argv[0])
-    .args(&argv[1..])
-    // HOME keeps the root worker's cookie cache where it always lived
-    // (/var/root/.config/gpclient) so --cookie-cache stays useful.
-    .env("HOME", "/var/root")
-    .env("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-    // The SAML `--browser` auth helper drops privileges through this pair
-    // (gpapi resolves the real user from SUDO_UID/PKEXEC_UID/DOAS_USER):
-    // without it every browser-auth connect dies with
-    // "… cannot be run as root" as soon as the SSO cookie expires.
-    .env("SUDO_UID", uid.to_string())
-    .env("SUDO_USER", &name)
-    .stdout(Stdio::from(log))
-    .stderr(Stdio::from(log_err))
-    .spawn()
-    .map_err(|e| format!("cannot spawn the gpclient worker: {e}"))?;
-  let pid = child.id();
+  // Generate the one-shot launchd job and let LAUNCHD run the connect: a
+  // worker born as this daemon's child would be signal-deaf on this macOS
+  // beta (see the module doc), and one born directly of launchd stays
+  // signalable — `gpclient disconnect` can then actually stop it.
+  let job_dir = PathBuf::from("/Library/Application Support/GP Bar S1");
+  let worker_plist = job_dir.join("gp-worker.plist");
+  fs::create_dir_all(&job_dir).map_err(|e| format!("cannot create {}: {e}", job_dir.display()))?;
+  fs::write(
+    &worker_plist,
+    proto::build_worker_plist(
+      &gpclient,
+      portal,
+      reuse_cookie,
+      &log_path,
+      &uid.to_string(),
+      &name,
+    ),
+  )
+  .map_err(|e| format!("cannot write {}: {e}", worker_plist.display()))?;
+  let _ = fs::set_permissions(&worker_plist, fs::Permissions::from_mode(0o644));
 
-  let exited: Arc<ExitPair> = Arc::new((Mutex::new(false), Condvar::new()));
-  let mut slot = state.worker.lock().unwrap();
-  if let Some(previous) = slot.as_ref() {
-    if !is_exited(&previous.exited) {
-      return Err(format!(
-        "a gpclient worker is already running (pid {})",
-        previous.pid
-      ));
-    }
+  // Idempotent load (leading unload recovers from a worker that exited
+  // outside GP Bar); `launchctl` failing here means the job never started.
+  let _ = Command::new("/bin/launchctl")
+    .args(["unload", "-w"])
+    .arg(&worker_plist)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status();
+  let loaded = Command::new("/bin/launchctl")
+    .args(["load", "-w"])
+    .arg(&worker_plist)
+    .output()
+    .map_err(|e| format!("cannot run launchctl: {e}"))?;
+  if !loaded.status.success() {
+    return Err(format!(
+      "launchctl load failed: {}",
+      String::from_utf8_lossy(&loaded.stderr).trim()
+    ));
   }
-  *slot = Some(Worker {
-    pid,
-    exited: exited.clone(),
-  });
-  drop(slot);
 
-  // Reap the child (root would otherwise accumulate a zombie per connect)
-  // and forget the worker bookkeeping once it exits.
-  let reaper_state = state.clone();
-  std::thread::spawn(move || {
-    let _ = child.wait();
-    let (lock, cvar) = &*exited;
-    *lock.lock().unwrap() = true;
-    cvar.notify_all();
-    let mut slot = reaper_state.worker.lock().unwrap();
-    if slot.as_ref().is_some_and(|w| w.pid == pid) {
-      *slot = None;
-    }
-  });
-
-  eprintln!("gp-helper: started gpclient worker pid={pid} portal={portal}");
+  eprintln!(
+    "gp-helper: loaded worker job {} portal={portal}",
+    proto::WORKER_LABEL
+  );
   Ok(())
-}
-
-fn is_exited(exited: &Arc<ExitPair>) -> bool {
-  *exited.0.lock().unwrap()
 }
 
 /// `gpclient disconnect` + poll the lock file, failing loud (never SIGKILL).
@@ -328,47 +299,27 @@ fn stop(_state: &Arc<State>) -> Result<(), String> {
     }
     std::thread::sleep(Duration::from_millis(500));
   }
+  unload_worker_job();
   Ok(())
 }
 
-/// SIGTERM the connecting worker and wait for its exit; no SIGKILL.
-fn cancel(state: &Arc<State>) -> Result<(), String> {
-  let worker = state.worker.lock().unwrap().take();
-  let Some(worker) = worker else {
-    // Idempotent: nothing we spawned is connecting (the app restarted, or
-    // the worker already reaped itself).
-    return Ok(());
-  };
-  if is_exited(&worker.exited) {
-    return Ok(());
-  }
-  // SIGTERM: the worker tears the tunnel down on this signal. Never
-  // SIGKILL — a killed worker skips the vpnc-script teardown.
-  let rc = unsafe { libc::kill(worker.pid as i32, libc::SIGTERM) };
-  if rc != 0 {
-    return Err(format!(
-      "cannot signal the worker (pid {}): errno {}",
-      worker.pid, rc
-    ));
-  }
-  let deadline = Instant::now() + Duration::from_secs(proto::GRACEFUL_STOP_TIMEOUT_SECS);
-  let (lock, cvar) = &*worker.exited;
-  let mut exited = lock.lock().unwrap();
-  while !*exited {
-    let now = Instant::now();
-    if now >= deadline {
-      return Err(format!(
-        "the worker (pid {}) did not exit after SIGTERM",
-        worker.pid
-      ));
-    }
-    let (guard, _) = cvar
-      .wait_timeout(exited, deadline.saturating_duration_since(now))
-      .unwrap();
-    exited = guard;
-  }
-  drop(exited);
-  eprintln!("gp-helper: canceled worker pid={}", worker.pid);
+/// Unload the one-shot worker job. Used by `stop` (cleanup) and `cancel`
+/// (launchd then terminates the connecting worker, which runs its own
+/// teardown instead of a blind kill — never SIGKILL).
+fn unload_worker_job() {
+  let _ = Command::new("/bin/launchctl")
+    .args(["unload", "-w"])
+    .arg(proto::WORKER_PLIST)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status();
+}
+
+/// Unload the connecting worker's job: launchd terminates it, which runs its
+/// own teardown instead of a blind kill.
+fn cancel(_state: &Arc<State>) -> Result<(), String> {
+  unload_worker_job();
+  eprintln!("gp-helper: unloaded worker job {}", proto::WORKER_LABEL);
   Ok(())
 }
 
