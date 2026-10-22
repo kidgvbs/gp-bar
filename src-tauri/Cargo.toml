@@ -16,6 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "fs"] }
 dirs = "5"
+# Only kill(pid, 0) for worker liveness (no fork/exec like the old `ps -p`),
+# no other libc use. tauri already links libc transitively.
+libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Tray handles are created directly (not through tauri::tray), pinned to the
 # exact 0.25.0 verified working on this machine. The early theories about

@@ -20,7 +20,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -256,15 +255,18 @@ pub fn read_lock_observation() -> Option<LockObservation> {
     })
 }
 
-/// `ps -p <pid>` avoids linking libc just for kill(pid, 0).
+/// `kill(pid, 0)` sends no signal: it only probes existence, and needs no
+/// fork/exec (the old `ps -p` spawned a subprocess every poll tick). When the
+/// probe fails with EPERM the process exists but belongs to root — our worker.
 fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "pid="])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: kill(2) with signal 0 only performs the permission/existence
+    // check; it never delivers a signal.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    ret == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 // -- background tasks ---------------------------------------------------------
@@ -274,10 +276,65 @@ pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
     tauri::async_runtime::spawn(async move {
         loop {
             let observation = read_lock_observation();
+            // Connecting without a lock file means the tunnel never came up:
+            // gpclient only writes the lock once it is established, so a dead
+            // worker here is a failed attempt (wrong SSO, closed browser,
+            // gateway error, crash) — surface it instead of spinning forever.
+            // The one-shot job stays loaded (no KeepAlive), so probing it
+            // needs the `pid =` line, not the command's exit status.
+            if observation.is_none() && controller.snapshot().phase == Phase::Connecting {
+                if let Some(false) = worker_has_active_pid(WORKER_LABEL).await {
+                    // The job is loaded but has no live process: gpclient ran
+                    // and exited before the tunnel came up (wrong SSO, closed
+                    // browser, gateway error, crash).
+                    controller.connect_failed(
+                        &app,
+                        "The VPN worker exited before the tunnel came up".to_string(),
+                    );
+                }
+                // Some(true) = still authenticating; None = the job is not
+                // loaded yet (the poller can tick between begin_connect and
+                // the wrapper's `launchctl load`) or launchctl failed:
+                // nothing to report here. `run_admin("start")` reports its
+                // own failure, and cancel/stop set their own phases.
+            }
             controller.observe_lock(&app, observation);
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
+}
+
+/// `dev.gpbar.worker` — the label of the one-shot launchd job the admin
+/// wrapper generates for the root gpclient worker.
+const WORKER_LABEL: &str = "dev.gpbar.worker";
+
+/// Whether the worker's launchd job currently has a live process assigned.
+///
+/// `launchctl print` is readable by an unprivileged user, but its exit status
+/// is useless as a liveness probe: a `RunAtLoad` job without KeepAlive stays
+/// loaded (exit 0, `state = not running`, `last exit code = <n>`) long after
+/// the process died. The `pid = <n>` line is the truth: it is only present
+/// while launchd has a process for the job.
+///
+/// * `Some(true)` — the `pid =` line is there: the worker process is alive.
+/// * `Some(false)` — the job is loaded but has no `pid =`: it ran and exited.
+/// * `None` — the job is not in the domain (exit 113, e.g. before the
+///   wrapper's first `launchctl load`) or launchctl failed: unknown.
+async fn worker_has_active_pid(label: &str) -> Option<bool> {
+    let target = format!("system/{label}");
+    let output = tokio::process::Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("pid = ")),
+    )
 }
 
 /// Tail the connect log file and stream parsed JSON records to the frontend.
@@ -340,7 +397,8 @@ async fn tail_chunk(
     // Guard: never grow the buffer unboundedly if gpclient never prints a newline.
     if buffer.len() > 1 << 20 {
         buffer.clear();
-        new_offset = std::fs::metadata(path)
+        new_offset = tokio::fs::metadata(path)
+            .await
             .map(|m| m.len())
             .unwrap_or(new_offset);
     }
