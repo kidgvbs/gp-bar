@@ -208,9 +208,16 @@ async fn do_connect(
   // authorization prompt can appear (afterwards `status` is Enabled and
   // everything runs promptless over XPC). Done AFTER begin_connect so a
   // failure lands in the Error state instead of vanishing silently.
+  //
+  // SMAppService has to present its authorization sheet, and an Accessory
+  // app (no Dock/menubar presence, never frontmost) cannot own a key
+  // window: the registration fails with EPERM and no prompt. Step up to
+  // Regular for the call, then back — the sheet anchors to the app.
+  let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
   pin_panel(&app, true);
   let register = helper::ensure_ready().await;
   pin_panel(&app, false);
+  let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
   if let Err(error) = register {
     eprintln!("gp-bar: helper registration failed: {error}");
     controller.connect_failed(&app, error.clone());
