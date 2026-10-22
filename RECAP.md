@@ -1,8 +1,8 @@
 # Recap — Nuovo client GUI per la VPN aziendale (GP Bar)
 
-**Data:** 20 ottobre 2026
+**Data:** 20–22 ottobre 2026
 **Richiesta:** riscrivere un client GUI come GP Connect.app ma **senza il limite di 1 ora** sulla durata della connessione VPN, usando REA per l'analisi.
-**Esito:** ✅ `GP Bar.app` costruito, avviato e in esecuzione nella menu bar. Nessun limite di tempo. ⚠️ **In sospeso:** su macOS 27.0.1 beta il click sul tray non risponde — diario completo del debug e piano di escalation in **§8**.
+**Esito:** ✅ `GP Bar.app` in produzione nella menu bar, nessun limite di tempo, **zero prompt** su connect/disconnect (soluzione 3, wrapper sudoers NOPASSWD). La soluzione 1 (SMAppService+XPC) è validata meccanicamente ma **parcheggiata su branch** per via di comportamenti instabili di BTM su questa beta — vedi **§12**.
 
 ---
 
@@ -78,9 +78,10 @@ gp-bar/
 ├── scripts/gen-app-icon.mjs                     # icona .icns generata via codice (PNG encoder a mano + iconutil)
 ├── src-tauri/
 │   ├── src/main.rs                              # setup Tauri, tray+menu, finestra popover, comandi IPC
-│   ├── src/vpn.rs                               # macchina a stati, poller lock file, tailer log JSON, script builder
+│   ├── src/vpn.rs                               # macchina a stati, poller lock file, tailer log JSON, helper admin (`run_admin`)
 │   ├── src/config.rs                            # portali/porte persistiti (default: gp.imm.re)
-│   ├── src/osascript.rs                         # wrapper admin + escaping shell/AppleScript (testato)
+│   ├── scripts/gp-admin                         # wrapper root-owned: operazioni fisse (il confine di sicurezza)
+│   ├── scripts/setup-admin.sh                   # installer una-tantum (wrapper + sudoers NOPASSWD)
 │   └── src/icons.rs                             # icone tray template disegnate via SDF (22×22, antialiasing 4×)
 └── reference/GlobalProtect-openconnect/        # clone shallow del sorgente open source (gitignored)
 ```
@@ -88,6 +89,8 @@ gp-bar/
 Comandi IPC: `get_state`, `get_config`, `get_versions`, `add/remove/select_portal`, `set_reuse_cookie`, `connect`, `disconnect`, `cancel`.
 
 Stati: `Disconnected → Connecting → Connected → Disconnecting → Disconnected/Error` con rilevamento anche di VPN avviate fuori dall'app (lock file esistente).
+
+*(Nota storica: `osascript.rs` — il wrapper admin di v0.1 — è stato rimosso in `52d9767` quando l'elevazione è passata al wrapper sudoers; il §12 racconta il percorso.)*
 
 ---
 
@@ -103,12 +106,12 @@ Note operative: 1 prompt admin per connect, 1 per disconnect (come `sudo` da ter
 
 ---
 
-## 6. Roadmap v2 (da concordare)
+## 6. Daemons senza prompt — le due strade percorse
 
-**Demone `gp-bard`** per azioni senza prompt:
-- helper nel bundle registrato via `SMAppService` (macOS 13+), attivazione con password admin **una sola volta**
-- socket Unix `/var/run/gp-bard.sock` + protocollo JSON (connect/disconnect/status + stream log)
-- ~200 righe di Rust, senza adottare l'intero stack GPL di gpservice
+La vecchia roadmap ("demone via SMAppService + socket Unix") è stata realizzata, in due versioni alternative:
+
+- **Soluzione 3 (produzione, `main`)**: wrapper root-owned + sudoers NOPASSWD — §11.
+- **Soluzione 1 (branch `solution-1-smappservice`)**: LaunchDaemon via SMAppService + XPC al posto del socket Unix — §12. Parcheggiata per l'instabilità di BTM sulla beta corrente, con la nota di investigate in `docs/btm-27.0.1-beta.md`.
 
 ---
 
@@ -325,7 +328,7 @@ Su macOS 27.0.1 (26A434) beta, i processi **root generati da `AuthorizationExecu
 
 **Verifica end-to-end**: giro completo da GP Bar — disconnect del worker CLI-born ✓, connect via launchd ✓ (job `dev.gpbar.worker`, worker session leader), disconnect del worker launchd-born ✓ (DNS ripristinati dal vpnc-script, lock rimosso, fase Disconnected).
 
-**Residui**: (a) la sordità AEWP-root è un difetto della beta macOS da segnalare ad Apple (FB); (b) TOCTOU locale sul file staged prima dell'`install` root (rilevante solo su macchine multi-utente ostili); (c) il log connect resta root-owned (umask) — vedi §8.9; (d) `Cargo.lock` ancora ignorato.
+**Residui**: (a) la sordità AEWP-root è un difetto della beta macOS da segnalare ad Apple (FB); (b) TOCTOU locale sul file staged prima dell'`install` root — **chiuso** dalla soluzione 3 (§11: la plist è generata internamente al wrapper, niente staging); (c) il log connect root-owned — vedi §8.9 (mitigabile con umask, non critico per tool personale); (d) `Cargo.lock` ancora ignorato da `.gitignore` — raccomandazione §8.12 in sospeso.
 
 ---
 
@@ -364,3 +367,34 @@ SMAppService daemon + XPC (via `objc2-service-management` 0.3.2 + bindiggi `xpc_
 ### Bug del pulsante Connect (risolto, commit 15bbed7)
 
 `state.portal` nasceva `None` e solo `begin_connect` lo impostava; il menu nativo del tray (rimosso in 707cc8a) era l'unica path che lo seedava da `config.selected`. Risultato: app appena avviata → Connect disabilitato per sempre, segnalato "bloccato dopo il primo disconnect". Fix: `note_selected_portal`/`apply_selected_portal` (solo fasi idle Disconnected/Error), chiamati da setup e add/remove/select portal.
+
+---
+
+## 12. Giornata 22/10: la soluzione 3 in produzione, la 1 parcheggiata (con tre lezioni di debugging pagate)
+
+### 12.1 Soluzione 3 chiusa e in produzione (commit `52d9767`, `f133a9f`)
+
+Wrapper root-owned + sudoers NOPASSWD: setup una-tantum in Terminal (Touch ID), poi `sudo -n` su `/usr/local/lib/gp-bar/admin` per ogni operazione — **zero prompt, zero credenziali nel processo**, verificato anche dal canale dell'agente (sudoers concede solo quel path: il tentativo di `sudo -n cat` sul sudoers stesso viene rifiutato correttamente). Nel commit è finita anche la cancellazione di `HANDOFF-TRAY.md` (post-mortem del §8, già assorbito qui).
+
+### 12.2 Soluzione 1: meccanica validata, ma quattro bug pagati di persona
+
+Sviluppata sul branch da un sub-agent e testata da `~/Applications/GP Bar S1.app` (identità separata `dev.gpbar.s1`). Ogni bug di seguito è **fissato e committato** sul branch:
+
+1. **Bundle identity duplicata** (`d5e1513`): S1 e GP Bar condividevano `dev.gpbar.app` → SMAppService/BTM risolveva il chiamante in modo ambiguo, la registration falliva **senza prompt** e l'errore era **invisibile** (la `ensure_ready` girava prima di `begin_connect` → `Err` mostrato da nessuno). Fix: identità propria (`dev.gpbar.s1` / "GP Bar S1") + il fallimento atterra nello stato Error del pannello (con wrapping: niente più errori ellipsizzati) + log su stderr.
+2. **Privesc via gpclient_path utente** (`3a6d75b`, fix applicata in review): il daemon root leggeva `gpclient_path` dal config **user-writable** e lo eseguiva → privesc completa. Fix: il daemon risolve gpclient **solo** dai path Homebrew fissi; l'override del config resta user-side (display versione).
+3. **BTM `-67054` "Codesigning failure loading plist"** (`831e58f`): la plist del LaunchDaemon scritta a runtime non è coperta dalla firma del bundle → register rifiutato. Fix: l'app ri-firma ad-hoc il bundle (user-writable) dopo la scrittura, come fa il build.
+4. **EPERM silenzioso da app Accessory** (`999df9a`): il prompt di autorizzazione non può essere presentato da un'app mai frontmost. Fix: step-up a policy Regular per la chiamata, poi ritorno. **Confermato dall'utente: il prompt offre Touch ID.** ✅
+
+Con questi fix la catena completa è validata: registration → launchd avvia il daemon on-demand → XPC → worker root → tunnel su.
+
+### 12.3 Il muro: root signal-deaf esteso ai figli del daemon, e BTM instabile
+
+- **Matrice segnali aggiornata** (estende il §10): su questa beta **anche i root figli di un LaunchDaemon** (launchd → daemon → worker) sono sordi ai segnali — non solo i figli di authtrampoline. `gpclient disconnect` esce 0, il lock resta, il Disconnect si congela. **Solo i figli diretti di launchd restano signalable.** Il daemon è stato ridisegnato di conseguenza (commit `0838ab3`): `start` genera e carica un **job launchd one-shot** per il worker (label `dev.gpbar.s1.worker`, come il wrapper della soluzione 3); `stop`/`cancel` scaricano il job.
+- **Turnover del daemon** (lezione operativa): essendo il daemon KeepAlive/residente, **un rebuild del binario non lo sostituisce** — il vecchio processo continua a servire le connect dalla memoria. Metà dei "fallimenti" di testing della giornata erano in realtà la v1 ancora viva (individuata verificando che il worker aveva PPID = vecchio gp-helper, non 1). Serve unregister+register forzato (l'app lo fa se la plist del bundle non è current — si innesca toccando la plist); non testato fino in fondo a causa del punto dopo.
+- **BTM instabile su questa beta** (anomalie C e D del `docs/btm-27.0.1-beta.md`): registrazione validata che ore dopo risulta **NotFound spontaneo**; e dopo un `launchctl bootout` manuale + re-register (accettata senza prompt), **il job non riparte mai più** (`active count = 0`, client XPC unreachable, daemon mai avviato). Nessun unregister/register successivo ha sanato lo stato. Da riprendere dopo un reboot del sistema.
+
+### 12.4 Stato finale
+
+- **Produzione: soluzione 3** in `~/Applications/GP Bar.app`, funzionante, zero prompt. `README.md` allineato (`1bf2526`).
+- **Branch `solution-1-smappservice`** (worktree `~/Rust/gp-bar-solution1`, HEAD `0838ab3`): meccanicamente completa, parcheggiata per BTM. Da fare se ripresa: turnover automatico del daemon a ogni rebuild (check versione), test dopo reboot, spostare il bundle in `/Applications` se si vuole chiudere la falla del percorso user-writable.
+- Cartelle della 1 ripulite (bundle S1, SMProbe, plist `GP Bar S1`); la nota per il collega su BTM è in `docs/btm-27.0.1-beta.md` (commit `9b98301`).
