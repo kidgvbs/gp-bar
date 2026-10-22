@@ -97,6 +97,15 @@ body {
   max-width: 220px;
 }
 
+/* Error text wraps: never hide the tail of an error message. */
+.state-detail.error {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  max-width: none;
+  overflow-wrap: break-word;
+}
+
 .duration {
   margin-left: auto;
   font-variant-numeric: tabular-nums;

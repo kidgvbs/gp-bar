@@ -93,6 +93,30 @@ pub fn helper_binary() -> Option<PathBuf> {
   app_bundle().map(|bundle| bundle.join("Contents").join("MacOS").join("gp-helper"))
 }
 
+/// Re-sign the app bundle ad-hoc, covering the just-written LaunchDaemons
+/// plist (see `sync_daemon_plist`). `codesign` walks nested executables, so
+/// the `gp-helper` sidecar is signed too. User-owned bundle: no admin needed.
+fn re_sign_bundle() -> Result<(), String> {
+  let bundle =
+    app_bundle().ok_or_else(|| "GP Bar is not running from an app bundle".to_string())?;
+  let output = std::process::Command::new("/usr/bin/codesign")
+    .arg("--force")
+    .arg("--sign")
+    .arg("-")
+    .arg("--identifier")
+    .arg(proto::BUNDLE_IDENTIFIER)
+    .arg(&bundle)
+    .output()
+    .map_err(|e| format!("cannot run codesign: {e}"))?;
+  if !output.status.success() {
+    return Err(format!(
+      "re-signing the bundle failed: {}",
+      String::from_utf8_lossy(&output.stderr).trim()
+    ));
+  }
+  Ok(())
+}
+
 /// The LaunchDaemon plist SMAppService installs.
 ///
 /// * `MachServices` + `RunAtLoad false`: launchd boots the daemon on demand
@@ -148,6 +172,14 @@ fn expected_plist() -> Option<String> {
 /// file write is enough — no admin privileges. A stale plist (bundle moved)
 /// is detected by the caller through `status`/`plist_is_current` and fixed
 /// by `unregister` + `register`.
+///
+/// BTM requires the LaunchDaemons plist to be **covered by the bundle
+/// signature** when `register` loads it (error -67054, "Codesigning failure
+/// loading plist"): a plist written at runtime lands *outside* the sealed
+/// resources, so the bundle is re-signed ad-hoc here (the same step
+/// `scripts/finalize-bundle.mjs` performs at build time; the user owns the
+/// bundle, so no admin prompt). With a real Developer ID distribution the
+/// plist ships at build time and this becomes a no-op via `plist_is_current`.
 fn sync_daemon_plist() -> Result<PathBuf, String> {
   let (path, content) = match (daemon_plist_path(), expected_plist()) {
     (Some(path), Some(content)) => (path, content),
@@ -157,6 +189,7 @@ fn sync_daemon_plist() -> Result<PathBuf, String> {
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
   }
   fs::write(&path, &content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+  re_sign_bundle()?;
   Ok(path)
 }
 

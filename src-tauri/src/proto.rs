@@ -24,6 +24,10 @@ use std::{
 
 /// The Mach service name both the LaunchDaemon plist (`MachServices`) and
 /// the app-side client look up.
+/// The app bundle identifier (tauri.conf.json `identifier`), used when
+/// re-signing the bundle ad-hoc at runtime — see `helper::re_sign_bundle`.
+pub const BUNDLE_IDENTIFIER: &str = "dev.gpbar.s1";
+
 pub const SERVICE: &CStr = c"dev.gpbar.helper";
 
 /// The LaunchDaemon plist file name inside

@@ -212,6 +212,7 @@ async fn do_connect(
   let register = helper::ensure_ready().await;
   pin_panel(&app, false);
   if let Err(error) = register {
+    eprintln!("gp-bar: helper registration failed: {error}");
     controller.connect_failed(&app, error.clone());
     return Err(error);
   }

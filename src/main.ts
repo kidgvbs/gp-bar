@@ -109,6 +109,8 @@ function render(state: VpnState) {
   statusDot.className = "status-dot " + state.phase.toLowerCase();
   stateBlock.dataset.phase = state.phase;
 
+  // Error adds a wrapping class; reset it for non-error states.
+  stateDetail.className = "state-detail";
   switch (state.phase) {
     case "Connected":
       stateLabel.textContent = "Connected";
@@ -130,6 +132,9 @@ function render(state: VpnState) {
       break;
     case "Error":
       stateLabel.textContent = "Error";
+      // Wrap: error text (e.g. a failed helper registration) must be
+      // readable in full instead of ellipsized away.
+      stateDetail.className = "state-detail error";
       stateDetail.textContent = state.last_error ?? "Something went wrong";
       actionBtn.textContent = "Connect";
       actionBtn.disabled = false;
