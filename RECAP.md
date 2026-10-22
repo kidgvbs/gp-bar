@@ -326,3 +326,15 @@ Su macOS 27.0.1 (26A434) beta, i processi **root generati da `AuthorizationExecu
 **Verifica end-to-end**: giro completo da GP Bar — disconnect del worker CLI-born ✓, connect via launchd ✓ (job `dev.gpbar.worker`, worker session leader), disconnect del worker launchd-born ✓ (DNS ripristinati dal vpnc-script, lock rimosso, fase Disconnected).
 
 **Residui**: (a) la sordità AEWP-root è un difetto della beta macOS da segnalare ad Apple (FB); (b) TOCTOU locale sul file staged prima dell'`install` root (rilevante solo su macchine multi-utente ostili); (c) il log connect resta root-owned (umask) — vedi §8.9; (d) `Cargo.lock` ancora ignorato.
+
+---
+
+## 13. BTM: teoria quarantena cdhash e turnover automatico
+
+**Anomalia D — teoria superstite: quarantena BTM per re-sign runtime.** Il daemon `dev.gpbar.helper` registrato via SMAppService spariva dai record BTM con `NotFound` spontanei. Teoria superstite: l'app scriveva a runtime la `Contents/Library/LaunchDaemons/dev.gpbar.helper.plist` e poi ri-firmava ad-hoc l'intero bundle (`sync_daemon_plist` + `re_sign_bundle`), cambiando il **cdhash a ogni avvio**; un record BTM che punta a un cdhash ormai non corrispondente viene considerato corrotto → quarantena → `NotFound` spontaneo e `register` che fallisce con -67054 ("Codesigning failure loading plist"). La teoria alternativa del flag `disabled` di launchd è stata **falsificata empiricamente**: `launchctl print-disabled` mostra il servizio `enabled`, eppure non riparte. 
+
+**Fix strutturale (questo branch):** la plist del LaunchDaemon è ora generata a **build time** da `scripts/finalize-bundle.mjs` (step 3, PRIMA del codesign ad-hoc: la plist è coperta dalla firma del bundle) e l'app non scrive/né ri-firma più nulla a runtime — niente deriva del cdhash dopo l'installazione. Il turnover del daemon residente è ora gestito via protocollo (sotto), non più via unregister+register forzato.
+
+**Test di sblocco previsto:** `sudo sfltool resetbtm` — da eseguire **da Terminal da parte dell'utente** (non dall'agente), svuota i record BTM quarantinati e permette una registrazione pulita successiva. Su questa beta di macOS 27.0.1 BTM resta fragile: NON eseguire `sfltool resetbtm` né `launchctl load/bootout` in automazione.
+
+**Turnover automatico del daemon via BUILD_REV handshake.** Il daemon è `KeepAlive`/residente: un rebuild del binario NON lo sostituisce. Entrambi i binari del crate (app e `gp-helper`) ricevono da `build.rs` lo stesso `cargo:rustc-env=BUILD_REV=<git rev-parse --short HEAD>` (fallback: `CARGO_PKG_VERSION`). Protocollo: il client, prima di ogni operazione XPC, manda `get_version`; se la `BUILD_REV` del daemon differisce dalla propria manda `terminate_self` — il daemon risponde Ok e POI esce (`exit(0)` dopo ~100ms su un thread, così il reply parte), launchd KeepAlive lo ri-spawna dal binario NUOVO su disco; il client attende ~300ms (`proto::TURNOVER_SETTLE_MS`) e riprova l'operazione su una connessione fresca. Un daemon pre-handshake (build senza l'op) risponde "unknown operation": il client logga e prosegue, senza turnover possibile.
