@@ -33,11 +33,34 @@ with the CSS path kept intact as a fallback.
   view and clips the moved webview's layer to the same radius
   (`setCornerRadius:` / `setWantsLayer:` on the CALayer — matching the
   native approach seen in GP Connect 3.2.0).
-- **Conclusion: closed for our purposes.** Using 0.8.1 with
-  `.content_view()` is the documented fix. No workaround needed.
-- Still-open related upstream issues worth watching (not blocking, our
-  window is non-resizable): #230 "Liquid glass draws square corners on
-  undecorated windows (cornerRadius without clipsToBounds)".
+- **Conclusion: #198 closed.** Using 0.8.1 with `.content_view()` is the
+  documented fix. No workaround needed.
+
+## Issue #229 — macOS 27 packaged-crash warning (OPEN, watch it)
+
+- [tauri-apps/window-vibrancy#229](https://github.com/tauri-apps/window-vibrancy/issues/229)
+  (opened 2026-09-21, still **open**, labels `platform: macOS`, `type: bug`):
+  on **macOS 27**, a *packaged* Tauri app (custom-protocol on) with an
+  `NSGlassEffectView` behind the WK host can hit two AppKit SIGABRTs that
+  `tauri dev` does not reproduce:
+  1. **Crash 1** — native edge drag (`_resizeChangedForDirectTouch` →
+     `objc_initWeak`). **Not applicable to GP Bar**: our popover is
+     undecorated and non-resizable, there is no native resize gesture.
+  2. **Crash 2** — first paint via `WKURLSchemeHandler`
+     (`_realMakeFirstResponder` → `objc_storeWeak`), i.e. exactly our
+     packaged load path (`npm run tauri build` + `custom-protocol`).
+     **Potentially applicable**: the reporter ships packaged builds
+     *without* `NSGlassEffectView` for this reason; the 0.8
+     `content_view()` reparent is not a fix for either crash.
+- Consequence: the packaged bundle's **first open is a mandatory test**
+  (checklist below). `tauri dev` staying healthy proves nothing here.
+- If it reproduces: set `"liquid_glass": false` in the config for the
+  CSS fallback (no recompile needed) and keep the glass off packaged
+  builds until #229 is understood upstream.
+- Also worth watching, non-blocking for us (window non-resizable):
+  upstream reports of square corners on undecorated windows with a
+  custom `cornerRadius` — mitigated in 0.8.1 by the paired
+  `clipsToBounds` layer clipping we rely on for the radius.
 
 ## Version detection (runtime)
 
@@ -127,6 +150,11 @@ for native glass.
 Build the bundle (see the final report) and run it. On macOS 27 with
 `liquid_glass` unset/`true`:
 
+- [ ] **Packaged first open (issue #229, crash 2)**: launch the built
+  `.app` (not `tauri dev`) and open the panel — the process must NOT
+  SIGABRT on first paint (`Console.app` → Crash Reports, `Namespace OBJC`).
+  `tauri dev` healthy proves nothing: the crash is custom-protocol only.
+
 - [ ] **Blur**: panel over a busy desktop (photo, browser with text) —
   background visibly blurred/refracted behind the panel; not a flat gray.
 - [ ] **Light background**: open the panel over a bright/white area —
@@ -159,7 +187,13 @@ Variants to compare (one at a time, `src-tauri/src/glass.rs` +
 
 ## Recommendation
 
-Adopt: see the final report. TL;DR — the native path is sound (upstream
-#198 fixed, webview reparenting is the documented recipe), keep the config
-override for a rollback, and validate the scrim alpha with the checklist
-above.
+Adopt **conditionally, pending the packaged first-open test**. The native
+path itself is sound (upstream #198 closed by the #199 reparent we use,
+webview reparenting is the crate's documented recipe) and the config
+override gives an instant rollback (`"liquid_glass": false`, no rebuild).
+But upstream **#229 is open** and describes a first-paint SIGABRT in
+packaged custom-protocol Tauri apps on macOS 27 — our exact build/run
+combination — that `tauri dev` cannot catch. Until that first open of the
+bundle is verified clean, treat the glass as a prototype: run the
+checklist, and if the crash reproduces, keep `"liquid_glass": false`
+(config-level default-off is a one-line change in `resolve_effect`).
