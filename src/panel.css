@@ -24,7 +24,7 @@ body {
   /* Popover look: the window itself is borderless and transparent (see
      tauri.conf.json), so the shape and the vibrancy come from CSS. The blur
      samples the desktop content behind the window, like a native popover. */
-  border-radius: 12px;
+  border-radius: 16px;
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   background: rgba(246, 246, 248, 0.68);
 }

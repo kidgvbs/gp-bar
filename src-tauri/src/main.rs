@@ -425,11 +425,11 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         return;
     }
 
-    // Anchor the panel under the tray icon: the event carries the icon's
-    // global rect, and macOS physical coordinates are global (primary monitor
-    // at 0,0, others e.g. negative to its left), so clamp against the bounds
-    // of the monitor that HOLDS the icon — never against 0, which would drag
-    // the panel back onto the primary screen.
+    // Anchor the panel under the tray icon. The handler passes the click
+    // position (or the icon rect when it agrees with the click), and macOS
+    // physical coordinates are global (primary monitor at 0,0, others e.g.
+    // negative to its left), so resolve the monitor that HOLDS the anchor —
+    // never the primary — and clamp inside its work area.
     let anchor = anchor.or_else(|| {
         window
             .cursor_position()
@@ -439,20 +439,39 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
 
     if let (Some((ax, ay)), Ok(size)) = (anchor, window.outer_size()) {
         if let Ok(Some(monitor)) = app.monitor_from_point(ax, ay) {
-            let origin = monitor.position();
-            let msize = monitor.size();
+            // Clamp inside the work area (the visibleFrame: below the menu
+            // bar, beside the Dock) of the monitor holding the anchor.
+            // Evidence: GP Connect resolves "the monitor under the cursor"
+            // and clamps with visibleFrame — clamping against the full
+            // monitor bounds would let the panel slide under the menu bar.
+            let work = monitor.work_area();
+            let (wx, wy, ww, wh) = (
+                work.position.x as f64,
+                work.position.y as f64,
+                work.size.width as f64,
+                work.size.height as f64,
+            );
             // `outer_size` is physical ON THE CURRENT MONITOR: re-project it onto
             // the anchor monitor so the panel lands correctly when it hops between
             // retina and 1x displays (720 vs 360 physical px for the same panel).
             let scale = window.scale_factor().unwrap_or(1.0);
-            let panel_w = size.width as f64 / scale * monitor.scale_factor() as f64;
-            let x = (ax - panel_w / 2.0).clamp(
-                origin.x as f64,
-                (origin.x + msize.width as i32) as f64 - panel_w,
-            );
-            // Right under the menu bar: the tray-rect anchor already sits at the
-            // bottom of the menu bar, so this is as high as the panel can go.
-            let y = ay.max(origin.y as f64 + 24.0 * monitor.scale_factor() as f64);
+            let target_scale = monitor.scale_factor();
+            let panel_w = size.width as f64 / scale * target_scale;
+            let panel_h = size.height as f64 / scale * target_scale;
+            // `clamp` panics when min exceeds max: a work area smaller than
+            // the panel must degrade to an edge, not take the app down.
+            let x = if ww < panel_w {
+                wx
+            } else {
+                (ax - panel_w / 2.0).clamp(wx, wx + ww - panel_w)
+            };
+            // Right under the tray icon, but never above the work area's top
+            // edge (the menu bar) and never past its bottom.
+            let y = if wh < panel_h {
+                ay.max(wy)
+            } else {
+                ay.max(wy).min(wy + wh - panel_h)
+            };
             let _ = window.set_position(PhysicalPosition::new(x as i32, y as i32));
         }
     }
@@ -563,21 +582,36 @@ fn main() {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Down,
+                        position,
                         rect,
                         ..
                     } = event
                     {
+                        let (px, py) = (position.x, position.y);
                         let (rx, ry) = match rect.position {
                             tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
                             tauri::Position::Logical(l) => (l.x, l.y),
                         };
-                        let rh = match rect.size {
-                            tauri::Size::Physical(s) => s.height as f64,
-                            tauri::Size::Logical(s) => s.height,
+                        let (rw, rh) = match rect.size {
+                            tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+                            tauri::Size::Logical(s) => (s.width, s.height),
                         };
-                        // Global coordinates of the tray icon: anchor the panel right
-                        // below it (see toggle_panel).
-                        toggle_panel(tray.app_handle(), Some((rx, ry + rh)));
+                        // The click is the robust anchor (evidence: GP Connect
+                        // anchors its popover on the cursor too): it always
+                        // lives in the coordinates of the display the user is
+                        // actually looking at. Trust the icon rect only when
+                        // the click falls inside it — some macOS builds report
+                        // the status-item rect in a different space, and a bad
+                        // rect would drag the panel onto the wrong screen.
+                        let rect_valid = (px >= rx - 2.0 && px <= rx + rw + 2.0)
+                            && (py >= ry - 2.0 && py <= ry + rh + 2.0);
+                        let anchor = if rect_valid {
+                            // Centered on the icon, right under it.
+                            (rx + rw / 2.0, ry + rh)
+                        } else {
+                            (px, py)
+                        };
+                        toggle_panel(tray.app_handle(), Some(anchor));
                     }
                 })
                 .build(app)?;
