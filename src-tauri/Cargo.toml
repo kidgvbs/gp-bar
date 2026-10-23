@@ -35,6 +35,16 @@ window-vibrancy = "0.8.1"
 # view (its fix for the focus-edge breakage, issue #198). Version unified
 # with the one window-vibrancy 0.8.1 builds against (same maintainer tree).
 # objc2-foundation supplies NSProcessInfo for the runtime OS-version check.
+
+# Pre-connect gateway list: the panel replicates gpclient's authenticated
+# portal-config request (POST /global-protect/getconfig.esp with the cached
+# portal cookie) to parse the full gateway list from the XML response.
+# rustls with native roots keeps corporate/private CAs working; default
+# TLS features are off so nothing pulls in openssl.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+# Same XML parsing gpclient uses (crates/gpapi), for the config response.
+xmltree = "0.10"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc2-app-kit", "WKWebView"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSProcessInfo"] }

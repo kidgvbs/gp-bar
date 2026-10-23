@@ -10,6 +10,7 @@
 mod config;
 mod glass;
 mod icons;
+mod portal_config;
 mod vpn;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -283,6 +284,72 @@ fn remove_gateway(
         }
         cfg.save()?;
         cfg.clone()
+    };
+    broadcast_config(&app, &cfg);
+    Ok(())
+}
+
+/// Fill the picker with ALL the portal's gateways, pre-connect: replicate
+/// gpclient's authenticated portal-config request (`POST
+/// /global-protect/getconfig.esp`) with the cached portal cookie and parse
+/// the gateway list from the XML response (see `portal_config`). The cookie
+/// is written by the root worker and exposed read-only via
+/// `gp-admin show-cookie`; without one (never connected, reuse disabled, or
+/// the pre-`show-cookie` wrapper still deployed) this stays advisory — the
+/// harvested list is kept and the next connect refreshes it anyway.
+#[tauri::command]
+async fn refresh_gateways(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
+    // The picker is frozen while a connection is up or starting; the next
+    // disconnect settles into Disconnected and the frontend re-triggers.
+    match state.controller.snapshot().phase {
+        Phase::Disconnected | Phase::Error => {}
+        _ => return Ok(()),
+    }
+    let (portal, reuse_cookie) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.selected.clone(), cfg.reuse_cookie)
+    };
+    let Some(portal) = portal else {
+        return Ok(());
+    };
+    if !reuse_cookie {
+        // Without reuse gpclient never writes a cookie cache: nothing to
+        // authenticate the request with.
+        return Err(
+            "the cookie cache is disabled (enable 'Reuse authentication cookie')".to_string(),
+        );
+    }
+    let cookie_json = vpn::run_admin("show-cookie", &[]).await?;
+    let auth = portal_config::parse_stored_cookie(&cookie_json, &portal)?;
+    let gateways = portal_config::fetch_gateways(&portal, &auth).await?;
+    let cfg = {
+        let mut cfg = state.config.lock().unwrap();
+        let mut changed = false;
+        // Replace, don't merge: the portal config is the source of truth
+        // (gpclient connects to exactly these addresses), and the harvested
+        // entries are always a subset of it. A user-removed gateway comes
+        // back on the next refresh — by design, `remove_gateway` is for the
+        // rare stale address, not to hide a real one.
+        if gateways != cfg.gateways {
+            cfg.gateways = gateways;
+            // Drop dangling preferred/selected names.
+            if let Some(name) = cfg.preferred_gateway.clone() {
+                if !cfg.gateways.contains(&name) {
+                    cfg.preferred_gateway = None;
+                }
+            }
+            if let Some(name) = cfg.selected_gateway.clone() {
+                if !cfg.gateways.contains(&name) {
+                    cfg.selected_gateway = None;
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            cfg.save()?;
+        }
+        cfg.clone()
+        // Guard dropped before emitting (deadlock discipline, see vpn::update).
     };
     broadcast_config(&app, &cfg);
     Ok(())
@@ -684,6 +751,7 @@ fn main() {
             select_gateway,
             set_preferred_gateway,
             remove_gateway,
+            refresh_gateways,
             get_network_health,
             repair_network,
             connect,

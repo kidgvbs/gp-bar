@@ -86,7 +86,9 @@ gp-bar/
 └── reference/GlobalProtect-openconnect/        # clone shallow del sorgente open source (gitignored)
 ```
 
-Comandi IPC: `get_state`, `get_config`, `get_versions`, `add/remove/select_portal`, `set_reuse_cookie`, `connect`, `disconnect`, `cancel`.
+Comandi IPC: `get_state`, `get_config`, `get_versions`, `add/remove/select_portal`, `set_reuse_cookie`, `select/preferred/remove_gateway`, `refresh_gateways`, `connect`, `disconnect`, `cancel`, `get_network_health`, `repair_network`, `quit`.
+
+**Lista completa dei gateway pre-connect** (`refresh_gateways` + `gp-admin show-cookie`): `gpclient` logga solo il conteggio ("Found N gateways"), quindi il picker cresceva un harvest per volta dal log di connect. Il wrapper espone ora in lettura il cookie portale messo in cache dal worker root (`gp-admin show-cookie`, file root-only `/var/root/.config/gpclient/cookie.json` — l'app non può leggerlo da sola); con quel cookie il backend replica la richiesta autenticata del client ufficiale (`POST /global-protect/getconfig.esp`, parametri da `gpapi::params::portal_getconfig`, cookie come form params) e sostituisce `cfg.gateways` con la lista completa parsata dall'XML (indirizzi `entry name=`: `find_gateway` di gpclient li accetta direttamente). Advisory: senza cookie (mai connessi, reuse spento, wrapper pre-`show-cookie`) la lista harvest resta; il refresh scatta a pannello aperto da disconnessi e a ogni Disconnect. Richiede il re-deploy del wrapper (`setup-admin.sh`) per attivarsi.
 
 Stati: `Disconnected → Connecting → Connected → Disconnecting → Disconnected/Error` con rilevamento anche di VPN avviate fuori dall'app (lock file esistente).
 
@@ -96,7 +98,7 @@ Stati: `Disconnected → Connecting → Connected → Disconnecting → Disconne
 
 ## 5. Build, test e stato attuale
 
-- ✅ `cargo test`: **7/7** (escaping shell/AppleScript, script builder, parsing gateway, icone)
+- ✅ `cargo test`: **16/16** (escaping shell/AppleScript, script builder, parsing gateway, cookie portale/form getconfig/XML config, icone)
 - ✅ Build release (`npm run tauri build`): `src-tauri/target/release/bundle/macos/GP Bar.app` (6.9 MiB, arm64, ad-hoc signed)
 - ✅ Smoke test: app avviata via `open`, processo stabile, tray visibile (lucchetto vuoto = disconnesso)
 - ⏳ **Da collaudare a mano** (serve password admin + SSO nel browser): flusso connect completo, posizionamento popover sotto l'icona, connessione oltre le 2 ore per confermare l'assenza di limiti

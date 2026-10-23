@@ -328,6 +328,25 @@ async function refreshPortals() {
   render(state);
 }
 
+// -- full gateway list (pre-connect) --------------------------------------------
+// The backend replicates gpclient's authenticated portal-config request
+// with the cached cookie and replaces the picker list with the portal's
+// full answer. Advisory only: failures (no cookie yet, old wrapper, cookie
+// expired) keep the harvested list — the connect log still harvests.
+let gatewaysRefreshedAt = 0;
+
+async function refreshGateways(throttleMs = 60_000) {
+  if (Date.now() - gatewaysRefreshedAt < throttleMs) return;
+  gatewaysRefreshedAt = Date.now();
+  try {
+    await invoke("refresh_gateways");
+  } catch (error) {
+    // Expected on a fresh setup (connect once with reuse enabled) and with
+    // the pre-`show-cookie` wrapper: not worth bothering the user.
+    console.warn("refresh_gateways skipped:", error);
+  }
+}
+
 // -- residual-DNS banner -------------------------------------------------------
 // A crashed gpclient (e.g. after an overnight standby) skips the vpnc-script
 // teardown and leaves its manual DNS servers on the active network service.
@@ -506,6 +525,9 @@ await listen<VpnState>("vpn-state", (e) => {
   // worker leaves the manual DNS servers behind.
   if (e.payload.phase === "Disconnected" || e.payload.phase === "Error") {
     refreshNetworkHealth();
+    // The picker unfroze: bring it to the portal's full list (the connect
+    // just refreshed the cookie, so the request usually succeeds).
+    refreshGateways();
   }
 });
 await listen<LogEvent>("vpn-log", (e) => appendLog(e.payload));
@@ -519,6 +541,9 @@ await listen("vpn-log-cleared", () => {
 await listen<PortalsConfig>("config-updated", (e) => renderPortals(e.payload));
 
 await refreshPortals();
+// Full gateway list at panel load (when disconnected): the cached cookie
+// usually suffices, see refreshGateways.
+void refreshGateways(0);
 // Residual-DNS banner: first health check at panel load.
 await refreshNetworkHealth();
 

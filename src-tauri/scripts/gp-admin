@@ -5,7 +5,8 @@
 #
 # This file IS the security boundary, hence the rules:
 #   * fixed operations only:
-#       selftest | start <portal> <0|1> [gateway|-] | stop | cancel | repair
+#       selftest | start <portal> <0|1> [gateway|-] | stop | cancel |
+#       repair | show-cookie
 #   * every argument is validated here — the caller is untrusted input
 #   * no caller-controlled paths, no eval, no sh -c of interpolated strings
 #   * the launchd job plist is fully generated from validated values, so a
@@ -181,6 +182,19 @@ cancel)
   # Unloading the one-shot job makes launchd terminate the worker, which
   # runs its own teardown instead of a blind kill.
   launchctl unload -w "$PLIST" 2>/dev/null || true
+  ;;
+
+show-cookie)
+  # Print gpclient's cached portal cookie so the panel can replicate the
+  # authenticated portal-config request and list ALL gateways pre-connect
+  # (gpclient logs only a count). The file is root-only (gpclient writes
+  # it 0600 as the root worker, HOME=/var/root in the job), so the app
+  # cannot read it directly and asks us instead — same fixed-op contract,
+  # no caller-controlled paths. Same default gpclient itself uses for
+  # `--cookie-cache` without an explicit path.
+  cookie_file='/var/root/.config/gpclient/cookie.json'
+  [ -f "$cookie_file" ] || die "no cached portal cookie (connect once with the cookie reuse enabled)"
+  cat "$cookie_file"
   ;;
 
 repair)
