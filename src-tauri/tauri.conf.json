@@ -22,6 +22,7 @@
         "minHeight": 100,
         "resizable": false,
         "visible": false,
+        "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
         "alwaysOnTop": true,
         "decorations": false,
