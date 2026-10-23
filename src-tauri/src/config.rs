@@ -28,6 +28,11 @@ pub struct Config {
     /// The gateway explicitly picked in the panel, `None` = "Auto".
     #[serde(default)]
     pub selected_gateway: Option<String>,
+    /// `None` = auto: native liquid glass panel backdrop on macOS 26+,
+    /// CSS vibrancy below. `Some(false)` forces the CSS backdrop even where
+    /// the glass is available. `Some(true)` = auto (see `glass::resolve_effect`).
+    #[serde(default)]
+    pub liquid_glass: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -44,6 +49,7 @@ impl Default for Config {
             gateways: Vec::new(),
             preferred_gateway: None,
             selected_gateway: None,
+            liquid_glass: None,
         }
     }
 }

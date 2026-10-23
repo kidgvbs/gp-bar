@@ -27,6 +27,17 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # pin until 0.25.1 is explicitly re-verified; tauri's own requirement is
 # "0.25", so cargo unifies both onto 0.25.0 and muda stays at 0.20.
 tray-icon = { version = "=0.25.0", default-features = false, features = ["serde", "libappindicator"] }
+# Native liquid-glass panel backdrop (macOS 26+), behind the webview.
+window-vibrancy = "0.8.1"
+
+# Liquid glass: the panel's own WKWebView, handed to window-vibrancy via
+# LiquidGlassOptions::content_view so the crate reparents it into the glass
+# view (its fix for the focus-edge breakage, issue #198). Version unified
+# with the one window-vibrancy 0.8.1 builds against (same maintainer tree).
+# objc2-foundation supplies NSProcessInfo for the runtime OS-version check.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc2-app-kit", "WKWebView"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSProcessInfo"] }
 
 [profile.release]
 strip = true

@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod glass;
 mod icons;
 mod vpn;
 
@@ -21,6 +22,7 @@ use tauri::{
 };
 
 use config::Config;
+use glass::PanelEffect;
 use vpn::{Phase, VpnController, VpnState};
 
 const TRAY_ID: &str = "gp-bar";
@@ -35,6 +37,9 @@ pub(crate) struct AppContext {
     /// the panel on screen so the user can watch the Connecting/Disconnecting
     /// state (see `pin_panel`).
     panel_pinned: AtomicBool,
+    /// Which panel backdrop (native liquid glass vs CSS vibrancy) was
+    /// resolved at startup; reported to the frontend via `get_panel_effect`.
+    panel_effect: PanelEffect,
 }
 
 // -- commands -----------------------------------------------------------------
@@ -42,6 +47,13 @@ pub(crate) struct AppContext {
 #[tauri::command]
 fn get_state(state: State<'_, AppContext>) -> VpnState {
     state.controller.snapshot()
+}
+
+/// Which backdrop the panel uses (`"liquid-glass"` or `"css-vibrancy"`), so
+/// the frontend can drop its own blur/tint when the glass does the job.
+#[tauri::command]
+fn get_panel_effect(state: State<'_, AppContext>) -> &'static str {
+    state.panel_effect.as_str()
 }
 
 #[tauri::command]
@@ -520,12 +532,18 @@ fn main() {
     let poller_controller = controller.clone();
     let tailer_controller = controller.clone();
 
+    let config = Config::load();
+    // Auto: liquid glass on macOS 26+ unless the user forces the CSS
+    // fallback (see Config::liquid_glass and glass::resolve_effect).
+    let panel_effect = glass::resolve_effect(config.liquid_glass);
+
     tauri::Builder::default()
         .manage(AppContext {
             controller: controller.clone(),
-            config: Mutex::new(Config::load()),
+            config: Mutex::new(config),
             panel_hidden_at: Mutex::new(None),
             panel_pinned: AtomicBool::new(false),
+            panel_effect,
         })
         .on_window_event(|window, event| {
             // Popover behaviour: dismiss the panel when it loses focus — except
@@ -542,6 +560,20 @@ fn main() {
         .setup(move |app| {
             // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Panel backdrop: native liquid glass where the OS (26+) and the
+            // config allow it, CSS vibrancy otherwise (see `glass`). Applied
+            // at window creation so the first `show` already looks right;
+            // `apply_liquid_glass` must run on the main thread, and `setup`
+            // does.
+            let effect = app.state::<AppContext>().panel_effect;
+            if effect == PanelEffect::LiquidGlass {
+                if let Some(panel) = app.get_webview_window("main") {
+                    if let Err(error) = glass::apply_liquid_glass(&panel) {
+                        eprintln!("gp-bar: liquid glass failed: {error}");
+                    }
+                }
+            }
 
             // Seed the idle state with the selected portal so the Connect button
             // is reachable in a fresh session. The removed native tray menu used
@@ -634,6 +666,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            get_panel_effect,
             get_config,
             get_versions,
             add_portal,
