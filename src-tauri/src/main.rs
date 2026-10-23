@@ -25,9 +25,9 @@ use vpn::{Phase, VpnController, VpnState};
 
 const TRAY_ID: &str = "gp-bar";
 
-struct AppContext {
+pub(crate) struct AppContext {
     controller: Arc<VpnController>,
-    config: Mutex<Config>,
+    pub(crate) config: Mutex<Config>,
     /// When the panel was last hidden, to tell "the click that dismissed it"
     /// apart from a fresh open request (see `toggle_panel`).
     panel_hidden_at: Mutex<Option<Instant>>,
@@ -147,8 +147,9 @@ async fn connect(
     state: State<'_, AppContext>,
     portal: String,
     reuse_cookie: bool,
+    gateway: Option<String>,
 ) -> Result<(), String> {
-    do_connect(app, &state, &portal, reuse_cookie).await
+    do_connect(app, &state, &portal, reuse_cookie, gateway).await
 }
 
 #[tauri::command]
@@ -179,6 +180,135 @@ fn quit(app: AppHandle) {
     app.exit(0);
 }
 
+// -- gateway selection -----------------------------------------------------------
+
+/// Same charset the wrapper enforces (the name lands in the job plist).
+fn valid_gateway_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+fn broadcast_config(app: &AppHandle, cfg: &Config) {
+    // See vpn::update: emit outside the config lock.
+    let _ = app.emit("config-updated", cfg);
+}
+
+#[tauri::command]
+fn select_gateway(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+    gateway: Option<String>,
+) -> Result<(), String> {
+    let cfg = {
+        let mut cfg = state.config.lock().unwrap();
+        match gateway.as_deref() {
+            // null = "Auto": back to auto-gateway (preferred still applies).
+            None => cfg.selected_gateway = None,
+            Some(name) => {
+                if !valid_gateway_name(name) {
+                    return Err(
+                        "Gateway may only contain letters, digits, dots, dashes and underscores"
+                            .to_string(),
+                    );
+                }
+                if !cfg.gateways.iter().any(|g| g == name) {
+                    return Err("Unknown gateway".to_string());
+                }
+                cfg.selected_gateway = Some(name.to_string());
+            }
+        }
+        cfg.save()?;
+        cfg.clone()
+        // Guard dropped before emitting (deadlock discipline, see vpn::update).
+    };
+    broadcast_config(&app, &cfg);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_preferred_gateway(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+    gateway: Option<String>,
+) -> Result<(), String> {
+    let cfg = {
+        let mut cfg = state.config.lock().unwrap();
+        match gateway.as_deref() {
+            None => cfg.preferred_gateway = None,
+            Some(name) => {
+                if !valid_gateway_name(name) {
+                    return Err("Invalid gateway name".to_string());
+                }
+                if !cfg.gateways.iter().any(|g| g == name) {
+                    return Err("Unknown gateway".to_string());
+                }
+                cfg.preferred_gateway = Some(name.to_string());
+            }
+        }
+        cfg.save()?;
+        cfg.clone()
+    };
+    broadcast_config(&app, &cfg);
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_gateway(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+    name: String,
+) -> Result<(), String> {
+    let cfg = {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.gateways.retain(|g| g != &name);
+        if cfg.preferred_gateway.as_deref() == Some(name.as_str()) {
+            cfg.preferred_gateway = None;
+        }
+        if cfg.selected_gateway.as_deref() == Some(name.as_str()) {
+            cfg.selected_gateway = None;
+        }
+        cfg.save()?;
+        cfg.clone()
+    };
+    broadcast_config(&app, &cfg);
+    Ok(())
+}
+
+// -- network repair ---------------------------------------------------------------
+
+#[tauri::command]
+async fn get_network_health(state: State<'_, AppContext>) -> Result<vpn::NetworkHealth, String> {
+    // While the VPN is up (or transitioning) its DNS settings are legitimate.
+    let phase = state.controller.snapshot().phase;
+    if matches!(
+        phase,
+        Phase::Connecting | Phase::Connected | Phase::Disconnecting
+    ) {
+        return Ok(vpn::NetworkHealth {
+            stale: false,
+            service: None,
+            servers: Vec::new(),
+        });
+    }
+    let (service, servers) = vpn::active_service_dns().await;
+    Ok(vpn::NetworkHealth {
+        stale: !servers.is_empty(),
+        service,
+        servers,
+    })
+}
+
+#[tauri::command]
+async fn repair_network(app: AppHandle) -> Result<String, String> {
+    // Refuses loudly while the VPN is up — see `gp-admin repair`.
+    match vpn::run_admin("repair", &[]).await {
+        Ok(message) => Ok(message),
+        Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), &error)),
+    }
+}
+
 // -- shared action logic --------------------------------------------------------
 
 async fn do_connect(
@@ -186,6 +316,7 @@ async fn do_connect(
     state: &State<'_, AppContext>,
     portal: &str,
     reuse_cookie: bool,
+    gateway: Option<String>,
 ) -> Result<(), String> {
     let controller = state.controller.clone();
 
@@ -202,11 +333,29 @@ async fn do_connect(
     std::fs::create_dir_all(Config::log_dir())
         .map_err(|error| format!("cannot create the log directory: {error}"))?;
 
+    // Gateway resolution: an explicit pick from the panel wins, then the
+    // preferred gateway, then gpclient's own auto-gateway order. The
+    // wrapper re-validates whatever lands in the args.
+    let resolved_gateway = {
+        let cfg = state.config.lock().unwrap();
+        gateway.or_else(|| cfg.preferred_gateway.clone())
+    };
+    if let Some(name) = &resolved_gateway {
+        if !valid_gateway_name(name) {
+            return Err("Invalid gateway name".to_string());
+        }
+    }
+    let gateway_arg = resolved_gateway.clone().unwrap_or_else(|| "-".to_string());
+
     // The root-owned wrapper (scripts/gp-admin) generates and loads the
     // launchd job itself: no staged files, no credentials, no dialogs. It
     // returns fast; the status poller adopts the worker from the lock file
     // once the tunnel is established.
-    let args = [portal, if reuse_cookie { "1" } else { "0" }];
+    let args = [
+        portal,
+        if reuse_cookie { "1" } else { "0" },
+        gateway_arg.as_str(),
+    ];
     controller.begin_connect(&app, portal.to_string());
     let _ = app.emit("vpn-log-cleared", ());
 
@@ -457,6 +606,11 @@ fn main() {
             remove_portal,
             select_portal,
             set_reuse_cookie,
+            select_gateway,
+            set_preferred_gateway,
+            remove_gateway,
+            get_network_health,
+            repair_network,
             connect,
             disconnect,
             cancel,

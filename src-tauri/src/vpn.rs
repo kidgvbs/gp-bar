@@ -20,6 +20,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -440,7 +441,8 @@ fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
 
     // Extract the gateway name from the connection log messages.
     if let Some(gateway) = parse_gateway(&event.message) {
-        controller.observe_gateway(app, Some(gateway));
+        controller.observe_gateway(app, Some(gateway.clone()));
+        harvest_gateway(app, &gateway);
     }
 
     let _ = app.emit("vpn-log", &event);
@@ -454,6 +456,134 @@ fn parse_gateway(message: &str) -> Option<String> {
     ] {
         if let Some(rest) = message.strip_prefix(prefix) {
             return Some(rest.split_whitespace().next().unwrap_or(rest).to_string());
+        }
+    }
+    None
+}
+
+/// A gateway name parsed from the live connect log: keep it in the config so
+/// the picker can offer it next time (`gpclient` lists gateways only while
+/// connecting; there is no query command).
+fn harvest_gateway(app: &AppHandle, gateway: &str) {
+    use tauri::Manager;
+    let Some(ctx) = app.try_state::<crate::AppContext>() else {
+        return;
+    };
+    let (cfg, changed) = {
+        let mut cfg = ctx.config.lock().unwrap();
+        let changed = !cfg.gateways.iter().any(|g| g == gateway);
+        if changed {
+            cfg.gateways.push(gateway.to_string());
+            if let Err(error) = cfg.save() {
+                eprintln!("gp-bar: cannot save the harvested gateway: {error}");
+            }
+        }
+        (cfg.clone(), changed)
+        // Guard dropped BEFORE emitting (see `update`).
+    };
+    if changed {
+        let _ = app.emit("config-updated", &cfg);
+    }
+}
+
+// -- network health (user-space, read-only) -------------------------------------
+//
+// After a worker dies without its graceful teardown (overnight standby,
+// crash, power loss), the DNS servers vpnc-script set with
+// `networksetup -setdnsservers` stay in the system settings and break name
+// resolution. Detecting that needs no privileges: reading a service's DNS
+// is a user operation, and stale DNS only matters while the VPN is down.
+
+/// What the panel needs to know about residual VPN DNS settings.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkHealth {
+    pub stale: bool,
+    pub service: Option<String>,
+    pub servers: Vec<String>,
+}
+
+/// Manual DNS servers of the active network service, for the stale-DNS
+/// banner. Read-only and unprivileged.
+pub async fn active_service_dns() -> (Option<String>, Vec<String>) {
+    let Some(interface) = scutil_primary_interface().await else {
+        return (None, Vec::new());
+    };
+    let order = command_stdout(&["/usr/sbin/networksetup", "-listnetworkserviceorder"]).await;
+    let Some(service) = parse_service_for_device(&order, &interface) else {
+        return (None, Vec::new());
+    };
+    let dns = command_stdout(&["/usr/sbin/networksetup", "-getdnsservers", &service]).await;
+    (Some(service), parse_dns_servers(&dns))
+}
+
+async fn scutil_primary_interface() -> Option<String> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("/usr/sbin/scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()?
+        .write_all(b"show State:/Network/Global/IPv4\n")
+        .await
+        .ok()?;
+    let output = child.wait_with_output().await.ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| line.split_once("PrimaryInterface :"))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn command_stdout(command: &[&str]) -> String {
+    match tokio::process::Command::new(command[0])
+        .args(&command[1..])
+        .output()
+        .await
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// IPv4 literals from `networksetup -getdnsservers` output. The "no manual
+/// DNS" prose ("There aren't any DNS Servers set on …") contains no literal,
+/// so it filters out naturally.
+fn parse_dns_servers(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| {
+            let parts: Vec<_> = line.trim().split('.').collect();
+            parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
+/// The network service that owns `device`, from
+/// `networksetup -listnetworkserviceorder` output. Mirrors the wrapper's
+/// `active_service` so the banner and `gp-admin repair` agree on the service.
+fn parse_service_for_device(output: &str, device: &str) -> Option<String> {
+    let mut service: Option<String> = None;
+    for line in output.lines() {
+        let line = line.trim();
+        // The device line starts with '(' too: it must be checked first, or
+        // it would be mistaken for a service name line.
+        if let Some(rest) = line.strip_prefix("(Hardware Port:") {
+            // "(Hardware Port: Wi-Fi, Device: en0)"
+            if let Some((_, dev)) = rest.split_once("Device: ") {
+                if dev.trim_end_matches(')').trim() == device {
+                    return service;
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix('(') {
+            // "(4) Wi-Fi" / "(*) monitor ufficio" — a service name line.
+            if let Some((_, name)) = rest.split_once(") ") {
+                service = Some(name.to_string());
+            }
         }
     }
     None
@@ -592,5 +722,48 @@ mod tests {
         disconnecting.state.portal = Some("keep.example".to_string());
         apply_selected_portal(&mut disconnecting, None);
         assert_eq!(disconnecting.state.portal.as_deref(), Some("keep.example"));
+    }
+
+    #[test]
+    fn parses_manual_dns_servers_only() {
+        assert_eq!(
+            parse_dns_servers("172.16.3.101\n172.16.3.102\n"),
+            vec!["172.16.3.101", "172.16.3.102"]
+        );
+        // The "no manual DNS" prose filters out: no IPv4 literal on the line.
+        assert_eq!(
+            parse_dns_servers("There aren't any DNS Servers set on Wi-Fi.\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(parse_dns_servers(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parses_the_service_owning_the_active_device() {
+        let order = "\
+An asterisk (*) denotes that a network service is disabled.
+(*) monitor ufficio
+(Hardware Port: USB 10/100/1000 LAN, Device: en4)
+
+(1) Hub-immo
+(Hardware Port: AX88179A, Device: en6)
+
+(4) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+";
+        assert_eq!(
+            parse_service_for_device(order, "en0"),
+            Some("Wi-Fi".to_string())
+        );
+        assert_eq!(
+            parse_service_for_device(order, "en6"),
+            Some("Hub-immo".to_string())
+        );
+        // Disabled services are resolvable too (they carry stale VPN DNS).
+        assert_eq!(
+            parse_service_for_device(order, "en4"),
+            Some("monitor ufficio".to_string())
+        );
+        assert_eq!(parse_service_for_device(order, "en9"), None);
     }
 }

@@ -104,6 +104,46 @@ body {
   font-size: 12px;
 }
 
+/* Residual-DNS banner: amber rgba tints, so it follows the light/dark
+   color scheme like every other surface (they sit on the vibrancy bg). */
+
+.dns-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 149, 0, 0.16);
+  border: 1px solid rgba(255, 149, 0, 0.5);
+}
+
+.dns-banner-text {
+  flex: 1;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.btn.dns-repair {
+  background: #ff9500;
+  color: white;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+/* Repair outcome line: green on success, red on failure. */
+.dns-result {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 0 2px;
+  color: #34c759;
+}
+
+.dns-result.error {
+  color: #ff3b30;
+}
+
 /* Controls */
 
 .controls {
@@ -140,7 +180,7 @@ select {
   line-height: 1;
 }
 
-.icon-btn:hover {
+.icon-btn:hover:not(:disabled) {
   background: rgba(128, 128, 128, 0.25);
 }
 
@@ -199,6 +239,39 @@ select {
 .editor-actions {
   display: flex;
   justify-content: flex-end;
+}
+
+/* Gateway picker: the portal row's twin (select + star + remove). */
+
+.gateway-row {
+  display: flex;
+  gap: 6px;
+}
+
+select:disabled,
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* The star marks the preferred gateway. Dim = no preferred set, amber =
+   preferred set. Disabled while "Automatico" is selected. */
+.icon-btn.star {
+  color: rgba(128, 128, 128, 0.45);
+}
+
+.icon-btn.star.active {
+  color: #ff9500;
+}
+
+/* "Confermi?" state of the remove button. The confirmation is inline
+   because a native confirm() steals focus and dismisses the popover. */
+.icon-btn.confirm {
+  color: #ff453a;
+  background: rgba(255, 69, 58, 0.16);
+  font-size: 12px;
+  padding: 0 6px;
+  white-space: nowrap;
 }
 
 /* Buttons */

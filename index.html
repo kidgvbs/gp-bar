@@ -17,10 +17,28 @@
         <div class="duration" id="duration"></div>
       </header>
 
+      <!-- Residual-DNS banner: shown only when the VPN is down but the
+           active network service still carries the VPN's manual DNS. -->
+      <div id="dns-banner" class="dns-banner hidden">
+        <span id="dns-banner-text"></span>
+        <button id="dns-repair" class="btn dns-repair">Restore</button>
+      </div>
+      <div id="dns-result" class="dns-result hidden"></div>
+
       <section class="controls">
         <div class="portal-row">
           <select id="portal-select" title="Portal"></select>
           <button id="portal-edit" class="icon-btn" title="Edit portals">&#9881;</button>
+        </div>
+
+        <!-- Gateway picker: "Automatic" = no explicit gateway (the backend
+             resolves the preferred one, or lets gpclient choose). -->
+        <div class="gateway-row">
+          <select id="gateway-select" title="Gateway">
+            <option value="">Automatic</option>
+          </select>
+          <button id="gateway-prefer" class="icon-btn star" title="Preferred gateway">&#9733;</button>
+          <button id="gateway-remove" class="icon-btn" title="Remove gateway">&times;</button>
         </div>
 
         <div id="portal-editor" class="portal-editor hidden">

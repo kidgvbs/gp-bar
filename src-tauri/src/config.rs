@@ -17,6 +17,17 @@ pub struct Config {
     /// Absolute path to the `gpclient` executable; `None` = auto-detect.
     #[serde(default)]
     pub gpclient_path: Option<String>,
+    /// Gateways seen in connect logs or added by the user. The picker lists
+    /// these; `gpclient --gateway <name>` connects to a specific one.
+    #[serde(default)]
+    pub gateways: Vec<String>,
+    /// The user's favorite gateway, used when the picker selection is "Auto"
+    /// (`selected_gateway` is null): preferred wins over --auto-gateway.
+    #[serde(default)]
+    pub preferred_gateway: Option<String>,
+    /// The gateway explicitly picked in the panel, `None` = "Auto".
+    #[serde(default)]
+    pub selected_gateway: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -30,6 +41,9 @@ impl Default for Config {
             selected: Some("gp.imm.re".to_string()),
             reuse_cookie: true,
             gpclient_path: None,
+            gateways: Vec::new(),
+            preferred_gateway: None,
+            selected_gateway: None,
         }
     }
 }
