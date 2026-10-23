@@ -227,6 +227,7 @@ function renderPortals(config: PortalsConfig) {
     rm.onclick = async () => {
       await invoke("remove_portal", { portal: p });
       await refreshPortals();
+      syncWindowSize();
     };
     li.appendChild(rm);
     portalList.appendChild(li);
@@ -463,6 +464,10 @@ cookieCache.addEventListener("change", async () => {
 
 portalEdit.addEventListener("click", () => {
   portalEditor.classList.toggle("hidden");
+  // The popover is content-sized while the log is collapsed: the editor row
+  // changes the natural height, so refit the window or the editor pushes
+  // "Activity" and the footer out of view.
+  syncWindowSize();
 });
 
 portalAdd.addEventListener("click", async () => {
@@ -471,6 +476,8 @@ portalAdd.addEventListener("click", async () => {
   await invoke("add_portal", { portal: value });
   portalInput.value = "";
   await refreshPortals();
+  // The refreshed portal list may grow (new <li>): refit here too.
+  syncWindowSize();
 });
 
 portalInput.addEventListener("keydown", (e) => {
@@ -479,6 +486,8 @@ portalInput.addEventListener("keydown", (e) => {
 
 portalDone.addEventListener("click", () => {
   portalEditor.classList.add("hidden");
+  // Back to the compact height (see the portalEdit handler).
+  syncWindowSize();
 });
 
 copyLog.addEventListener("click", async () => {
