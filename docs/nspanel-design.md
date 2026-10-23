@@ -200,3 +200,15 @@ Feasible with the public crate; nothing essential is missing. The only hand-writ
 native code is the global click-out monitor (~40 lines of `objc2`), which
 `tauri-nspanel` does not expose. Everything else (subclassing, flags, level) is
 crate API.
+
+## 6. Test outcome (2026-10-23) — REJECTED for adoption
+
+User test on the real desk (retina MacBook 1440x900@2x + 1x external
+display above): clicking the tray icon produced **no visible panel at
+all**. Root cause not isolated before rejection. One plausible shared
+factor with main's wrong-monitor bug (fixed the same day in main a1c1d24):
+tao's `set_outer_position(Physical)` misplaces cross-scale hops, so the
+panel may have opened at a spot the user was not looking at — but this
+was never re-tested on the branch. Main keeps the borderless-window
+structure with click-anchored logical positioning; the NSPanel semantics
+(hidesOnDeactivate, non-activating, native click-out) are not adopted.
