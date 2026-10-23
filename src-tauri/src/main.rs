@@ -10,16 +10,17 @@
 mod config;
 mod glass;
 mod icons;
+mod panel;
 mod vpn;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent,
+    AppHandle, Emitter, Listener, LogicalPosition, Manager, State,
 };
+use tauri_nspanel::ManagerExt;
 
 use config::Config;
 use glass::PanelEffect;
@@ -30,16 +31,19 @@ const TRAY_ID: &str = "gp-bar";
 pub(crate) struct AppContext {
     controller: Arc<VpnController>,
     pub(crate) config: Mutex<Config>,
-    /// When the panel was last hidden, to tell "the click that dismissed it"
-    /// apart from a fresh open request (see `toggle_panel`).
-    panel_hidden_at: Mutex<Option<Instant>>,
     /// While an admin password dialog is up it steals the panel's focus; keep
     /// the panel on screen so the user can watch the Connecting/Disconnecting
-    /// state (see `pin_panel`).
+    /// state (see `pin_panel`). Checked by the native click-out monitor too.
     panel_pinned: AtomicBool,
     /// Which panel backdrop (native liquid glass vs CSS vibrancy) was
     /// resolved at startup; reported to the frontend via `get_panel_effect`.
     panel_effect: PanelEffect,
+}
+
+impl AppContext {
+    pub(crate) fn panel_pinned(&self) -> bool {
+        self.panel_pinned.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 // -- commands -----------------------------------------------------------------
@@ -410,32 +414,13 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
 
 // -- panel window ---------------------------------------------------------------
 
-fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
-    let Some(window) = app.get_webview_window("main") else {
+/// Show the panel, click-anchored under the tray icon. The anchor resolution,
+/// monitor lookup and work-area clamp are unchanged from the borderless
+/// window era; only the show primitive is now the native NSPanel.
+fn show_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
+    let Some(window) = app.get_webview_window(panel::PANEL_LABEL) else {
         return;
     };
-    let state = app.state::<AppContext>();
-
-    // Native popover toggle: a click while the panel is open dismisses it.
-    if window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
-        *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
-        return;
-    }
-
-    // Race: the very click that opened the tray icon also made the panel lose
-    // focus, and `on_window_event` already hid it a few milliseconds ago. If
-    // that happened within this window, this is the SAME physical click — keep
-    // the panel closed instead of reopening it behind the user's back.
-    let just_hidden = state
-        .panel_hidden_at
-        .lock()
-        .unwrap()
-        .is_some_and(|hidden| hidden.elapsed() < Duration::from_millis(250));
-    *state.panel_hidden_at.lock().unwrap() = None;
-    if just_hidden {
-        return;
-    }
 
     // Anchor the panel under the tray icon. The handler passes the click
     // position (or the icon rect when it agrees with the click), and macOS
@@ -450,6 +435,7 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     });
 
     if let (Some((ax, ay)), Ok(size)) = (anchor, window.outer_size()) {
+        eprintln!("gp-bar: NSPanel show: anchor physical ({ax:.0},{ay:.0}) size {size:?}");
         if let Ok(Some(monitor)) = app.monitor_from_point(ax, ay) {
             // The anchor is per-monitor PHYSICAL, so the monitor lookup must
             // happen in that space. Everything after runs in GLOBAL LOGICAL
@@ -492,27 +478,48 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
             } else {
                 ay.max(wy).min(wy + wh - panel_h)
             };
+            eprintln!(
+                "gp-bar: NSPanel show: monitor `{}` scale {} work {wx:.0},{wy:.0} {ww:.0}x{wh:.0} -> logical ({x:.0},{y:.0})",
+                monitor.name().map(String::as_str).unwrap_or_default(),
+                m_scale
+            );
             let _ = window.set_position(LogicalPosition::new(x, y));
         }
     }
 
-    let _ = window.show();
-    let _ = window.set_focus();
+    // Native panel show (no `set_focus`): the panel is non-activating and
+    // becomes key only when a text field needs it, so the foreground app
+    // keeps focus (see docs/nspanel-design.md).
+    if let Ok(native) = app.get_webview_panel(panel::PANEL_LABEL) {
+        native.show();
+        eprintln!(
+            "gp-bar: NSPanel show: orderFrontRegardless sent — visible={} frame={:?}",
+            native.is_visible(),
+            native.as_panel().frame()
+        );
+    }
+}
+
+/// Toggle the popover on a tray click: an open panel dismisses, a closed one
+/// opens anchored under the icon.
+fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
+    let open = app
+        .get_webview_panel(panel::PANEL_LABEL)
+        .map(|panel| panel.is_visible())
+        .unwrap_or(false);
+    if open {
+        if let Ok(panel) = app.get_webview_panel(panel::PANEL_LABEL) {
+            panel.hide();
+        }
+    } else {
+        show_panel(app, anchor);
+    }
 }
 
 fn pin_panel(app: &AppHandle, pinned: bool) {
     app.state::<AppContext>()
         .panel_pinned
         .store(pinned, Ordering::Relaxed);
-    // Hand focus back to the still-visible panel when the dialog is gone, so
-    // the next click elsewhere dismisses it again as usual.
-    if !pinned {
-        if let Some(window) = app.get_webview_window("main") {
-            if window.is_visible().unwrap_or(false) {
-                let _ = window.set_focus();
-            }
-        }
-    }
 }
 
 fn sync_tray_with_state(app: &AppHandle, phase: Phase) {
@@ -546,28 +553,23 @@ fn main() {
     let panel_effect = glass::resolve_effect(config.liquid_glass);
 
     tauri::Builder::default()
+        .plugin(tauri_nspanel::init())
         .manage(AppContext {
             controller: controller.clone(),
             config: Mutex::new(config),
-            panel_hidden_at: Mutex::new(None),
             panel_pinned: AtomicBool::new(false),
             panel_effect,
-        })
-        .on_window_event(|window, event| {
-            // Popover behaviour: dismiss the panel when it loses focus — except
-            // while `panel_pinned` is set, i.e. an admin password dialog is up and
-            // the user is mid connect/disconnect watching the state updates.
-            if let WindowEvent::Focused(false) = event {
-                let state = window.state::<AppContext>();
-                if !state.panel_pinned.load(Ordering::Relaxed) {
-                    let _ = window.hide();
-                    *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
-                }
-            }
         })
         .setup(move |app| {
             // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Convert the `main` window into the native NSPanel and install
+            // the global click-out monitor. Before anything else: the tray
+            // toggle below only talks to the panel from now on.
+            if let Err(error) = panel::convert_to_panel(app.handle()) {
+                eprintln!("gp-bar: convert_to_panel failed: {error}");
+            }
 
             // Panel backdrop: native liquid glass where the OS (26+) and the
             // config allow it, CSS vibrancy otherwise (see `glass`). Applied

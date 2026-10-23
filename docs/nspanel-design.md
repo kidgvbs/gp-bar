@@ -200,3 +200,75 @@ Feasible with the public crate; nothing essential is missing. The only hand-writ
 native code is the global click-out monitor (~40 lines of `objc2`), which
 `tauri-nspanel` does not expose. Everything else (subclassing, flags, level) is
 crate API.
+
+## 7. Retry (branch `feature-nspanel-v2`) — diagnosis strategy
+
+The v1 test failed with "no window at all" on the mixed-DPI desk, and the root
+cause was never isolated. Two of the plausible causes were bugs in v1's base
+that current `main` has since fixed, so this branch **re-ports the NSPanel
+semantics on top of current `main`** instead of retesting the stale prototype:
+
+1. **Space stickiness** (fixed on main by `visibleOnAllWorkspaces: true`,
+   commit ba72fa2): v1's window belonged to the Space of whichever display was
+   active at launch, so `set_position` could target a display the user was not
+   looking at. This config **must survive** any merge.
+2. **Cross-scale positioning** (fixed on main by global logical points,
+   commit a1c1d24): v1 positioned in physical pixels through tao's
+   scale-factor-of-the-current-window conversion, which lands off by the DPI
+   ratio on a 2x↔1x hop. `show_panel` keeps main's logical math verbatim.
+
+Residual "no window at all" candidates and their coverage:
+
+- **convert_to_panel silently failing at setup** — now instrumented:
+  `gp-bar: NSPanel setup: ...` prints the window lookup, the conversion result,
+  and the post-conversion frame. Any setup failure prints and never aborts the
+  app (`eprintln!`, not `?`, in `main`).
+- **The show path** — verified in the `tauri-nspanel` v2.1 source: `Panel::show`
+  maps to `orderFrontRegardless`, NOT `makeKeyAndOrderFront` — so a
+  non-activating panel that can never become key still gets ordered front. No
+  fix needed; the instrumentation confirms `visible` + frame after every show.
+- **Click-out monitor mis-hiding** — the global monitor only fires for events
+  NOT delivered to our own process and is skipped while `panel_pinned` is set.
+
+### 7.1 How to test / capture diagnostics
+
+The `eprintln!` lines go to stderr, so they appear only when the binary is
+launched from a terminal:
+
+```sh
+/Applications/.../GP\ Bar.app/Contents/MacOS/gp-bar 2>&1 | tee /tmp/gpbar-nspanel2.log
+```
+
+Expected sequence on a tray click that OPENS the panel:
+
+```
+gp-bar: NSPanel setup: converting `main` (scale 2)
+gp-bar: NSPanel setup: converted ok — visible=false frame=...
+gp-bar: NSPanel show: anchor physical (...) size ...
+gp-bar: NSPanel show: monitor <name> scale <s> work ... -> logical (x,y)
+gp-bar: NSPanel show: orderFrontRegardless sent — visible=true frame=...
+```
+
+On the mixed-DPI desk (retina MacBook 1440x900@2x below, 1x external above),
+test the tray click on BOTH displays: each click should log the monitor that
+held the anchor (scale 2 vs 1) and a `visible=true` frame on that display. If
+"no window" reproduces, the last printed line pins the failing stage:
+
+- nothing after `setup: converting` → conversion failed (its `Err` text follows),
+- `show:` anchor but no `monitor` line → `monitor_from_point` missed,
+- `orderFrontRegardless sent — visible=false` → AppKit refused to order front.
+
+### 7.2 Conflicts resolved against current main
+
+- `main.rs` imports: kept `LogicalPosition` (show_panel math), dropped
+  `WindowEvent` (no `on_window_event` anymore) and `PhysicalPosition`
+  (unused). `tauri_nspanel::ManagerExt` added.
+- `AppContext`: dropped `panel_hidden_at` (the 250 ms race guard dies with the
+  `Focused(false)` handler — a non-activating panel causes no focus change on
+  open); kept `panel_pinned` (now checked by the native click-out monitor) and
+  main's `panel_effect`.
+- `main()` setup: BOTH the NSPanel conversion (first) and main's liquid-glass
+  backdrop application (second) run, in that order.
+- `tauri.conf.json`: unchanged — `visibleOnAllWorkspaces: true` survives.
+- `pin_panel`: the unpinned `set_focus()` handback is dropped — the panel is
+  non-activating by design and never took key.
