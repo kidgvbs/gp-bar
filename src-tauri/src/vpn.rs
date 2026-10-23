@@ -266,8 +266,7 @@ fn process_alive(pid: u32) -> bool {
     // SAFETY: kill(2) with signal 0 only performs the permission/existence
     // check; it never delivers a signal.
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    ret == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 // -- background tasks ---------------------------------------------------------
@@ -557,7 +556,10 @@ fn parse_dns_servers(output: &str) -> Vec<String> {
         .lines()
         .filter(|line| {
             let parts: Vec<_> = line.trim().split('.').collect();
-            parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            parts.len() == 4
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         })
         .map(|line| line.trim().to_string())
         .collect()
