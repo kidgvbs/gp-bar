@@ -44,12 +44,15 @@ body {
    keep working on top. */
 body.liquid-glass {
   -webkit-backdrop-filter: none;
-  background: rgba(246, 246, 248, 0.35);
+  /* Raised from 0.35 (unreadable over busy light backgrounds): readability
+     first, the glass keeps its blur/saturation character underneath. */
+  background: rgba(246, 246, 248, 0.6);
 }
 
 @media (prefers-color-scheme: dark) {
   body.liquid-glass {
-    background: rgba(38, 38, 42, 0.45);
+    /* Same raise: 0.45 → 0.68, matching the CSS-vibrancy scrim. */
+    background: rgba(38, 38, 42, 0.68);
   }
 }
 
