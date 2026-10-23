@@ -79,6 +79,17 @@ const [winScale, winInner] = await Promise.all([win.scaleFactor(), win.innerSize
 const fullWidth = winInner.width / winScale;
 const fullHeight = winInner.height / winScale;
 
+// Panel backdrop: on macOS 26+ the backend installs a native NSGlassEffectView
+// behind the webview (see src-tauri/src/glass.rs); the body then drops its own
+// CSS blur/tint (kept stronger otherwise, see panel.css) so the glass shows
+// through. Tolerate a backend without the command: keep the CSS backdrop.
+try {
+  const effect = await invoke<string>("get_panel_effect");
+  if (effect === "liquid-glass") document.body.classList.add("liquid-glass");
+} catch {
+  // Older backend build: CSS vibrancy stays.
+}
+
 function collapsedHeight(): number {
   const app = document.getElementById("app")!;
   app.style.height = "auto";

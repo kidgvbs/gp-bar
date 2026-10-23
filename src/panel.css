@@ -35,6 +35,24 @@ body {
   }
 }
 
+/* Native liquid glass variant (macOS 26+, applied by `glass::apply_liquid_glass`
+   in src-tauri/src/glass.rs): the NSGlassEffectView behind the webview does
+   the blur and the corner radius natively, so the CSS blur goes away and the
+   body stays fully transparent for the glass to show through. A faint scrim
+   keeps the text readable over the Clear glass on busy light backgrounds —
+   the panels inside (#app children) already carry their own rgba tints, which
+   keep working on top. */
+body.liquid-glass {
+  -webkit-backdrop-filter: none;
+  background: rgba(246, 246, 248, 0.35);
+}
+
+@media (prefers-color-scheme: dark) {
+  body.liquid-glass {
+    background: rgba(38, 38, 42, 0.45);
+  }
+}
+
 #app {
   display: flex;
   flex-direction: column;
