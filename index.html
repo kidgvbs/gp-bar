@@ -47,6 +47,14 @@
             <input id="portal-input" type="text" placeholder="portal.example.com" spellcheck="false" />
             <button id="portal-add" class="icon-btn">+</button>
           </div>
+          <div class="portal-add-row">
+            <!-- The portal is password-auth: its config (with the full
+                 gateway list) cannot be fetched with the cached cookie, so
+                 gateways are harvested from connect logs and added manually
+                 here (read them once from gpclient's interactive prompt). -->
+            <input id="gateway-input" type="text" placeholder="gateway host (manual add)" spellcheck="false" />
+            <button id="gateway-add" class="icon-btn">+</button>
+          </div>
           <label class="option-row">
             <input type="checkbox" id="cookie-cache" checked />
             <span>Reuse authentication cookie (fewer browser logins)</span>

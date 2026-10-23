@@ -289,6 +289,32 @@ fn remove_gateway(
     Ok(())
 }
 
+/// Manual gateway add. On this deployment the portal is password-auth (its
+/// getconfig answers `auth-failed-password-empty` without the real password,
+/// which GP Bar never handles by design — see `refresh_gateways`), so the
+/// full list cannot be fetched pre-connect: the user reads it once from
+/// gpclient's interactive prompt and enters the names here.
+#[tauri::command]
+fn add_gateway(app: AppHandle, state: State<'_, AppContext>, name: String) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if !valid_gateway_name(&name) {
+        return Err(
+            "Gateway may only contain letters, digits, dots, dashes and underscores".to_string(),
+        );
+    }
+    let cfg = {
+        let mut cfg = state.config.lock().unwrap();
+        if !cfg.gateways.iter().any(|g| g == &name) {
+            cfg.gateways.push(name.clone());
+            cfg.save()?;
+        }
+        cfg.clone()
+        // Guard dropped before emitting (deadlock discipline, see vpn::update).
+    };
+    broadcast_config(&app, &cfg);
+    Ok(())
+}
+
 /// Fill the picker with ALL the portal's gateways, pre-connect: replicate
 /// gpclient's authenticated portal-config request (`POST
 /// /global-protect/getconfig.esp`) with the cached portal cookie and parse
@@ -321,6 +347,27 @@ async fn refresh_gateways(app: AppHandle, state: State<'_, AppContext>) -> Resul
     }
     let cookie_json = vpn::run_admin("show-cookie", &[]).await?;
     let auth = portal_config::parse_stored_cookie(&cookie_json, &portal)?;
+    // Seed the picker with the gateway the cached credential last
+    // authenticated to — free and always fresh, even where the portal
+    // config request below cannot work (this portal is password-auth:
+    // its getconfig rejects cookie-only requests, so the full list needs
+    // a manual one-time entry, see `add_gateway`).
+    if let Some(last) = &auth.last_gateway {
+        let seeded = {
+            let mut cfg = state.config.lock().unwrap();
+            if valid_gateway_name(last) && !cfg.gateways.iter().any(|g| g == last) {
+                cfg.gateways.push(last.clone());
+                cfg.save()?;
+                Some(cfg.clone())
+            } else {
+                None
+            }
+            // Guard dropped before emitting (deadlock discipline).
+        };
+        if let Some(cfg) = seeded {
+            broadcast_config(&app, &cfg);
+        }
+    }
     let gateways = portal_config::fetch_gateways(&portal, &auth).await?;
     let cfg = {
         let mut cfg = state.config.lock().unwrap();
@@ -560,6 +607,14 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
                 ay.max(wy).min(wy + wh - panel_h)
             };
             let _ = window.set_position(LogicalPosition::new(x, y));
+            // Terminal-launch diagnostics: which anchor, which monitor, and
+            // where the panel ended up (mixed-DPI desks keep misbehaving in
+            // ways only runtime numbers can settle).
+            eprintln!(
+                "gp-bar: panel anchor logical=({ax:.0},{ay:.0}) monitor={} scale={m_scale:.1} \
+                 work=({wx:.0},{wy:.0},{ww:.0},{wh:.0}) -> panel at logical=({x:.0},{y:.0}) size={panel_w:.0}x{panel_h:.0}",
+                monitor.name().map(|s| s.as_str()).unwrap_or_default()
+            );
         }
     }
 
@@ -751,6 +806,7 @@ fn main() {
             select_gateway,
             set_preferred_gateway,
             remove_gateway,
+            add_gateway,
             refresh_gateways,
             get_network_health,
             repair_network,

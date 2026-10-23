@@ -53,6 +53,8 @@ const portalEditor = document.getElementById("portal-editor")!;
 const portalList = document.getElementById("portal-list")!;
 const portalInput = document.getElementById("portal-input") as HTMLInputElement;
 const portalAdd = document.getElementById("portal-add")!;
+const gatewayInput = document.getElementById("gateway-input") as HTMLInputElement;
+const gatewayAddBtn = document.getElementById("gateway-add")!;
 const portalDone = document.getElementById("portal-done")!;
 const gatewaySelect = document.getElementById("gateway-select") as HTMLSelectElement;
 const gatewayPrefer = document.getElementById("gateway-prefer") as HTMLButtonElement;
@@ -497,6 +499,32 @@ portalAdd.addEventListener("click", async () => {
   await refreshPortals();
   // The refreshed portal list may grow (new <li>): refit here too.
   syncWindowSize();
+});
+
+// Manual gateway add (see the placeholder note in index.html): the backend
+// validates the name like every gateway path does.
+gatewayAddBtn.addEventListener("click", async () => {
+  const value = gatewayInput.value.trim();
+  if (!value) return;
+  try {
+    await invoke("add_gateway", { name: value });
+    gatewayInput.value = "";
+    await refreshPortals();
+  } catch (error) {
+    // Inline error: no native dialogs from the popover (they steal focus
+    // and the panel dismisses on Focused(false)).
+    gatewayInput.value = String(error);
+    setTimeout(() => {
+      if (gatewayInput.value === String(error)) gatewayInput.value = "";
+    }, 3000);
+  }
+});
+
+gatewayInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    gatewayAddBtn.click();
+  }
 });
 
 portalInput.addEventListener("keydown", (e) => {

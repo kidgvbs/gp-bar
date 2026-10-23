@@ -32,6 +32,8 @@ struct StoredCookie {
     server: String,
     #[serde(default)]
     username: String,
+    #[serde(default)]
+    last_gateway: Option<String>,
     auth_cookie: AuthCookieCredential,
 }
 
@@ -52,6 +54,10 @@ pub struct PortalAuth {
     pub username: String,
     pub user_auth_cookie: String,
     pub prelogon_user_auth_cookie: String,
+    /// The gateway the cached credential authenticated to last — a free,
+    /// always-fresh seed for the picker even where the portal config request
+    /// cannot work (password-auth portals reject cookie-only requests).
+    pub last_gateway: Option<String>,
 }
 
 /// Parse gpclient's cookie cache and check it matches `portal`.
@@ -82,6 +88,10 @@ pub fn parse_stored_cookie(json: &str, portal: &str) -> Result<PortalAuth, Strin
         username,
         user_auth_cookie: stored.auth_cookie.user_auth_cookie,
         prelogon_user_auth_cookie: stored.auth_cookie.prelogon_user_auth_cookie,
+        last_gateway: stored
+            .last_gateway
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty()),
     })
 }
 
@@ -397,6 +407,7 @@ mod tests {
             username: "alice".to_string(),
             user_auth_cookie: "auth-1".to_string(),
             prelogon_user_auth_cookie: "pre-1".to_string(),
+            last_gateway: None,
         };
         let machine = MachineProfile {
             computer: "macbook".to_string(),
@@ -437,6 +448,7 @@ mod tests {
             username: "alice".to_string(),
             user_auth_cookie: "auth-1".to_string(),
             prelogon_user_auth_cookie: String::new(),
+            last_gateway: None,
         };
         let machine = MachineProfile {
             computer: String::new(),
