@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, Manager, PhysicalPosition, State, WindowEvent,
+    AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent,
 };
 
 use config::Config;
@@ -439,6 +439,16 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
 
     if let (Some((ax, ay)), Ok(size)) = (anchor, window.outer_size()) {
         if let Ok(Some(monitor)) = app.monitor_from_point(ax, ay) {
+            // The anchor is per-monitor PHYSICAL, so the monitor lookup must
+            // happen in that space. Everything after runs in GLOBAL LOGICAL
+            // points instead: tao's set_outer_position converts a Physical
+            // position using the window's CURRENT scale factor, so on a
+            // mixed-DPI desk (retina laptop + 1x external) a physical
+            // position aimed at the other monitor lands off by the scale
+            // ratio and the panel opens far from the tray icon. GP Connect
+            // positions its panel with Position::Logical for this reason.
+            let m_scale = monitor.scale_factor();
+            let (ax, ay) = (ax / m_scale, ay / m_scale);
             // Clamp inside the work area (the visibleFrame: below the menu
             // bar, beside the Dock) of the monitor holding the anchor.
             // Evidence: GP Connect resolves "the monitor under the cursor"
@@ -446,18 +456,16 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
             // monitor bounds would let the panel slide under the menu bar.
             let work = monitor.work_area();
             let (wx, wy, ww, wh) = (
-                work.position.x as f64,
-                work.position.y as f64,
-                work.size.width as f64,
-                work.size.height as f64,
+                work.position.x as f64 / m_scale,
+                work.position.y as f64 / m_scale,
+                work.size.width as f64 / m_scale,
+                work.size.height as f64 / m_scale,
             );
-            // `outer_size` is physical ON THE CURRENT MONITOR: re-project it onto
-            // the anchor monitor so the panel lands correctly when it hops between
-            // retina and 1x displays (720 vs 360 physical px for the same panel).
+            // The panel's logical size is scale-invariant: once everything
+            // is in points, no DPI re-projection is needed.
             let scale = window.scale_factor().unwrap_or(1.0);
-            let target_scale = monitor.scale_factor();
-            let panel_w = size.width as f64 / scale * target_scale;
-            let panel_h = size.height as f64 / scale * target_scale;
+            let panel_w = size.width as f64 / scale;
+            let panel_h = size.height as f64 / scale;
             // `clamp` panics when min exceeds max: a work area smaller than
             // the panel must degrade to an edge, not take the app down.
             let x = if ww < panel_w {
@@ -472,7 +480,7 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
             } else {
                 ay.max(wy).min(wy + wh - panel_h)
             };
-            let _ = window.set_position(PhysicalPosition::new(x as i32, y as i32));
+            let _ = window.set_position(LogicalPosition::new(x, y));
         }
     }
 
