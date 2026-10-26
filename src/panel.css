@@ -325,6 +325,13 @@ select:disabled,
   background: #ff3b30;
 }
 
+/* Armed gateway switch: swap the tunnel to another gateway (disconnect +
+   reconnect through the pick) — amber, between "connect" blue and
+   "disconnect" red. Specificity must beat the phase rule above. */
+.status-block[data-phase="Connected"] ~ .controls .btn.primary.reconnect {
+  background: #ff9500;
+}
+
 .btn.secondary {
   background: rgba(128, 128, 128, 0.2);
   color: inherit;

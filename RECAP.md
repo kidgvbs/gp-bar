@@ -456,3 +456,33 @@ Il posizionamento non veniva **mai** eseguito: non era un problema di set_positi
 **Scelta**: repo **nuovo** con root commit orfani (alberi ripuliti, identità `kidgvbs <noreply GitHub>` configurata a livello **repo**, così anche i commit futuri restano puliti senza toccare la config globale) invece di riscrittura filter-repo del vecchio. Il vecchio repo diventa `gp-bar-archived`: privato + `archived` GitHub (read-only), tutta la storia pre-scrub conservata lì — è il suo ruolo. Branch pubblicati: `main` + `solution-1-smappservice` (parcheggiata: da ribasare su main se ripresa).
 
 **Lezione**: prima di pubblicare, controllare **storia** (`git log --all -S<termine>`, tutti i branch e i messaggi) e **identità** (`git log --format='%an <%ae>'`), non solo `grep` sull'albero corrente; il gateway FQDN non è mai entrato in git solo perché vive nella config fuori repo — la segregazione dei dati fuori dal repo è la difesa che funziona, lo scrub è la seconda linea.
+
+## 16. Il gateway "connesso" non è quello selezionato: il cached-cookie bypassa `--gateway` (26/10/2026)
+
+**Sintomo**: il pannello mostrava il gateway sbagliato accanto al portale — la selezione del picker sembrava ignorata.
+
+**Diagnosi in due parti**:
+
+1. **Il display diceva la VERITÀ**: il log del worker conteneva un solo `POST https://<fqdn>/ssl-vpn/getconfig.esp` e nessuna riga di selezione. Nei sorgenti gpclient (3.2.0): finché il cookie cached è valido, `try_cached_cookie` ritorna subito e gpclient riconnette a `stored.last_gateway` **ignorando `--gateway` del tutto** (mod.rs:234-238). Il flusso portale — l'unico che onora `--gateway`/`--auto-gateway` — parte solo a cookie scaduto. La selezione era una richiesta bypassata dal cookie.
+2. **La catena di display era integra ma sorda a quel flusso**: `parse_gateway` (vpn.rs) sapeva solo le righe di selezione ("Connecting to the selected/only available gateway", "Auto-gateway: attempting"), che nel percorso cookie non esistono.
+
+**Fix (backend, tre pezzi)**:
+
+- `parse_gateway` → enum `GatewayMention`: `Selected { name, address }` (le tre righe note, ora parsando anche la forma Display di gpapi `name (address)` — primo token = nome, secondo tra parentesi = indirizzo) e `Host(fqdn)` dalla riga `POST https://<gw>/ssl-vpn/getconfig.esp` — **universale**, appare in entrambi i flussi. Esclusi con test dedicati il portale (`/global-protect/getconfig.esp`) e l'HIP (`/ssl-vpn/hipreportcheck.esp`).
+- Config: `gateway_hosts: BTreeMap<addr, name>` (FQDN → nome). Seminata a mano con le 5 coppie dell'utente; **auto-appresa** da `learn_gateway_host` quando compare una riga `name (address)`.
+- Handler del tailer: `Selected` → impara la coppia, osserva e harvesta il **nome**; `Host` → traduce via mappa (`gateway_display_name`), display del FQDN raw se sconosciuto, harvest **solo** se il nome è noto (mai l'FQDN). Zero modifiche frontend: `main.ts` renderizzava già `portal · gateway`.
+- **La selezione ora vince**: `do_connect` azzera la reuse (`reuse_cookie && resolved_gateway.is_none()`) quando c'è un gateway esplicito (pick o preferred) — senza `--cookie-cache` gpclient passa dal flusso portale, che onora `--gateway`. Auto resta con la reuse (l'auto-gateway è ciò che il percorso cookie farebbe comunque). Nessuna modifica al wrapper root-owned: il flag `reuse` di `gp-admin start` esisteva già, era il caller che passava sempre 1.
+
+**Conseguenza del bypass chiperrata, accettata**: col gateway esplicito il connect non è più silenzioso — niente re-auth via cookie, gpclient rifà l'autenticazione portale (può aprire il browser per le credenziali). È il prezzo per onorare la selezione.
+
+## 17. Switch gateway a caldo: Reconnect ambra + le due trappole (26/10/2026)
+
+**Feature**: mentre Connesso la select gateway resta **abilitata** (★/× restano congelati); un pick diverso dal tunnel attivo arma il pulsante in **Reconnect ambra** (`#ff9500`) → click = disconnect + connect sul nuovo pick. Il flag armed sopravvive agli eventi di stato mentre Connesso e si disarmare da solo appena la fase lascia Connected. Riselezionare il tunnel attivo (o Automatic che vi risolve) disarma e torna a Disconnect.
+
+**Le due trappole trovate sul campo**:
+
+1. **Il primo Reconnect era solo visivo** — race: `gp-admin stop` ritorna quando il lock è sparito, ma la fase nel **controller** passa a Disconnected via **poller** → il `connect` frontend subito dopo veniva rifiutato ("cannot connect while Disconnecting"). Fix frontend: il Reconnect polla `get_state` (250ms, timeout 15s) finché la fase non lascia Disconnecting, poi connette.
+2. **Il colore non cambiava** — specificità CSS: `.status-block[data-phase="Connected"] ~ .controls .btn.primary` (4 classi + 1 attr) batteva `.btn.primary.reconnect` (3 classi). Fix: stesso selettore completo + `.reconnect`, così vince dopo nell'ordine.
+
+**Lezioni**: (1) una command backend che ritorna non implica che lo **stato observable** sia già aggiornato — tra wrapper e poller c'è una finestra, e un client che concatena due comandi deve **aspettare l'osservazione**, non solo il ritorno; (2) quando una regola per fase e una per classe concorrono sullo stesso elemento, scrivere la seconda **dentro** il selettore della prima: la specificità si eredita, il colore no.
+

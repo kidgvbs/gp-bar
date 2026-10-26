@@ -28,6 +28,14 @@ pub struct Config {
     /// The gateway explicitly picked in the panel, `None` = "Auto".
     #[serde(default)]
     pub selected_gateway: Option<String>,
+    /// Reverse display map: gateway FQDN → picker name. The cached-cookie
+    /// re-auth path logs no gateway *name* — gpclient skips the selection
+    /// entirely and reconnects to the last gateway, so only the FQDN
+    /// appears in the log — the panel translates it through this map.
+    /// Seeded by hand; learned automatically whenever a selection line
+    /// in "name (address)" form appears (the FQDN is then remembered).
+    #[serde(default)]
+    pub gateway_hosts: std::collections::BTreeMap<String, String>,
     /// `None` = auto: native liquid glass panel backdrop on macOS 26+,
     /// CSS vibrancy below. `Some(false)` forces the CSS backdrop even where
     /// the glass is available. `Some(true)` = auto (see `glass::resolve_effect`).
@@ -49,6 +57,7 @@ impl Default for Config {
             gateways: Vec::new(),
             preferred_gateway: None,
             selected_gateway: None,
+            gateway_hosts: std::collections::BTreeMap::new(),
             liquid_glass: None,
         }
     }

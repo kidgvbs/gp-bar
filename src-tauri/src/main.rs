@@ -403,6 +403,13 @@ async fn do_connect(
     }
     let gateway_arg = resolved_gateway.clone().unwrap_or_else(|| "-".to_string());
 
+    // An explicit gateway pick is meaningless with a cached cookie: while
+    // the cookie is valid gpclient reconnects to `last_gateway` and ignores
+    // `--gateway` entirely. Drop the reuse in that case — the connect then
+    // goes through the portal flow, which honors the pick. (Auto mode is
+    // the exception: auto-gateway is what the cookie path would do anyway.)
+    let reuse_cookie = reuse_cookie && resolved_gateway.is_none();
+
     // The root-owned wrapper (scripts/gp-admin) generates and loads the
     // launchd job itself: no staged files, no credentials, no dialogs. It
     // returns fast; the status poller adopts the worker from the lock file

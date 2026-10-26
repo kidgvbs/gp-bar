@@ -120,6 +120,13 @@ let currentPhase: Phase = "Disconnected";
 let connectedSince: number | null = null;
 let logLines: string[] = [];
 
+// Gateway switch while connected: the gateway the tunnel is actually on
+// (mirrors state.gateway) and whether a different pick is armed for a
+// Reconnect. The picker stays editable while Connected; a pick that differs
+// from the live tunnel turns the action button into an orange Reconnect.
+let connectedGateway: string | null = null;
+let reconnectArmed = false;
+
 // Gateway picker: mirror of the last-rendered config fields, kept so the
 // star / remove controls can update without re-reading the config.
 let preferredGateway: string | null = null;
@@ -163,6 +170,7 @@ function tickDuration() {
 function render(state: VpnState) {
   currentPhase = state.phase;
   connectedSince = state.connected_since_epoch_secs;
+  connectedGateway = state.gateway ?? null;
   statusDot.className = "status-dot " + state.phase.toLowerCase();
   stateBlock.dataset.phase = state.phase;
 
@@ -170,7 +178,14 @@ function render(state: VpnState) {
     case "Connected":
       stateLabel.textContent = "Connected";
       stateDetail.textContent = state.portal + (state.gateway ? ` · ${state.gateway}` : "");
-      actionBtn.textContent = "Disconnect";
+      // A pending gateway switch survives state refreshes (timer tick,
+      // log events): keep the Reconnect button until it fires or the
+      // pick matches the tunnel again.
+      if (reconnectArmed) {
+        actionBtn.textContent = "Reconnect";
+      } else {
+        actionBtn.textContent = "Disconnect";
+      }
       actionBtn.disabled = false;
       break;
     case "Connecting":
@@ -199,11 +214,19 @@ function render(state: VpnState) {
       break;
   }
   tickDuration();
+  // The armed Reconnect survives only while Connected: any teardown or
+  // error state disarms it (the click handler chains the connect itself).
+  if (currentPhase !== "Connected") reconnectArmed = false;
+  updateActionReconnect();
   // Both the gateway row (frozen while a connection is active) and the
   // residual-DNS banner (only meaningful while the VPN is down) track the
   // phase on every state event.
   updateGatewayControls();
   updateDnsBanner();
+}
+
+function updateActionReconnect() {
+  actionBtn.classList.toggle("reconnect", reconnectArmed);
 }
 
 function renderPortals(config: PortalsConfig) {
@@ -276,9 +299,11 @@ function renderGateways(config: PortalsConfig) {
   updateGatewayControls();
 }
 
-// Enabled/disabled, star and tooltip state of the gateway row. The whole row
-// is frozen while a connection is starting, up or tearing down — a gateway
-// change mid-connection would be silently deferred and confusing.
+// Enabled/disabled, star and tooltip state of the gateway row. Prefer and
+// remove stay frozen while a connection is starting, up or tearing down — a
+// config change mid-connection would be silently deferred and confusing.
+// The select itself stays editable while Connected: picking a different
+// gateway arms a Reconnect instead.
 function updateGatewayControls() {
   const active =
     currentPhase === "Connecting" ||
@@ -289,7 +314,8 @@ function updateGatewayControls() {
 
   if (active) resetRemoveConfirm();
 
-  gatewaySelect.disabled = active;
+  gatewaySelect.disabled =
+    currentPhase === "Connecting" || currentPhase === "Disconnecting";
   gatewayPrefer.disabled = active || auto;
   gatewayRemove.disabled = active || auto;
   gatewayPrefer.classList.toggle("active", preferredGateway !== null);
@@ -297,8 +323,12 @@ function updateGatewayControls() {
   gatewaySelect.title = auto
     ? `Gateway "Automatic": connects with the preferred${
         preferredGateway ? ` (${preferredGateway} ★)` : ""
-      } when set, otherwise gpclient picks on its own. A specific gateway always wins.`
-    : `Always connect through gateway ${name}.`;
+      } when set, otherwise gpclient picks on its own. A specific gateway always wins.${
+        currentPhase === "Connected" ? " Pick another gateway to Reconnect through it." : ""
+      }`
+    : `Always connect through gateway ${name}.${
+        currentPhase === "Connected" ? " Pick another gateway to Reconnect through it." : ""
+      }`;
   if (auto) {
     gatewayPrefer.title = preferredGateway
       ? `Preferred: ${preferredGateway}. To remove it, select it and click ★ again.`
@@ -389,7 +419,24 @@ async function refreshNetworkHealth() {
 }
 
 actionBtn.addEventListener("click", async () => {
-  if (currentPhase === "Connected" || currentPhase === "Disconnecting") {
+  if (currentPhase === "Connected" && reconnectArmed) {
+    // Gateway switch: tear the tunnel down, then bring it back up through
+    // the newly picked gateway. The disconnect invoke resolves once the
+    // worker is gone, but the backend's phase still flips to Disconnected
+    // via its poller — wait that out before connecting, or do_connect
+    // refuses ("cannot connect while Disconnecting").
+    const gateway = gatewaySelect.value || null;
+    const portal = portalSelect.value;
+    const reuseCookie = cookieCache.checked;
+    await invoke("disconnect");
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      const state = await invoke<VpnState>("get_state");
+      if (state.phase !== "Disconnecting") break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    await invoke("connect", { portal, reuseCookie, gateway });
+  } else if (currentPhase === "Connected" || currentPhase === "Disconnecting") {
     await invoke("disconnect");
   } else if (currentPhase === "Connecting") {
     await invoke("cancel");
@@ -412,6 +459,17 @@ gatewaySelect.addEventListener("change", async () => {
   resetRemoveConfirm();
   // Empty value ("Automatic") = null: no explicit gateway selection.
   await invoke("select_gateway", { gateway: gatewaySelect.value || null });
+  // While connected, a pick that differs from the live tunnel arms a
+  // Reconnect ("Automatic" resolves to the preferred gateway here, per
+  // the backend's connect resolution). Re-picking the live gateway
+  // disarms it and restores the plain Disconnect.
+  if (currentPhase === "Connected") {
+    const target = gatewaySelect.value || preferredGateway;
+    reconnectArmed =
+      connectedGateway !== null ? target !== connectedGateway : target !== null;
+    actionBtn.textContent = reconnectArmed ? "Reconnect" : "Disconnect";
+    updateActionReconnect();
+  }
   updateGatewayControls();
 });
 

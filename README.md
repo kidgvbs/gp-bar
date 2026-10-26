@@ -90,7 +90,11 @@ sudo bash "$HOME/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.
 The padlock lives in the menu bar:
 
 * **Left click** — open the GP Bar panel: VPN status, connect/disconnect,
-  live activity log, portal and gateway pickers.
+  live activity log, portal and gateway pickers. The panel shows the
+  **live gateway** next to the portal (`portal · gateway`); while
+  connected, picking a different gateway arms an amber **Reconnect**
+  button that swaps the tunnel to it (disconnect + connect through the
+  pick).
 * **Right click** — open the tray menu: Connect / Disconnect / Quit (each
   enabled per VPN state; the menu is popped up by hand, never attached to
   the status item — an attached one swallows left clicks on the macOS 27
@@ -148,7 +152,14 @@ re-verified.)
 * `preferred_gateway` / `selected_gateway` — the picker's "Auto"
   (`selected_gateway: null`) connects to the preferred gateway when one is
   set, else lets gpclient choose (`--auto-gateway`); a picked gateway forces
-  `--gateway <name>`.
+  `--gateway <name>` — and disables the cached-cookie reuse for that
+  connect, because while the cookie is valid gpclient reconnects to the
+  last gateway and ignores `--gateway` entirely.
+* `gateway_hosts` — reverse display map (gateway FQDN → picker name). The
+  cached-cookie re-auth path logs no gateway *name*, only the FQDN; GP Bar
+  translates it through this map to show the picker name. Seeded by hand,
+  learned automatically whenever a `name (address)` selection line appears
+  in the connect log.
 * `liquid_glass` — `null` = auto: native liquid-glass panel backdrop on
   macOS 26+, CSS vibrancy below; `false` forces the CSS backdrop everywhere.
 

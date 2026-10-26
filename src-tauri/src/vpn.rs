@@ -438,26 +438,107 @@ fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
         },
     };
 
-    // Extract the gateway name from the connection log messages.
-    if let Some(gateway) = parse_gateway(&event.message) {
-        controller.observe_gateway(app, Some(gateway.clone()));
-        harvest_gateway(app, &gateway);
+    // Extract the gateway from the connection log messages.
+    match parse_gateway(&event.message) {
+        // A selection line: learn the pair if present, then observe and
+        // harvest the NAME (never the address — the picker stores names).
+        Some(GatewayMention::Selected { name, address }) => {
+            if let Some(address) = address {
+                learn_gateway_host(app, &address, &name);
+            }
+            controller.observe_gateway(app, Some(name.clone()));
+            harvest_gateway(app, &name);
+        }
+        // A getconfig POST: the cached-cookie path emits only this. Translate
+        // to the picker name via the config map; display the raw FQDN when
+        // unknown, but harvest only a known NAME (never the FQDN).
+        Some(GatewayMention::Host(host)) => {
+            let name = gateway_display_name(app, &host);
+            controller.observe_gateway(app, Some(name.clone().unwrap_or(host)));
+            if let Some(name) = name {
+                harvest_gateway(app, &name);
+            }
+        }
+        None => {}
     }
 
     let _ = app.emit("vpn-log", &event);
 }
 
-fn parse_gateway(message: &str) -> Option<String> {
+/// A gateway mentioned in a connect-log line, and in which form.
+#[derive(Debug, PartialEq, Eq)]
+enum GatewayMention {
+    /// A selection line: `name` or `name (address)` — `Gateway`'s Display.
+    Selected {
+        name: String,
+        address: Option<String>,
+    },
+    /// A getconfig POST to a gateway host: universal signal, the only one
+    /// the cached-cookie re-auth path emits (no selection lines there).
+    Host(String),
+}
+
+fn parse_gateway(message: &str) -> Option<GatewayMention> {
     for prefix in [
         "Connecting to the selected gateway: ",
         "Connecting to the only available gateway: ",
         "Auto-gateway: attempting gateway ",
     ] {
         if let Some(rest) = message.strip_prefix(prefix) {
-            return Some(rest.split_whitespace().next().unwrap_or(rest).to_string());
+            let mut tokens = rest.split_whitespace();
+            let name = tokens.next().unwrap_or(rest).to_string();
+            // `name (address)`: strip the parens to remember the pair.
+            let address = tokens
+                .next()
+                .filter(|token| token.starts_with('(') && token.ends_with(')'))
+                .map(|token| token[1..token.len() - 1].to_string());
+            return Some(GatewayMention::Selected { name, address });
+        }
+    }
+    // `POST https://<gw>/ssl-vpn/getconfig.esp` — but NOT the portal's
+    // `/global-protect/getconfig.esp` or the HIP `/ssl-vpn/hipreportcheck.esp`.
+    if let Some(rest) = message.strip_prefix("POST https://") {
+        if let Some(host) = rest.strip_suffix("/ssl-vpn/getconfig.esp") {
+            if !host.contains('/') {
+                return Some(GatewayMention::Host(host.to_string()));
+            }
         }
     }
     None
+}
+
+/// Remember a gateway FQDN → name pair in the config, so the cached-cookie
+/// re-auth path (which logs only the FQDN) can still display the name.
+fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
+    use tauri::Manager;
+    let Some(ctx) = app.try_state::<crate::AppContext>() else {
+        return;
+    };
+    let (cfg, changed) = {
+        let mut cfg = ctx.config.lock().unwrap();
+        if cfg.gateway_hosts.get(address).map(String::as_str) == Some(name) {
+            (cfg.clone(), false)
+        } else {
+            cfg.gateway_hosts
+                .insert(address.to_string(), name.to_string());
+            if let Err(error) = cfg.save() {
+                eprintln!("gp-bar: cannot save the gateway host map: {error}");
+            }
+            (cfg.clone(), true)
+        }
+        // Guard dropped BEFORE emitting (see `update`).
+    };
+    if changed {
+        let _ = app.emit("config-updated", &cfg);
+    }
+}
+
+/// Translate a gateway FQDN into its picker name, if known.
+fn gateway_display_name(app: &AppHandle, address: &str) -> Option<String> {
+    use tauri::Manager;
+    let ctx = app.try_state::<crate::AppContext>()?;
+    let cfg = ctx.config.lock().unwrap();
+    cfg.gateway_hosts.get(address).cloned()
 }
 
 /// A gateway name parsed from the live connect log: keep it in the config so
@@ -684,13 +765,33 @@ mod tests {
 
     #[test]
     fn parses_gateway_names() {
+        use super::GatewayMention;
         assert_eq!(
-            parse_gateway("Connecting to the only available gateway: vpn-1.corp.example"),
-            Some("vpn-1.corp.example".to_string())
+            parse_gateway("Connecting to the only available gateway: vpn-1 (vpn-1.corp.example)"),
+            Some(GatewayMention::Selected {
+                name: "vpn-1".to_string(),
+                address: Some("vpn-1.corp.example".to_string()),
+            })
         );
         assert_eq!(
             parse_gateway("Auto-gateway: attempting gateway gtw-2"),
-            Some("gtw-2".to_string())
+            Some(GatewayMention::Selected {
+                name: "gtw-2".to_string(),
+                address: None,
+            })
+        );
+        assert_eq!(
+            parse_gateway("POST https://vpn-1.corp.example/ssl-vpn/getconfig.esp"),
+            Some(GatewayMention::Host("vpn-1.corp.example".to_string()))
+        );
+        // The portal getconfig and the HIP report must NOT match.
+        assert_eq!(
+            parse_gateway("POST https://portal.corp.example/global-protect/getconfig.esp"),
+            None
+        );
+        assert_eq!(
+            parse_gateway("POST https://vpn-1.corp.example/ssl-vpn/hipreportcheck.esp"),
+            None
         );
         assert_eq!(parse_gateway("Unrelated message"), None);
     }
