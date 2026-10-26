@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GP Bar</title>
+    <link rel="stylesheet" href="/src/panel.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="status-block" id="status-block">
+        <div class="status-dot" id="status-dot"></div>
+        <div class="status-text">
+          <div class="state-label" id="state-label">Disconnected</div>
+          <div class="state-detail" id="state-detail">Not connected</div>
+        </div>
+        <div class="duration" id="duration"></div>
+      </header>
+
+      <!-- Residual-DNS banner: shown only when the VPN is down but the
+           active network service still carries the VPN's manual DNS. -->
+      <div id="dns-banner" class="dns-banner hidden">
+        <span id="dns-banner-text"></span>
+        <button id="dns-repair" class="btn dns-repair">Restore</button>
+      </div>
+      <div id="dns-result" class="dns-result hidden"></div>
+
+      <section class="controls">
+        <div class="portal-row">
+          <select id="portal-select" title="Portal"></select>
+          <button id="portal-edit" class="icon-btn" title="Edit portals">&#9881;</button>
+        </div>
+
+        <!-- Gateway picker: "Automatic" = no explicit gateway (the backend
+             resolves the preferred one, or lets gpclient choose). -->
+        <div class="gateway-row">
+          <select id="gateway-select" title="Gateway">
+            <option value="">Automatic</option>
+          </select>
+          <button id="gateway-prefer" class="icon-btn star" title="Preferred gateway">&#9733;</button>
+          <button id="gateway-remove" class="icon-btn" title="Remove gateway">&times;</button>
+        </div>
+
+        <div id="portal-editor" class="portal-editor hidden">
+          <ul id="portal-list"></ul>
+          <div class="portal-add-row">
+            <input id="portal-input" type="text" placeholder="portal.example.com" spellcheck="false" />
+            <button id="portal-add" class="icon-btn">+</button>
+          </div>
+          <div class="portal-add-row">
+            <!-- The portal is password-auth: its config (with the full
+                 gateway list) cannot be fetched with the cached cookie, so
+                 gateways are harvested from connect logs and added manually
+                 here (read them once from gpclient's interactive prompt). -->
+            <input id="gateway-input" type="text" placeholder="gateway host (manual add)" spellcheck="false" />
+            <button id="gateway-add" class="icon-btn">+</button>
+          </div>
+          <label class="option-row">
+            <input type="checkbox" id="cookie-cache" checked />
+            <span>Reuse authentication cookie (fewer browser logins)</span>
+          </label>
+          <div class="editor-actions">
+            <button id="portal-done" class="btn secondary">Done</button>
+          </div>
+        </div>
+
+        <button id="action-btn" class="btn primary">Connect</button>
+      </section>
+
+      <section class="log-block collapsed" id="log-block">
+        <div class="log-header">
+          <button class="log-toggle" id="log-toggle" type="button" title="Toggle activity log">
+            <span class="chevron">&#9656;</span>
+            <span>Activity</span>
+          </button>
+          <button id="copy-log" class="icon-btn" title="Copy log">&#9114;</button>
+        </div>
+        <pre id="log" class="log"></pre>
+      </section>
+
+      <footer>
+        <span id="versions"></span>
+        <button id="quit-btn" class="btn quit" title="Quit GP Bar">Quit</button>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

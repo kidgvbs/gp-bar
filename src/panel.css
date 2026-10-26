@@ -1,0 +1,433 @@
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+  overflow: hidden;
+  /* Popover look: the window itself is borderless and transparent (see
+     tauri.conf.json), so the shape and the vibrancy come from CSS. The blur
+     samples the desktop content behind the window, like a native popover. */
+  border-radius: 16px;
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  background: rgba(246, 246, 248, 0.68);
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: rgba(38, 38, 42, 0.68);
+  }
+}
+
+/* Native liquid glass variant (macOS 26+, applied by `glass::apply_liquid_glass`
+   in src-tauri/src/glass.rs): the NSGlassEffectView behind the webview does
+   the blur and the corner radius natively, so the CSS blur goes away and the
+   body stays fully transparent for the glass to show through. A faint scrim
+   keeps the text readable over the Clear glass on busy light backgrounds —
+   the panels inside (#app children) already carry their own rgba tints, which
+   keep working on top. */
+body.liquid-glass {
+  -webkit-backdrop-filter: none;
+  /* Raised from 0.35 (unreadable over busy light backgrounds): readability
+     first, the glass keeps its blur/saturation character underneath. */
+  background: rgba(246, 246, 248, 0.6);
+}
+
+@media (prefers-color-scheme: dark) {
+  body.liquid-glass {
+    /* Same raise: 0.45 → 0.68, matching the CSS-vibrancy scrim. */
+    background: rgba(38, 38, 42, 0.68);
+  }
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  height: 100vh;
+}
+
+/* Status header */
+
+.status-block {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(128, 128, 128, 0.08);
+}
+
+.status-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #8e8e93;
+}
+
+.status-dot.connected {
+  background: #34c759;
+  box-shadow: 0 0 8px rgba(52, 199, 89, 0.6);
+}
+
+.status-dot.connecting,
+.status-dot.disconnecting {
+  background: #ffcc00;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.status-dot.error {
+  background: #ff3b30;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.state-label {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.state-detail {
+  color: rgba(128, 128, 128, 0.9);
+  font-size: 11px;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.duration {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: rgba(128, 128, 128, 0.9);
+  font-size: 12px;
+}
+
+/* Residual-DNS banner: amber rgba tints, so it follows the light/dark
+   color scheme like every other surface (they sit on the vibrancy bg). */
+
+.dns-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 149, 0, 0.16);
+  border: 1px solid rgba(255, 149, 0, 0.5);
+}
+
+.dns-banner-text {
+  flex: 1;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.btn.dns-repair {
+  background: #ff9500;
+  color: white;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+/* Repair outcome line: green on success, red on failure. */
+.dns-result {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 0 2px;
+  color: #34c759;
+}
+
+.dns-result.error {
+  color: #ff3b30;
+}
+
+/* Controls */
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.portal-row {
+  display: flex;
+  gap: 6px;
+}
+
+select {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  background: rgba(128, 128, 128, 0.08);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.icon-btn {
+  border: none;
+  background: rgba(128, 128, 128, 0.12);
+  border-radius: 8px;
+  min-width: 32px;
+  padding: 0 8px;
+  cursor: pointer;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: rgba(128, 128, 128, 0.25);
+}
+
+.portal-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(128, 128, 128, 0.08);
+}
+
+.portal-editor.hidden {
+  display: none;
+}
+
+.portal-editor ul {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.portal-editor li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: rgba(128, 128, 128, 0.1);
+}
+
+.portal-add-row {
+  display: flex;
+  gap: 6px;
+}
+
+.portal-add-row input {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.option-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: rgba(128, 128, 128, 1);
+}
+
+.editor-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Gateway picker: the portal row's twin (select + star + remove). */
+
+.gateway-row {
+  display: flex;
+  gap: 6px;
+}
+
+select:disabled,
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* The star marks the preferred gateway. Dim = no preferred set, amber =
+   preferred set. Disabled while "Automatico" is selected. */
+.icon-btn.star {
+  color: rgba(128, 128, 128, 0.45);
+}
+
+.icon-btn.star.active {
+  color: #ff9500;
+}
+
+/* "Confermi?" state of the remove button. The confirmation is inline
+   because a native confirm() steals focus and dismisses the popover. */
+.icon-btn.confirm {
+  color: #ff453a;
+  background: rgba(255, 69, 58, 0.16);
+  font-size: 12px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+/* Buttons */
+
+.btn {
+  border: none;
+  border-radius: 10px;
+  padding: 10px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.btn:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.btn.primary {
+  background: #0a84ff;
+  color: white;
+}
+
+.status-block[data-phase="Connected"] ~ .controls .btn.primary {
+  background: #ff3b30;
+}
+
+.btn.secondary {
+  background: rgba(128, 128, 128, 0.2);
+  color: inherit;
+}
+
+/* Log */
+
+.log-block {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+}
+
+.log-block.collapsed {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+.log-block.collapsed .log {
+  display: none;
+}
+
+.log-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: rgba(128, 128, 128, 0.9);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.log-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border-radius: 6px;
+}
+
+.log-toggle:hover {
+  background: rgba(128, 128, 128, 0.12);
+}
+
+.chevron {
+  font-size: 9px;
+  transition: transform 0.15s ease;
+}
+
+.log-block:not(.collapsed) .chevron {
+  transform: rotate(90deg);
+}
+
+.log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 8px;
+  border-radius: 10px;
+  background: rgba(128, 128, 128, 0.08);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  cursor: text;
+}
+
+footer {
+  font-size: 10px;
+  color: rgba(128, 128, 128, 0.7);
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.btn.quit {
+  background: rgba(255, 69, 58, 0.16);
+  border: 1px solid rgba(255, 69, 58, 0.45);
+  color: #ff453a;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+
+.btn.quit:hover:not(:disabled) {
+  background: rgba(255, 69, 58, 0.3);
+}
+
+.hidden {
+  display: none !important;
+}

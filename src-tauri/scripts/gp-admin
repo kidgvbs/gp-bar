@@ -1,0 +1,239 @@
+#!/bin/sh
+# GP Bar privileged helper — the only executable /etc/sudoers.d/gp-bar
+# allows the user to run as root without a password (installed root-owned
+# 0755 by scripts/setup-admin.sh).
+#
+# This file IS the security boundary, hence the rules:
+#   * fixed operations only:
+#       selftest | start <portal> <0|1> [gateway|-] | stop | cancel | repair
+#   * every argument is validated here — the caller is untrusted input
+#   * no caller-controlled paths, no eval, no sh -c of interpolated strings
+#   * the launchd job plist is fully generated from validated values, so a
+#     user-writable staging file can never become arbitrary root execution
+#
+# Residual risk with NOPASSWD, deliberate and documented: anything running
+# as this user can toggle the VPN on/off, nothing more.
+
+set -eu
+
+DAEMON_DIR='/Library/Application Support/GP Bar'
+PLIST="$DAEMON_DIR/dev.gpbar.worker.plist"
+LOCK=/var/run/gpclient.lock
+
+die() { echo "gp-admin: $*" >&2; exit 1; }
+
+# Same locations as Config::detect_gpclient in the app. The app cannot
+# pass a custom path in: that would be arbitrary root execution.
+find_gpclient() {
+  if [ -x /opt/homebrew/bin/gpclient ]; then
+    printf '%s' /opt/homebrew/bin/gpclient
+    return 0
+  fi
+  if [ -x /usr/local/bin/gpclient ]; then
+    printf '%s' /usr/local/bin/gpclient
+    return 0
+  fi
+  return 1
+}
+
+# Strict charset: also keeps the value XML-safe for the job plist. Shared by
+# portal and gateway names (both end up in the job plist).
+valid_portal() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Name of the network service currently carrying the default route, the one
+# vpnc-script reconfigures while the tunnel is up.
+active_service() {
+  primary_if=$(printf 'show State:/Network/Global/IPv4\n' | /usr/sbin/scutil | awk '/PrimaryInterface/ {print $3}')
+  [ -n "$primary_if" ] || return 1
+  /usr/sbin/networksetup -listnetworkserviceorder | awk -v dev="$primary_if" '
+    /^\([^)]*\) / { svc = $0; sub(/^\([^)]*\) /, "", svc) }
+    /Device: / {
+      if (match($0, /Device: [A-Za-z0-9]+/)) {
+        d = substr($0, RSTART+8, RLENGTH-8)
+        if (d == dev) { print svc; exit }
+      }
+    }'
+}
+
+# Manual DNS servers set on a service, one per line (empty when none).
+service_dns() {
+  /usr/sbin/networksetup -getdnsservers "$1" 2>/dev/null \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+
+op="${1:-}"
+
+case "$op" in
+selftest)
+  find_gpclient >/dev/null || die "gpclient not found"
+  mkdir -p "$DAEMON_DIR" 2>/dev/null || die "cannot create $DAEMON_DIR"
+  echo ok
+  ;;
+
+start)
+  portal="${2:-}"
+  reuse="${3:-0}"
+  gateway="${4:--}"
+  valid_portal "$portal" || die "invalid portal name"
+  if [ "$reuse" != 0 ] && [ "$reuse" != 1 ]; then die "invalid reuse flag"; fi
+  if [ "$gateway" != "-" ]; then
+    valid_portal "$gateway" || die "invalid gateway name"
+  fi
+  gpclient=$(find_gpclient) || die "gpclient not found"
+  [ -e /dev/console ] || die "no console user"
+  uid=$(stat -f %u /dev/console) || die "no console user"
+  user=$(id -nu "$uid") || die "no console user"
+  home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  [ -n "$home" ] || die "no home directory for $user"
+
+  log_dir="$home/Library/Logs/gp-bar"
+  log_path="$log_dir/gpclient-connect.log"
+  mkdir -p "$DAEMON_DIR" "$log_dir"
+
+  # A leftover lock from a crashed worker (or a forced reboot) would make the
+  # next gpclient refuse to start ("another instance is running"). If the PID
+  # it names is gone, the lock is stale: remove it before starting. We are
+  # root here, so kill -0 sees root PIDs too.
+  if [ -f "$LOCK" ]; then
+    old_pid=$(cat "$LOCK" 2>/dev/null || true)
+    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+      echo "gp-admin: removing stale lock file (PID $old_pid is gone)" >&2
+      rm -f "$LOCK"
+    else
+      die "a VPN worker is already running (PID $old_pid)"
+    fi
+  fi
+
+  # One log per attempt: the panel tailer rewinds on shrink, so truncating
+  # here is the "new attempt" signal (same contract as the old flow).
+  : > "$log_path"
+
+  if [ "$reuse" = 1 ]; then
+    cookie='<string>--cookie-cache</string>'
+  else
+    cookie=''
+  fi
+  if [ "$gateway" != "-" ]; then
+    gateway_args="<string>--gateway</string><string>$gateway</string>"
+  else
+    gateway_args="<string>--auto-gateway</string>"
+  fi
+
+  # Snapshot the manual DNS of the service vpnc-script will reconfigure, so
+  # `repair` can restore exactly the pre-VPN state if the worker ever dies
+  # without a graceful disconnect (standby crash, SIGKILL, power loss).
+  if svc=$(active_service); then
+    { echo "$svc"; service_dns "$svc"; } > "$DAEMON_DIR/dns-snapshot.txt"
+  else
+    echo "gp-admin: cannot resolve the active network service; DNS snapshot skipped" >&2
+    : > "$DAEMON_DIR/dns-snapshot.txt"
+  fi
+
+  umask 022
+  cat > "$PLIST" <<JOB
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.gpbar.worker</string>
+<key>ProgramArguments</key><array><string>$gpclient</string><string>--log-format</string><string>json</string><string>connect</string><string>$portal</string><string>--browser</string>$gateway_args$cookie</array>
+<key>EnvironmentVariables</key><dict><key>HOME</key><string>/var/root</string><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>SUDO_UID</key><string>$uid</string><key>SUDO_USER</key><string>$user</string></dict>
+<key>StandardOutPath</key><string>$log_path</string>
+<key>StandardErrorPath</key><string>$log_path</string>
+<key>RunAtLoad</key><true/>
+</dict></plist>
+JOB
+  chown root:wheel "$PLIST"
+  chmod 0644 "$PLIST"
+
+  # The worker must be born from launchd to stay signalable: root children
+  # spawned outside launchd ignore catchable signals on this macOS beta
+  # (see RECAP.md). The leading unload keeps the load idempotent and
+  # recovers from a worker that exited outside GP Bar.
+  launchctl unload -w "$PLIST" 2>/dev/null || true
+  launchctl load -w "$PLIST"
+  ;;
+
+stop)
+  gpclient=$(find_gpclient) || die "gpclient not found"
+  # gpclient disconnect signals the lock-file PID with SIGINT and exits 0
+  # even when the signal went nowhere: the lock file is the truth. Fail
+  # loud, never SIGKILL — a killed worker skips the vpnc-script teardown
+  # that restores DNS settings and routes.
+  "$gpclient" disconnect
+  i=0
+  while [ "$i" -lt 20 ] && [ -e "$LOCK" ]; do
+    sleep 0.5
+    i=$((i+1))
+  done
+  if [ -e "$LOCK" ]; then
+    echo "gp-admin: the VPN worker did not stop" >&2
+    exit 1
+  fi
+  launchctl unload -w "$PLIST" 2>/dev/null || true
+  ;;
+
+cancel)
+  # Unloading the one-shot job makes launchd terminate the worker, which
+  # runs its own teardown instead of a blind kill.
+  launchctl unload -w "$PLIST" 2>/dev/null || true
+  ;;
+
+repair)
+  # Restore network settings after a worker died without its graceful
+  # teardown (overnight standby, crash, forced power-off): vpnc-script's
+  # manual DNS servers would otherwise keep breaking name resolution.
+  if [ -e "$LOCK" ]; then
+    die "the VPN is up; nothing to repair"
+  fi
+  if pgrep -x gpclient >/dev/null 2>&1; then
+    die "a gpclient worker is still running; connect/disconnect it instead"
+  fi
+  svc=$(active_service) || die "no active network service found"
+  [ -n "$svc" ] || die "cannot resolve the active network service"
+  vpn_dns=$(service_dns "$svc")
+  if [ -z "$vpn_dns" ]; then
+    echo "gp-admin: no stale manual DNS on '$svc'"
+    exit 0
+  fi
+  # Restore target: the pre-connect snapshot when it exists, DHCP defaults
+  # (Empty) otherwise.
+  restore_empty=1
+  restore_servers=''
+  if [ -s "$DAEMON_DIR/dns-snapshot.txt" ]; then
+    snap_svc=$(head -n 1 "$DAEMON_DIR/dns-snapshot.txt")
+    restore_servers=$(tail -n +2 "$DAEMON_DIR/dns-snapshot.txt" \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    [ -z "$restore_servers" ] && restore_empty=1 || restore_empty=0
+  fi
+  if [ "$restore_empty" = 1 ]; then
+    /usr/sbin/networksetup -setdnsservers "$svc" Empty
+    echo "gp-admin: cleared manual DNS on '$svc' (was left by the VPN)"
+  else
+    /usr/sbin/networksetup -setdnsservers "$svc" $restore_servers
+    echo "gp-admin: restored DNS on '$svc' to the pre-VPN setting: $(echo $restore_servers)"
+  fi
+  # The same VPN DNS can sit on services that were active during past
+  # connects (docks, USB adapters, now disabled — vpnc-script never reverts
+  # them if the worker died). Clear every other service carrying exactly
+  # the stale set; anything else (a user's own manual DNS) is left alone.
+  while IFS= read -r service; do
+    [ -z "$service" ] && continue
+    [ "$service" = "$svc" ] && continue
+    if [ "$(service_dns "$service")" = "$vpn_dns" ]; then
+      /usr/sbin/networksetup -setdnsservers "$service" Empty
+      echo "gp-admin: cleared the same stale DNS on '$service'"
+    fi
+  done <<SERVICES
+$(/usr/sbin/networksetup -listallnetworkservices | tail -n +2 | sed 's/^\*//')
+SERVICES
+  ;;
+
+*)
+  die "unknown operation: $op"
+  ;;
+esac
