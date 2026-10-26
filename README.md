@@ -17,9 +17,11 @@ sudo gpclient connect vpn.example.com --browser --auto-gateway --cookie-cache
 
 * **Connect** — GP Bar asks a **root-owned helper** to start the VPN worker
   (one `sudo -n`, no dialog, no credentials in the app — see
-  [Privileges](#privileges)). The worker runs as root, born from **launchd**
-  so it stays signalable (see the incident notes in `RECAP.md`); its SSO
-  login opens in your default browser.
+  [Privileges](#privileges)). Gateway selection mirrors the CLI: the panel's
+  "Auto" maps to `--auto-gateway` (with an optional preferred gateway), a
+  picked gateway passes `--gateway <name>`. The worker runs as root, born
+  from **launchd** so it stays signalable (see the incident notes in
+  `RECAP.md`); its SSO login opens in your default browser.
 * **Status** — `gpclient` writes its PID to `/var/run/gpclient.lock` once the
   tunnel is up and removes it on disconnect; GP Bar watches that file to know
   whether the VPN is up (even if it was started from a terminal, or before GP
@@ -88,8 +90,11 @@ sudo bash "$HOME/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.
 The padlock lives in the menu bar:
 
 * **Left click** — open the GP Bar panel: VPN status, connect/disconnect,
-  live activity log, portal picker.
-* **Right click** — open the tray menu: Connect / Disconnect / Quit.
+  live activity log, portal and gateway pickers.
+* **Right click** — open the tray menu: Connect / Disconnect / Quit (each
+  enabled per VPN state; the menu is popped up by hand, never attached to
+  the status item — an attached one swallows left clicks on the macOS 27
+  beta, see `RECAP.md` §8 and §14).
 
 The panel needs the selected portal seeded before Connect works; picking a
 portal in the picker (or adding one) enables it. Errors show in the panel
@@ -122,7 +127,11 @@ re-verified.)
   "portals": ["vpn.example.com"],
   "selected": "vpn.example.com",
   "reuse_cookie": true,
-  "gpclient_path": null
+  "gpclient_path": null,
+  "gateways": [],
+  "preferred_gateway": null,
+  "selected_gateway": null,
+  "liquid_glass": null
 }
 ```
 
@@ -132,6 +141,16 @@ re-verified.)
   display; `null` auto-detects the Homebrew locations. (The root helper
   always resolves gpclient from the fixed Homebrew paths: a root-owned
   component must not execute user-configured paths.)
+* `gateways` — entries of the gateway picker: added from the panel or
+  harvested from connect logs, never fetched over the network. GP Bar makes
+  no network calls of its own (a portal-side gateway fetch was removed —
+  see `RECAP.md`).
+* `preferred_gateway` / `selected_gateway` — the picker's "Auto"
+  (`selected_gateway: null`) connects to the preferred gateway when one is
+  set, else lets gpclient choose (`--auto-gateway`); a picked gateway forces
+  `--gateway <name>`.
+* `liquid_glass` — `null` = auto: native liquid-glass panel backdrop on
+  macOS 26+, CSS vibrancy below; `false` forces the CSS backdrop everywhere.
 
 ## Licensing
 

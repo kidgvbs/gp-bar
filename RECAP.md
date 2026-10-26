@@ -86,7 +86,7 @@ gp-bar/
 └── reference/GlobalProtect-openconnect/        # clone shallow del sorgente open source (gitignored)
 ```
 
-Comandi IPC: `get_state`, `get_config`, `get_versions`, `add/remove/select_portal`, `set_reuse_cookie`, `select/preferred/remove/add_gateway`, `connect`, `disconnect`, `cancel`, `get_network_health`, `repair_network`, `quit`.
+Comandi IPC: `get_state`, `get_panel_effect`, `get_config`, `get_versions`, `add/remove/select_portal`, `set_reuse_cookie`, `select/preferred/remove/add_gateway`, `connect`, `disconnect`, `cancel`, `get_network_health`, `repair_network`, `quit`.
 
 **Gateway nel picker** — come si riempie la lista, in ordine di affidabilità:
 
@@ -445,3 +445,11 @@ Il posizionamento non veniva **mai** eseguito: non era un problema di set_positi
 - Ogni popup e ogni azione del menu lascia traccia in `panel.log`.
 
 **Verificato dall'utente**: menu all'icona al destro, azioni coerenti col pannello, click sinistro intatto. **Lezione**: su questa beta il menu nativo dello status item è irrecuperabile dal lato sinistro, ma il popup manuale con ramo mouse-location di muda lo replica al 100% — e il diario di §8 aveva già tutte le coordinate per dirlo: bastava cercare il ramo giusto invece di arrendersi al menu attaccato.
+
+## 15. Pubblicazione del repo: pulito l'albero non basta, conta la storia (26/10/2026)
+
+**Contesto**: repo reso pubblico. Lo scrub dell'**albero** (hostname del portale reale → placeholder, lista di app menu-bar che rivelava l'IdP → genericizzata) non è sufficiente quando i dati sensibili vivono nella **storia**: `git log --all -S` mostrava l'hostname in 9 commit (2 anche nei messaggi) e l'identità git reale (nome + email aziendale) era su ogni commit di ogni branch.
+
+**Scelta**: repo **nuovo** con root commit orfani (alberi ripuliti, identità `kidgvbs <noreply GitHub>` configurata a livello **repo**, così anche i commit futuri restano puliti senza toccare la config globale) invece di riscrittura filter-repo del vecchio. Il vecchio repo diventa `gp-bar-archived`: privato + `archived` GitHub (read-only), tutta la storia pre-scrub conservata lì — è il suo ruolo. Branch pubblicati: `main` + `solution-1-smappservice` (parcheggiata: da ribasare su main se ripresa).
+
+**Lezione**: prima di pubblicare, controllare **storia** (`git log --all -S<termine>`, tutti i branch e i messaggi) e **identità** (`git log --format='%an <%ae>'`), non solo `grep` sull'albero corrente; il gateway FQDN non è mai entrato in git solo perché vive nella config fuori repo — la segregazione dei dati fuori dal repo è la difesa che funziona, lo scrub è la seconda linea.
