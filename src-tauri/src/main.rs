@@ -512,31 +512,28 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     // Anchor the panel under the tray icon: the handler passes the click
     // position (or the icon rect when it agrees with the click). The monitor
     // holding the anchor is resolved BY HAND in one canonical space — logical
-    // points, top-left origin — never through tauri's monitor_from_point,
-    // because the three spaces in this stack do not agree on macOS:
+    // points, top-left origin — never through tauri's monitor_from_point.
+    // macOS really runs TWO screen spaces here, flipped against each other
+    // in y:
     //
-    //   * the tray payload (tray-icon 0.25) is logical points scaled by the
-    //     tray screen's own factor, TOP-LEFT origin (mouseLocation flipped
-    //     with the main screen's height, then .to_physical);
-    //   * tauri's Monitor data is logical points scaled by the monitor's
-    //     factor, BOTTOM-LEFT origin (CGDisplayBounds and NSScreen
-    //     visibleFrame both live in the CG global space);
-    //   * monitor_from_point hit-tests CGDisplayBounds in pure logical
-    //     points — a scaled tray payload can never match it (the
-    //     "found NO monitor" this code replaces), and even a logical point
-    //     would be off by the y-flip.
+    //   * AppKit (NSEvent::mouseLocation, NSScreen/NSWindow frames) is
+    //     BOTTOM-LEFT origin, y up. The tray payload is born there and is
+    //     flipped into top-left by tray-icon (and by tao's cursor helper)
+    //     using the MAIN screen's height from CGDisplayPixelsHigh — which
+    //     behaves as POINTS on this OS build (only the logical height fits
+    //     both the single- and the dual-display payloads) — then scaled by
+    //     the tray window's own factor. Pre-scale, the payload IS canonical.
+    //   * Quartz display space (CGDisplayBounds — what tao's
+    //     Monitor::position() passes through RAW; tauri's work_area just adds
+    //     the menu-bar/dock insets to it) is TOP-LEFT origin, y down: the
+    //     monitor table below is already canonical, no flip needed.
     //
-    // The y-flip constant every helper uses is the MAIN screen's height
-    // (CGDisplayPixelsHigh, see tao's util::window_position and tray-icon's
-    // flip_window_screen_coordinates) — reproduced here as
-    // primary.size()/scale, so no points-vs-pixels assumption is baked in:
-    // whichever unit that C API returns cancels against itself.
-    let main_h = app
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .map(|m| m.size().height as f64 / m.scale_factor())
-        .unwrap_or(900.0);
+    // The mixed-DPI bug this replaced: an earlier table flipped tao's
+    // positions with the main height, mirroring every NON-primary monitor
+    // across the primary (a display above the laptop was recorded below),
+    // so anchors on the external menu bar never matched. The single-monitor
+    // case still worked because the primary's origin (0,0) is invariant
+    // under that flip.
 
     // Tray payload, or the cursor fallback recovered to pure logical points
     // (tao converts the cursor with the PRIMARY scale — its cross-monitor
@@ -586,13 +583,13 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
                 scale,
                 bounds: (
                     pos.x as f64 / scale,
-                    main_h - (pos.y as f64 + size.height as f64) / scale,
+                    pos.y as f64 / scale,
                     size.width as f64 / scale,
                     size.height as f64 / scale,
                 ),
                 work: (
                     work.position.x as f64 / scale,
-                    main_h - (work.position.y as f64 + work.size.height as f64) / scale,
+                    work.position.y as f64 / scale,
                     work.size.width as f64 / scale,
                     work.size.height as f64 / scale,
                 ),
@@ -662,7 +659,7 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
                 let scale = primary.scale_factor();
                 let work = primary.work_area();
                 let wx = work.position.x as f64 / scale;
-                let wy = main_h - (work.position.y as f64 + work.size.height as f64) / scale;
+                let wy = work.position.y as f64 / scale;
                 let w_scale = window.scale_factor().unwrap_or(scale);
                 let panel_w = size.width as f64 / w_scale;
                 let (x, y) = (wx + work.size.width as f64 / scale - panel_w, wy);
