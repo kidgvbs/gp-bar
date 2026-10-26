@@ -2,7 +2,7 @@
 name = "gp-bar"
 version = "0.1.0"
 description = "Menu bar client for the GlobalProtect VPN via the open-source gpclient CLI. No connection time limits."
-authors = ["Gabriele Gallo"]
+authors = ["kidgvbs"]
 license = "MIT"
 edition = "2021"
 rust-version = "1.77"
