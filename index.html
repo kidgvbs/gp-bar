@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GP Bar</title>
+    <link rel="stylesheet" href="/src/panel.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="status-block" id="status-block">
+        <div class="status-dot" id="status-dot"></div>
+        <div class="status-text">
+          <div class="state-label" id="state-label">Disconnected</div>
+          <div class="state-detail" id="state-detail">Not connected</div>
+        </div>
+        <div class="duration" id="duration"></div>
+      </header>
+
+      <section class="controls">
+        <div class="portal-row">
+          <select id="portal-select" title="Portal"></select>
+          <button id="portal-edit" class="icon-btn" title="Edit portals">&#9881;</button>
+        </div>
+
+        <div id="portal-editor" class="portal-editor hidden">
+          <ul id="portal-list"></ul>
+          <div class="portal-add-row">
+            <input id="portal-input" type="text" placeholder="portal.example.com" spellcheck="false" />
+            <button id="portal-add" class="icon-btn">+</button>
+          </div>
+          <label class="option-row">
+            <input type="checkbox" id="cookie-cache" checked />
+            <span>Reuse authentication cookie (fewer browser logins)</span>
+          </label>
+          <div class="editor-actions">
+            <button id="portal-done" class="btn secondary">Done</button>
+          </div>
+        </div>
+
+        <button id="action-btn" class="btn primary">Connect</button>
+      </section>
+
+      <section class="log-block collapsed" id="log-block">
+        <div class="log-header">
+          <button class="log-toggle" id="log-toggle" type="button" title="Toggle activity log">
+            <span class="chevron">&#9656;</span>
+            <span>Activity</span>
+          </button>
+          <button id="copy-log" class="icon-btn" title="Copy log">&#9114;</button>
+        </div>
+        <pre id="log" class="log"></pre>
+      </section>
+
+      <footer>
+        <span id="versions"></span>
+        <span id="helper-status" class="helper-status"></span>
+        <button id="quit-btn" class="btn quit" title="Quit GP Bar">Quit</button>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

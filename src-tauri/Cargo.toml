@@ -1,0 +1,46 @@
+[package]
+name = "gp-bar"
+version = "0.1.0"
+description = "Menu bar client for the GlobalProtect VPN via the open-source gpclient CLI. No connection time limits."
+authors = ["Gabriele Gallo"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77"
+# tauri needs to find the app binary among the crate's targets (gp-helper
+# is a bin too).
+default-run = "gp-bar"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[[bin]]
+name = "gp-helper"
+path = "src/bin/gp-helper.rs"
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "fs"] }
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Raw XPC bindings for the gp-helper daemon protocol (see src/xpc.rs): the
+# xpc_* symbols are re-exported by libSystem, so no -lxpc is needed.
+block2 = "0.6"
+# LaunchDaemon registration (SMAppService) for the privileged helper.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-service-management = "0.3"
+libc = "0.2"
+# Tray handles are created directly (not through tauri::tray), pinned to the
+# exact 0.25.0 verified working on this machine. The early theories about
+# menu-attach timing on macOS 27 beta were red herrings: the tray always
+# worked, the app was frozen by a poller deadlock (see vpn::update). Keep the
+# pin until 0.25.1 is explicitly re-verified; tauri's own requirement is
+# "0.25", so cargo unifies both onto 0.25.0 and muda stays at 0.20.
+tray-icon = { version = "=0.25.0", default-features = false, features = ["serde", "libappindicator"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
