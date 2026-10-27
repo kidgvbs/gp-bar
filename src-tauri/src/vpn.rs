@@ -76,8 +76,6 @@ impl Default for VpnState {
 #[derive(Default)]
 struct Inner {
     state: VpnState,
-    /// PID of the root gpclient worker we started, when connecting.
-    worker_pid: Option<u32>,
     /// Whether the in-flight connect attempt's `admin start` has been
     /// confirmed (the wrapper returned Ok and loaded a fresh launchd job).
     /// The status poller may blame a job without a pid on a dead worker ONLY
@@ -178,7 +176,6 @@ impl VpnController {
         self.update(app, |inner| {
             inner.state.phase = Phase::Error;
             inner.state.last_error = Some(error);
-            inner.worker_pid = None;
             inner.worker_started = false;
         });
     }
@@ -299,9 +296,6 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
             inner.state.phase = Phase::Connected;
             inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
             inner.state.pid = Some(obs.pid);
-            if inner.worker_pid.is_none() {
-                inner.worker_pid = Some(obs.pid);
-            }
         }
         (Some(obs), Phase::Connecting) => {
             inner.state.phase = Phase::Connected;
@@ -315,7 +309,6 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
             inner.state.connected_since_epoch_secs = None;
             inner.state.pid = None;
             inner.state.gateway = None;
-            inner.worker_pid = None;
             inner.worker_started = false;
         }
         (None, _) => {}
@@ -1095,7 +1088,6 @@ mod tests {
             assert_eq!(inner.state.phase, Phase::Connected);
             assert_eq!(inner.state.pid, Some(4242));
             assert_eq!(inner.state.connected_since_epoch_secs, Some(1_700_000_000));
-            assert_eq!(inner.worker_pid, Some(4242));
         }
         // Our own attempt completed: Connecting graduates to Connected.
         {
@@ -1113,8 +1105,8 @@ mod tests {
             apply_lock(&mut inner, Some(obs()));
             assert_eq!(inner.state.phase, phase);
             assert_eq!(inner.state.gateway.as_deref(), Some("gw-keep"));
-            // No adoption: the worker bookkeeping was not rewritten.
-            assert_eq!(inner.worker_pid, None);
+            // No adoption: the reported pid was not rewritten either.
+            assert_eq!(inner.state.pid, None);
         }
 
         // -- observation None (no lock file / dead PID) ---------------------
@@ -1125,13 +1117,11 @@ mod tests {
             inner.state.pid = Some(4242);
             inner.state.connected_since_epoch_secs = Some(1_700_000_000);
             inner.state.gateway = Some("gw-old".to_string());
-            inner.worker_pid = Some(4242);
             apply_lock(&mut inner, None);
             assert_eq!(inner.state.phase, Phase::Disconnected);
             assert_eq!(inner.state.connected_since_epoch_secs, None);
             assert_eq!(inner.state.pid, None);
             assert_eq!(inner.state.gateway, None);
-            assert_eq!(inner.worker_pid, None);
         }
         // Idle and in-flight phases absorb a missing lock: Connecting keeps
         // waiting for its worker (the poller decides exit-vs-authenticating

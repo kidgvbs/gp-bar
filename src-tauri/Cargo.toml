@@ -29,6 +29,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tray-icon = { version = "=0.25.0", default-features = false, features = ["serde", "libappindicator"] }
 # Native liquid-glass panel backdrop (macOS 26+), behind the webview.
 window-vibrancy = "0.8.1"
+tauri-plugin-log = "2.0.0-rc.2"
 
 # Liquid glass: the panel's own WKWebView, handed to window-vibrancy via
 # LiquidGlassOptions::content_view so the crate reparents it into the glass
