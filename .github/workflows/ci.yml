@@ -51,7 +51,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Node 22's bundled npm dies with "Exit handler never called"
+          # on current runners; Node 24 LTS (npm 11) is clean.
+          node-version: 24
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npx tsc --noEmit
