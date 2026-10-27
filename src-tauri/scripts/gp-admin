@@ -44,10 +44,16 @@ LOG_DIR=/Library/Logs/gp-bar
 LOG_PATH="$LOG_DIR/gpclient-connect.log"
 
 # The worker binaries resolve from the root-owned install prefix only.
-# setup-admin.sh copies gpclient (and its sibling gpauth + Frameworks
-# dylibs) here from the Homebrew paths; nothing under /opt/homebrew,
-# /usr/local or /Applications is ever executed as root by this script.
+# setup-admin.sh copies gpclient (with its Frameworks dylibs) and the whole
+# "GP Connect Login.app" bundle (gpauth's SAML drop-in) here; nothing under
+# /opt/homebrew, /usr/local or /Applications is ever executed as root by
+# this script. $PREFIX/bin/gpauth is a RELATIVE symlink into the bundle:
+# gpauth is Hardened Runtime and its code signature validates against its
+# bundle context (Info.plist + _CodeSignature), so it must exec through
+# the bundle layout, never as a bare Mach-O.
 GPCLIENT="$PREFIX/bin/gpclient"
+GPAUTH="$PREFIX/bin/gpauth"
+GPLOGIN_APP="$PREFIX/GP Connect Login.app"
 
 die() { echo "gp-admin: $*" >&2; exit 1; }
 
@@ -55,7 +61,13 @@ die() { echo "gp-admin: $*" >&2; exit 1; }
 # its directory chain is owned by root and not group/world-writable.
 # A user-writable parent (or a user-swappable file) would make the
 # NOPASSWD grant equivalent to arbitrary root execution.
+# Symlinks: on macOS `stat -f` without -L stats the LINK ITSELF (lstat),
+# so the first check below covers the link; `realpath` then resolves it
+# and the walk covers the target and its whole parent chain.
 require_root_owned() {
+  if [ -L "$1" ]; then
+    [ "$(stat -f %u "$1")" = 0 ] || die "symlink $1 is not root-owned"
+  fi
   real=$(realpath "$1") || die "cannot resolve $1"
   d=$real
   while :; do
@@ -113,11 +125,15 @@ op="${1:-}"
 case "$op" in
 selftest)
   require_gpclient
-  # The SAML drop-in helper, when present, must pass the same checks
-  # (gpclient resolves it as a sibling of its own executable).
-  if [ -e "$PREFIX/bin/gpauth" ]; then
-    require_root_owned "$PREFIX/bin/gpauth"
-  fi
+  # The SAML drop-in helper: gpclient resolves it as a sibling of its own
+  # executable, so it must exist as the bundle-backed symlink. It is
+  # Hardened Runtime — exec'ing a bare Mach-O copy dies with SIGKILL at
+  # exec (bundle-context signature validation), so the bundle layout is
+  # not optional. Fail loud if it is missing.
+  [ -L "$GPAUTH" ] || die "gpauth symlink missing at $GPAUTH — re-run setup-admin.sh"
+  require_root_owned "$GPAUTH"
+  [ -d "$GPLOGIN_APP" ] || die "GP Connect Login.app bundle missing at $GPLOGIN_APP — re-run setup-admin.sh"
+  require_root_owned "$GPLOGIN_APP"
   mkdir -p "$DAEMON_DIR" 2>/dev/null || die "cannot create $DAEMON_DIR"
   install -d -m 0755 -o root -g wheel "$LOG_DIR"
   echo ok

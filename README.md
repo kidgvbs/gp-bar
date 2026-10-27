@@ -51,14 +51,20 @@ Creating the tunnel requires root. GP Bar never handles a password itself:
   directory is system-owned):
 
   * `admin` — the wrapper (0755),
-  * `bin/gpclient` and `bin/gpauth` — **root-owned copies** of the worker
-    binaries, resolved from the Homebrew locations. The wrapper executes
-    these only, never anything under `/opt/homebrew`, `/usr/local` or an
-    app bundle, and refuses to run unless the binary, its realpath and
-    every parent directory are root-owned,
-  * `Frameworks/*.dylib` — the `@executable_path` dylibs gpclient links
-    (libopenconnect and its closure), copied layout-preserving so the
-    whole load chain is root-owned too,
+  * `bin/gpclient` — a **root-owned copy** of the worker binary, resolved
+    from the Homebrew locations, plus `Frameworks/*.dylib` — the
+    `@executable_path` dylibs gpclient links (libopenconnect and its
+    closure), copied layout-preserving so the whole load chain is
+    root-owned too. The wrapper executes these only, never anything under
+    `/opt/homebrew`, `/usr/local` or an app bundle, and refuses to run
+    unless the file, its realpath and every parent directory are
+    root-owned,
+  * `GP Connect Login.app` and `bin/gpauth` — gpauth (the SAML drop-in,
+    resolved by gpclient as a sibling of its own executable) is
+    **Hardened Runtime**: its code signature validates against its bundle
+    context, and the kernel kills a bare Mach-O copy at exec. So the whole
+    bundle is copied root-owned and `bin/gpauth` is a relative symlink into
+    it — the exec happens in bundle context, exactly like upstream.
   * the sudoers grant, written atomically: a dotted, inert temp file in
     `/etc/sudoers.d`, validated on its own with `visudo -cf`, then renamed
     into place. A malformed file can never be live.
