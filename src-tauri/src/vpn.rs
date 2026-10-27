@@ -774,6 +774,43 @@ pub async fn active_service_dns() -> (Option<String>, Vec<String>) {
     (Some(service), parse_dns_servers(&dns))
 }
 
+/// The pre-VPN DNS snapshot the privileged wrapper records at connect time
+/// (see scripts/gp-admin `start`): line 1 = the service it was taken on, then
+/// the manual IPv4 servers, an `ipv6:` marker line, then the IPv6 servers.
+/// World-readable, written atomically by root.
+const DNS_SNAPSHOT: &str = "/Library/Application Support/GP Bar/dns-snapshot.txt";
+
+/// Whether the active service's current manual IPv4 DNS is exactly the
+/// recorded pre-VPN state: then it is the user's OWN configuration, not a
+/// VPN leftover, and the banner must not call it stale. Anything else
+/// (missing/empty snapshot, another service, a different set) is unknown —
+/// the banner is advisory and `gp-admin repair` is the one that decides.
+pub fn dns_matches_pre_vpn_snapshot(service: &str, servers: &[String]) -> bool {
+    let Ok(raw) = std::fs::read_to_string(DNS_SNAPSHOT) else {
+        return false;
+    };
+    snapshot_v4_matches(&raw, service, servers)
+}
+
+fn snapshot_v4_matches(raw: &str, service: &str, servers: &[String]) -> bool {
+    let mut lines = raw.lines().map(str::trim);
+    let Some(snap_service) = lines.next() else {
+        return false;
+    };
+    if snap_service != service {
+        return false;
+    }
+    let mut snapshot: Vec<String> = lines
+        .take_while(|line| *line != "ipv6:")
+        .map(str::to_string)
+        .collect();
+    let mut current: Vec<String> = servers.to_vec();
+    // Set equality, order-insensitive (networksetup may list in any order).
+    snapshot.sort_unstable();
+    current.sort_unstable();
+    !snapshot.is_empty() && snapshot == current
+}
+
 async fn scutil_primary_interface() -> Option<String> {
     use tokio::io::AsyncWriteExt;
     let mut child = tokio::process::Command::new("/usr/sbin/scutil")
@@ -1280,6 +1317,35 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(parse_dns_servers(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn snapshot_v4_matches_only_the_own_service_and_set() {
+        let raw = "Wi-Fi\n1.1.1.1\n8.8.8.8\nipv6:\n2001:db8::53\n";
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Same service, same set (any order): the user's own pre-VPN state.
+        assert!(snapshot_v4_matches(
+            raw,
+            "Wi-Fi",
+            &set(&["8.8.8.8", "1.1.1.1"])
+        ));
+        // The v6 section after the marker must not leak into the v4 set.
+        assert!(!snapshot_v4_matches(
+            raw,
+            "Wi-Fi",
+            &set(&["8.8.8.8", "1.1.1.1", "2001:db8::53"])
+        ));
+        // Different service: never a match.
+        assert!(!snapshot_v4_matches(raw, "Ethernet", &set(&["1.1.1.1"])));
+        // Different set: not the pre-VPN state.
+        assert!(!snapshot_v4_matches(raw, "Wi-Fi", &set(&["9.9.9.9"])));
+        // Empty snapshot / no service line: unknown, never a match.
+        assert!(!snapshot_v4_matches("", "Wi-Fi", &set(&["1.1.1.1"])));
+        assert!(!snapshot_v4_matches(
+            "Wi-Fi\nipv6:\n",
+            "Wi-Fi",
+            &set(&["1.1.1.1"])
+        ));
     }
 
     #[test]

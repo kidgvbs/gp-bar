@@ -107,10 +107,66 @@ active_service() {
     }'
 }
 
-# Manual DNS servers set on a service, one per line (empty when none).
+# Manual IPv4 DNS servers set on a service, one per line (empty when none).
+# vpnc-script writes only IPv4 DNS (INTERNAL_IP4_DNS), so this is also the
+# VPN-leftover signature.
 service_dns() {
   /usr/sbin/networksetup -getdnsservers "$1" 2>/dev/null \
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+
+# Manual IPv6 DNS servers set on a service, one per line (empty when none).
+# An IPv6 literal always contains a colon, an IPv4 one never does. vpnc-script
+# never writes v6, but its teardown (`-setdnsservers <svc> Empty`) clears ALL
+# manual DNS — so the snapshot must record the user's v6 too, or a repair that
+# restores only v4 would silently drop them.
+service_dns6() {
+  /usr/sbin/networksetup -getdnsservers "$1" 2>/dev/null \
+    | grep -E '^[0-9A-Fa-f:]+$' | grep ':' || true
+}
+
+# Snapshot format (dns-snapshot.txt, written atomically by `start`):
+#   line 1:      the network service the pre-VPN DNS was captured on
+#   until ipv6:  the manual IPv4 servers (pre-VPN state)
+#   after ipv6:: the manual IPv6 servers (pre-VPN state)
+# Flat lines, shell-grep-able.
+SNAPSHOT="$DAEMON_DIR/dns-snapshot.txt"
+
+snapshot_svc() {
+  [ -s "$SNAPSHOT" ] || return 1
+  head -n 1 "$SNAPSHOT"
+}
+
+# The snapshot's IPv4 / IPv6 server lists.
+snapshot_v4() {
+  sed '1d' "$SNAPSHOT" | sed '/^ipv6:$/,$d' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+
+snapshot_v6() {
+  sed -n '/^ipv6:$/,$p' "$SNAPSHOT" | sed '1d' \
+    | grep -E '^[0-9A-Fa-f:]+$' || true
+}
+
+# The current manual DNS of `svc` as one normalized, sorted string.
+current_dns() {
+  { service_dns "$1"; service_dns6 "$1"; } | sort | tr '\n' ' '
+}
+
+# The snapshot's DNS as one normalized, sorted string (v4 + v6).
+snapshot_dns() {
+  { snapshot_v4; snapshot_v6; } | sort | tr '\n' ' '
+}
+
+# Write the pre-VPN snapshot for `svc` atomically (temp + rename).
+write_snapshot() {
+  {
+    echo "$1"
+    service_dns "$1"
+    echo "ipv6:"
+    service_dns6 "$1"
+  } > "$SNAPSHOT.tmp"
+  mv -f "$SNAPSHOT.tmp" "$SNAPSHOT"
 }
 
 # Resolve the root-owned worker binary and verify the whole ownership
@@ -207,11 +263,27 @@ start)
   # Snapshot the manual DNS of the service vpnc-script will reconfigure, so
   # `repair` can restore exactly the pre-VPN state if the worker ever dies
   # without a graceful disconnect (standby crash, SIGKILL, power loss).
+  # Never poison it: after a crash the leftover VPN servers are still set,
+  # and snapshotting THOSE as "pre-VPN state" would make a later repair
+  # restore the VPN resolvers. Rules:
+  #   * no snapshot yet (or one for a different service) -> take a fresh one;
+  #   * same service and the current DNS differs from what the snapshot
+  #     records -> the current DNS is suspected VPN leftover (or an
+  #     unexplained manual change): keep the existing snapshot, warn loud;
+  #   * same service and same DNS -> harmless refresh.
   if svc=$(active_service); then
-    { echo "$svc"; service_dns "$svc"; } > "$DAEMON_DIR/dns-snapshot.txt"
+    if snap=$(snapshot_svc); then
+      if [ "$snap" = "$svc" ] && [ "$(current_dns "$svc")" != "$(snapshot_dns)" ]; then
+        echo "gp-admin: manual DNS on '$svc' differs from the recorded pre-VPN snapshot; keeping the existing snapshot (suspected VPN leftover — run repair while the VPN is down)" >&2
+      else
+        write_snapshot "$svc"
+      fi
+    else
+      write_snapshot "$svc"
+    fi
   else
     echo "gp-admin: cannot resolve the active network service; DNS snapshot skipped" >&2
-    : > "$DAEMON_DIR/dns-snapshot.txt"
+    [ -s "$SNAPSHOT" ] || : > "$SNAPSHOT"
   fi
 
   # PATH carries the root-owned bin/ FIRST and no Homebrew prefix: root
@@ -276,6 +348,8 @@ repair)
   # Restore network settings after a worker died without its graceful
   # teardown (overnight standby, crash, forced power-off): vpnc-script's
   # manual DNS servers would otherwise keep breaking name resolution.
+  # Never guess: restore only from a snapshot taken on THIS service, and
+  # refuse when there is nothing trustworthy to restore from.
   if [ -e "$LOCK" ]; then
     die "the VPN is up; nothing to repair"
   fi
@@ -284,32 +358,41 @@ repair)
   fi
   svc=$(active_service) || die "no active network service found"
   [ -n "$svc" ] || die "cannot resolve the active network service"
+  # vpnc-script writes only IPv4 DNS, so leftover IPv4 manual servers are
+  # the VPN signature; manual IPv6 alone is the user's own, left alone.
   vpn_dns=$(service_dns "$svc")
   if [ -z "$vpn_dns" ]; then
     echo "gp-admin: no stale manual DNS on '$svc'"
     exit 0
   fi
-  # Restore target: the pre-connect snapshot when it exists, DHCP defaults
-  # (Empty) otherwise.
-  restore_empty=1
-  restore_servers=''
-  if [ -s "$DAEMON_DIR/dns-snapshot.txt" ]; then
-    snap_svc=$(head -n 1 "$DAEMON_DIR/dns-snapshot.txt")
-    restore_servers=$(tail -n +2 "$DAEMON_DIR/dns-snapshot.txt" \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
-    [ -z "$restore_servers" ] && restore_empty=1 || restore_empty=0
+  # No snapshot: the pre-VPN state is unknown. Clearing or "restoring"
+  # anything would be a guess — refuse and tell the user what to do.
+  if ! snapshot_svc >/dev/null; then
+    die "manual DNS on '$svc' ($vpn_dns) looks VPN-left, but no pre-VPN snapshot exists — refusing to guess. Clear it yourself: networksetup -setdnsservers '$svc' Empty (or set your own servers), then use GP Bar normally to record a fresh snapshot"
   fi
-  if [ "$restore_empty" = 1 ]; then
+  # The snapshot must belong to the CURRENT service: a snapshot taken on
+  # Wi-Fi must never be applied to Ethernet (or vice versa) after a switch.
+  snap_svc=$(snapshot_svc)
+  if [ "$snap_svc" != "$svc" ]; then
+    die "the pre-VPN snapshot was taken on '$snap_svc', but the active service is '$svc' — restoring it here would write another service's DNS. Re-connect and disconnect the VPN on '$svc' via GP Bar to record a fresh snapshot, or set the DNS by hand: networksetup -getdnsservers '$snap_svc' shows the recorded pre-VPN servers"
+  fi
+  restore_v4=$(snapshot_v4)
+  restore_v6=$(snapshot_v6)
+  if [ -z "$restore_v4" ] && [ -z "$restore_v6" ]; then
+    # The pre-VPN state had no manual DNS at all: back to DHCP defaults.
     /usr/sbin/networksetup -setdnsservers "$svc" Empty
-    echo "gp-admin: cleared manual DNS on '$svc' (was left by the VPN)"
+    echo "gp-admin: cleared manual DNS on '$svc' (pre-VPN state had none)"
   else
-    /usr/sbin/networksetup -setdnsservers "$svc" $restore_servers
-    echo "gp-admin: restored DNS on '$svc' to the pre-VPN setting: $(echo $restore_servers)"
+    # Restore IPv4 AND IPv6 together — networksetup takes both in one call,
+    # and a v4-only restore would drop the user's manual v6 resolvers.
+    /usr/sbin/networksetup -setdnsservers "$svc" $restore_v4 $restore_v6
+    echo "gp-admin: restored DNS on '$svc' to the pre-VPN setting: $(echo $restore_v4 $restore_v6)"
   fi
   # The same VPN DNS can sit on services that were active during past
   # connects (docks, USB adapters, now disabled — vpnc-script never reverts
   # them if the worker died). Clear every other service carrying exactly
-  # the stale set; anything else (a user's own manual DNS) is left alone.
+  # the stale IPv4 set; anything else (a user's own manual DNS) is left
+  # alone.
   while IFS= read -r service; do
     [ -z "$service" ] && continue
     [ "$service" = "$svc" ] && continue

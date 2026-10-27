@@ -389,8 +389,16 @@ async fn get_network_health(state: State<'_, AppContext>) -> Result<vpn::Network
         });
     }
     let (service, servers) = vpn::active_service_dns().await;
+    // The banner is advisory: "stale" = manual DNS that is NOT the recorded
+    // pre-VPN state (the wrapper's snapshot — see scripts/gp-admin). A
+    // snapshot-equal DNS is the user's own configuration, not a VPN leftover;
+    // `gp-admin repair` makes the real decision and refuses to guess.
+    let stale = !servers.is_empty()
+        && !service
+            .as_deref()
+            .is_some_and(|svc| vpn::dns_matches_pre_vpn_snapshot(svc, &servers));
     Ok(vpn::NetworkHealth {
-        stale: !servers.is_empty(),
+        stale,
         service,
         servers,
     })
