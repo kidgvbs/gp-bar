@@ -156,6 +156,11 @@ a GP Connect update (the source of the `gpclient` binary) — re-run the
 setup script to refresh the installed wrapper and the root-owned binary
 copies (it is idempotent, and it also performs the end-to-end selftest).
 
+CI (`.github/workflows/ci.yml`) runs on every push/PR: `cargo fmt
+--check`, `cargo clippy -D warnings` and `cargo test` on Linux (the
+macOS-only code paths are `cfg`-gated), shellcheck on the two admin
+scripts, and `tsc --noEmit` + `vite build` on the frontend.
+
 The tray icon is built through `tauri::tray`, so `tray-icon` comes in only as
 a transitive dependency of tauri itself (no direct pin; GP Bar never attaches
 a tray menu).
