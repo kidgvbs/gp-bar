@@ -78,6 +78,13 @@ struct Inner {
     state: VpnState,
     /// PID of the root gpclient worker we started, when connecting.
     worker_pid: Option<u32>,
+    /// Whether the in-flight connect attempt's `admin start` has been
+    /// confirmed (the wrapper returned Ok and loaded a fresh launchd job).
+    /// The status poller may blame a job without a pid on a dead worker ONLY
+    /// while this is true: before it, the job on the system is still the
+    /// previous attempt's (stale, no pid) and would be reported as a false
+    /// "worker exited" through the whole SSO login.
+    worker_started: bool,
 }
 
 pub struct VpnController {
@@ -119,14 +126,52 @@ impl VpnController {
 
     // -- connect ---------------------------------------------------------------
 
-    pub fn begin_connect(&self, app: &AppHandle, portal: String) {
-        self.update(app, |inner| {
-            inner.state.phase = Phase::Connecting;
-            inner.state.portal = Some(portal.clone());
-            inner.state.gateway = None;
-            inner.state.last_error = None;
-            inner.state.connected_since_epoch_secs = None;
-        });
+    /// Gate + transition for a connect attempt in ONE critical section.
+    ///
+    /// `do_connect` used to check the phase with `snapshot()` (lock taken and
+    /// released), do other work, and only then transition with
+    /// `begin_connect` (lock re-taken). On the multi-threaded tokio runtime
+    /// two invocations (double click, panel + tray menu) both passed the
+    /// gate, and the second `admin start` unloaded — killing — the first
+    /// worker mid-SSO. The check and the transition must be atomic; the
+    /// refusal error is the caller's to surface.
+    pub fn try_begin_connect(&self, app: &AppHandle, portal: &str) -> Result<(), String> {
+        let outcome = {
+            let mut inner = self.inner.lock().unwrap();
+            match enter_connecting(&mut inner, portal) {
+                Ok(()) => Ok(inner.state.clone()),
+                Err(phase) => Err(format!("cannot connect while {phase:?}")),
+            }
+            // Guard dropped BEFORE emitting (the `update` discipline).
+        };
+        match outcome {
+            Ok(state) => {
+                let _ = app.emit("vpn-state", &state);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Gate + transition for a disconnect attempt, atomic like
+    /// `try_begin_connect`. A second disconnect while already Disconnecting
+    /// is idempotent (Ok), matching the old `do_disconnect` behavior.
+    pub fn try_begin_disconnect(&self, app: &AppHandle) -> Result<(), String> {
+        let outcome = {
+            let mut inner = self.inner.lock().unwrap();
+            match enter_disconnecting(&mut inner) {
+                Ok(()) => Ok(inner.state.clone()),
+                Err(phase) => Err(format!("cannot disconnect while {phase:?}")),
+            }
+            // Guard dropped BEFORE emitting (the `update` discipline).
+        };
+        match outcome {
+            Ok(state) => {
+                let _ = app.emit("vpn-state", &state);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn connect_failed(&self, app: &AppHandle, error: String) {
@@ -134,18 +179,24 @@ impl VpnController {
             inner.state.phase = Phase::Error;
             inner.state.last_error = Some(error);
             inner.worker_pid = None;
+            inner.worker_started = false;
         });
+    }
+
+    /// The wrapper's `start` returned Ok: the launchd job now belongs to this
+    /// attempt, and the poller may trust its `pid =` line from here on.
+    ///
+    /// If the phase already left Connecting (the attempt failed, was
+    /// canceled, or a stale lock file graduated it straight to Connected),
+    /// setting the flag is harmless: it is reset by `enter_connecting` on
+    /// every new attempt and cleared on every teardown/failed transition, so
+    /// a stale `true` can never gate a future attempt.
+    pub fn mark_worker_started(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.worker_started = true;
     }
 
     // -- disconnect ------------------------------------------------------------
-    pub fn begin_disconnect(&self, app: &AppHandle) {
-        self.update(app, |inner| {
-            if inner.state.phase == Phase::Connected {
-                inner.state.phase = Phase::Disconnecting;
-            }
-        });
-    }
-
     /// The privileged teardown failed: surface the failure instead of a
     /// stuck "Disconnecting". The poller then reports the truth from the lock
     /// file (still connected → Connected again).
@@ -160,40 +211,18 @@ impl VpnController {
 
     /// Apply filesystem evidence (lock file present/absent, PID alive/dead).
     pub fn observe_lock(&self, app: &AppHandle, lock: Option<LockObservation>) {
-        self.update(app, |inner| match (lock, &inner.state.phase) {
-            (Some(obs), Phase::Disconnected | Phase::Error) => {
-                // A gpclient worker is running although we did not start it this
-                // session (e.g. started from a terminal, or the app restarted).
-                inner.state.phase = Phase::Connected;
-                inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-                inner.state.pid = Some(obs.pid);
-                if inner.worker_pid.is_none() {
-                    inner.worker_pid = Some(obs.pid);
-                }
-            }
-            (Some(obs), Phase::Connecting) => {
-                inner.state.phase = Phase::Connected;
-                inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-                inner.state.pid = Some(obs.pid);
-            }
-            (Some(_), Phase::Connected | Phase::Disconnecting) => {}
-            (None, Phase::Connected) => {
-                // The lock disappeared: gpclient exited and cleaned up.
-                inner.state.phase = Phase::Disconnected;
-                inner.state.connected_since_epoch_secs = None;
-                inner.state.pid = None;
-                inner.state.gateway = None;
-                inner.worker_pid = None;
-            }
-            (None, Phase::Disconnecting) => {
-                inner.state.phase = Phase::Disconnected;
-                inner.state.connected_since_epoch_secs = None;
-                inner.state.pid = None;
-                inner.state.gateway = None;
-                inner.worker_pid = None;
-            }
-            (None, _) => {}
-        });
+        self.update(app, |inner| apply_lock(inner, lock));
+    }
+
+    /// Whether the poller may attribute a missing lock file to a dead worker:
+    /// only while a connect attempt is in flight AND its start has been
+    /// confirmed (`mark_worker_started`, set once `run_admin("start")`
+    /// returned Ok). Before that the launchd job is still the previous one
+    /// (or not loaded), and a job without a `pid =` line would be reported as
+    /// a false "worker exited" through the whole SSO login.
+    pub fn connecting_worker_started(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.state.phase == Phase::Connecting && inner.worker_started
     }
 
     /// A parsed gateway name from the JSON log stream.
@@ -226,6 +255,70 @@ impl VpnController {
 fn apply_selected_portal(inner: &mut Inner, portal: Option<String>) {
     if matches!(inner.state.phase, Phase::Disconnected | Phase::Error) {
         inner.state.portal = portal;
+    }
+}
+
+/// Pure half of `VpnController::try_begin_connect`: the connect gate and
+/// transition, unit-testable without an AppHandle. Only the idle phases may
+/// start a connect; the refusal carries the blocking phase.
+fn enter_connecting(inner: &mut Inner, portal: &str) -> Result<(), Phase> {
+    if !matches!(inner.state.phase, Phase::Disconnected | Phase::Error) {
+        return Err(inner.state.phase.clone());
+    }
+    inner.state.phase = Phase::Connecting;
+    inner.state.portal = Some(portal.to_string());
+    inner.state.gateway = None;
+    inner.state.last_error = None;
+    inner.state.connected_since_epoch_secs = None;
+    // New attempt: its start is not confirmed yet (see `worker_started`).
+    inner.worker_started = false;
+    Ok(())
+}
+
+/// Pure half of `VpnController::try_begin_disconnect`. Connected proceeds;
+/// Disconnecting is already in flight (idempotent Ok); anything else refuses.
+fn enter_disconnecting(inner: &mut Inner) -> Result<(), Phase> {
+    match inner.state.phase.clone() {
+        Phase::Connected => {
+            inner.state.phase = Phase::Disconnecting;
+            Ok(())
+        }
+        Phase::Disconnecting => Ok(()),
+        phase => Err(phase),
+    }
+}
+
+/// Pure half of `VpnController::observe_lock`: the phase × observation
+/// transition table, unit-testable without an AppHandle. Documented by
+/// `tests::apply_lock_transitions`.
+fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
+    match (lock, &inner.state.phase) {
+        (Some(obs), Phase::Disconnected | Phase::Error) => {
+            // A gpclient worker is running although we did not start it this
+            // session (e.g. started from a terminal, or the app restarted).
+            inner.state.phase = Phase::Connected;
+            inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
+            inner.state.pid = Some(obs.pid);
+            if inner.worker_pid.is_none() {
+                inner.worker_pid = Some(obs.pid);
+            }
+        }
+        (Some(obs), Phase::Connecting) => {
+            inner.state.phase = Phase::Connected;
+            inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
+            inner.state.pid = Some(obs.pid);
+        }
+        (Some(_), Phase::Connected | Phase::Disconnecting) => {}
+        (None, Phase::Connected | Phase::Disconnecting) => {
+            // The lock disappeared: gpclient exited and cleaned up.
+            inner.state.phase = Phase::Disconnected;
+            inner.state.connected_since_epoch_secs = None;
+            inner.state.pid = None;
+            inner.state.gateway = None;
+            inner.worker_pid = None;
+            inner.worker_started = false;
+        }
+        (None, _) => {}
     }
 }
 
@@ -280,9 +373,14 @@ pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
             // gpclient only writes the lock once it is established, so a dead
             // worker here is a failed attempt (wrong SSO, closed browser,
             // gateway error, crash) — surface it instead of spinning forever.
+            // But only once the start is CONFIRMED (`worker_started`, set
+            // after `run_admin("start")` returns Ok): before that the job on
+            // the system is still the previous attempt's, and its missing
+            // `pid =` line would be a false "worker exited" sticking on screen
+            // through the whole SSO login.
             // The one-shot job stays loaded (no KeepAlive), so probing it
             // needs the `pid =` line, not the command's exit status.
-            if observation.is_none() && controller.snapshot().phase == Phase::Connecting {
+            if observation.is_none() && controller.connecting_worker_started() {
                 if let Some(false) = worker_has_active_pid(WORKER_LABEL).await {
                     // The job is loaded but has no live process: gpclient ran
                     // and exited before the tunnel came up (wrong SSO, closed
@@ -293,10 +391,9 @@ pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
                     );
                 }
                 // Some(true) = still authenticating; None = the job is not
-                // loaded yet (the poller can tick between begin_connect and
-                // the wrapper's `launchctl load`) or launchctl failed:
-                // nothing to report here. `run_admin("start")` reports its
-                // own failure, and cancel/stop set their own phases.
+                // loaded yet or launchctl failed: nothing to report here.
+                // `run_admin("start")` reports its own failure, and
+                // cancel/stop set their own phases.
             }
             controller.observe_lock(&app, observation);
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -829,6 +926,164 @@ mod tests {
         disconnecting.state.portal = Some("keep.example".to_string());
         apply_selected_portal(&mut disconnecting, None);
         assert_eq!(disconnecting.state.portal.as_deref(), Some("keep.example"));
+    }
+
+    #[test]
+    fn apply_lock_transitions() {
+        let obs = || LockObservation {
+            pid: 4242,
+            connected_since_epoch_secs: 1_700_000_000,
+        };
+        let inner_at = |phase: Phase| {
+            let mut inner = Inner::default();
+            inner.state.phase = phase;
+            inner
+        };
+
+        // -- observation Some (lock file present, PID alive) ----------------
+        //
+        // Idle phases are adopted: an outside worker is connected.
+        for phase in [Phase::Disconnected, Phase::Error] {
+            let mut inner = inner_at(phase);
+            apply_lock(&mut inner, Some(obs()));
+            assert_eq!(inner.state.phase, Phase::Connected);
+            assert_eq!(inner.state.pid, Some(4242));
+            assert_eq!(inner.state.connected_since_epoch_secs, Some(1_700_000_000));
+            assert_eq!(inner.worker_pid, Some(4242));
+        }
+        // Our own attempt completed: Connecting graduates to Connected.
+        {
+            let mut inner = inner_at(Phase::Connecting);
+            inner.state.portal = Some("vpn.example.com".to_string());
+            apply_lock(&mut inner, Some(obs()));
+            assert_eq!(inner.state.phase, Phase::Connected);
+            // The in-flight target survives the transition.
+            assert_eq!(inner.state.portal.as_deref(), Some("vpn.example.com"));
+        }
+        // Already-connected phases absorb the observation unchanged.
+        for phase in [Phase::Connected, Phase::Disconnecting] {
+            let mut inner = inner_at(phase.clone());
+            inner.state.gateway = Some("gw-keep".to_string());
+            apply_lock(&mut inner, Some(obs()));
+            assert_eq!(inner.state.phase, phase);
+            assert_eq!(inner.state.gateway.as_deref(), Some("gw-keep"));
+            // No adoption: the worker bookkeeping was not rewritten.
+            assert_eq!(inner.worker_pid, None);
+        }
+
+        // -- observation None (no lock file / dead PID) ---------------------
+        //
+        // Connected phases are torn down: the worker exited and cleaned up.
+        for phase in [Phase::Connected, Phase::Disconnecting] {
+            let mut inner = inner_at(phase);
+            inner.state.pid = Some(4242);
+            inner.state.connected_since_epoch_secs = Some(1_700_000_000);
+            inner.state.gateway = Some("gw-old".to_string());
+            inner.worker_pid = Some(4242);
+            apply_lock(&mut inner, None);
+            assert_eq!(inner.state.phase, Phase::Disconnected);
+            assert_eq!(inner.state.connected_since_epoch_secs, None);
+            assert_eq!(inner.state.pid, None);
+            assert_eq!(inner.state.gateway, None);
+            assert_eq!(inner.worker_pid, None);
+        }
+        // Idle and in-flight phases absorb a missing lock: Connecting keeps
+        // waiting for its worker (the poller decides exit-vs-authenticating
+        // separately, not here).
+        for phase in [Phase::Disconnected, Phase::Connecting, Phase::Error] {
+            let mut inner = inner_at(phase.clone());
+            apply_lock(&mut inner, None);
+            assert_eq!(inner.state.phase, phase);
+        }
+    }
+
+    #[test]
+    fn connect_gate_only_allows_idle_phases() {
+        // Idle phases start a connect and reset the attempt bookkeeping.
+        for phase in [Phase::Disconnected, Phase::Error] {
+            let mut inner = Inner::default();
+            inner.state.phase = phase;
+            inner.state.gateway = Some("gw-stale".to_string());
+            inner.state.last_error = Some("old failure".to_string());
+            inner.worker_started = true;
+            enter_connecting(&mut inner, "vpn.example.com").unwrap();
+            assert_eq!(inner.state.phase, Phase::Connecting);
+            assert_eq!(inner.state.portal.as_deref(), Some("vpn.example.com"));
+            assert_eq!(inner.state.gateway, None);
+            assert_eq!(inner.state.last_error, None);
+            assert_eq!(inner.state.connected_since_epoch_secs, None);
+            assert!(!inner.worker_started);
+        }
+        // In-flight phases refuse and change nothing.
+        for phase in [Phase::Connecting, Phase::Connected, Phase::Disconnecting] {
+            let mut inner = Inner::default();
+            inner.state.phase = phase.clone();
+            inner.state.portal = Some("in-flight.example".to_string());
+            assert_eq!(
+                enter_connecting(&mut inner, "other.example"),
+                Err(phase.clone())
+            );
+            assert_eq!(inner.state.phase, phase);
+            assert_eq!(inner.state.portal.as_deref(), Some("in-flight.example"));
+        }
+    }
+
+    #[test]
+    fn disconnect_gate_allows_connected_and_idempotent_disconnecting() {
+        let mut inner = Inner::default();
+        inner.state.phase = Phase::Connected;
+        enter_disconnecting(&mut inner).unwrap();
+        assert_eq!(inner.state.phase, Phase::Disconnecting);
+        // A second disconnect while already tearing down is idempotent.
+        enter_disconnecting(&mut inner).unwrap();
+        assert_eq!(inner.state.phase, Phase::Disconnecting);
+
+        for phase in [Phase::Disconnected, Phase::Connecting, Phase::Error] {
+            let mut inner = Inner::default();
+            inner.state.phase = phase.clone();
+            assert_eq!(enter_disconnecting(&mut inner), Err(phase));
+        }
+    }
+
+    #[test]
+    fn poller_exit_gate_requires_a_confirmed_start() {
+        // The C2 scenario: Connecting but `run_admin("start")` not back yet.
+        // The poller must NOT blame the stale launchd job for the exit.
+        let mut inner = Inner::default();
+        inner.state.phase = Phase::Connecting;
+        apply_lock(&mut inner, None);
+        assert_eq!(inner.state.phase, Phase::Connecting);
+
+        let controller = VpnController::new();
+        {
+            let mut i = controller.inner.lock().unwrap();
+            i.state.phase = Phase::Connecting;
+            i.worker_started = false;
+        }
+        assert!(!controller.connecting_worker_started());
+
+        // Once the start is confirmed, the gate opens...
+        controller.mark_worker_started();
+        assert!(controller.connecting_worker_started());
+
+        // ...and if the phase already moved on (stale lock graduated it to
+        // Connected, or a cancel failed the attempt), marking is harmless:
+        // the flag alone never re-opens the gate.
+        {
+            let mut i = controller.inner.lock().unwrap();
+            i.state.phase = Phase::Error;
+        }
+        controller.mark_worker_started();
+        assert!(!controller.connecting_worker_started());
+
+        // Teardown and failure clear it for the next attempt too.
+        {
+            let mut i = controller.inner.lock().unwrap();
+            i.state.phase = Phase::Connected;
+            i.worker_started = true;
+        }
+        apply_lock(&mut controller.inner.lock().unwrap(), None);
+        assert!(!controller.connecting_worker_started());
     }
 
     #[test]

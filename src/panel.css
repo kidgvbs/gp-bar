@@ -165,6 +165,15 @@ body.liquid-glass {
   color: #ff3b30;
 }
 
+/* Inline error line for failed commands (see #cmd-error in index.html). */
+.cmd-error {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 0 2px;
+  color: #ff3b30;
+  word-break: break-word;
+}
+
 /* Controls */
 
 .controls {
@@ -285,7 +294,7 @@ select:disabled,
   color: #ff9500;
 }
 
-/* "Confermi?" state of the remove button. The confirmation is inline
+/* "Confirm?" state of the remove button. The confirmation is inline
    because a native confirm() steals focus and dismisses the popover. */
 .icon-btn.confirm {
   color: #ff453a;
