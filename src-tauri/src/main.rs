@@ -99,15 +99,10 @@ struct VersionInfo {
 #[tauri::command]
 fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
     let portal = portal.trim().to_string();
-    if portal.is_empty() {
-        return Err("Portal is empty".to_string());
-    }
-    if !portal
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-    {
+    if !valid_name(&portal) {
         return Err(
-            "Portal may only contain letters, digits, dots, dashes and underscores".to_string(),
+            "Portal may only contain letters, digits, dots, dashes and underscores (and must not start with a dash)"
+                .to_string(),
         );
     }
     let selected = {
@@ -210,12 +205,22 @@ fn quit(app: AppHandle) {
 
 // -- gateway selection -----------------------------------------------------------
 
+/// Shared charset for every name that reaches the privileged wrapper
+/// (portals and gateways): ASCII letters, digits, dots, dashes and
+/// underscores. A LEADING DASH is rejected on purpose: gpclient's option
+/// parser would read it as an option (argument injection, S4), and `-`
+/// collides with the wrapper's "auto-gateway" sentinel argument.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+}
+
 /// Same charset the wrapper enforces (the name lands in the job plist).
 fn valid_gateway_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    valid_name(name)
 }
 
 fn broadcast_config(app: &AppHandle, cfg: &Config) {
@@ -385,9 +390,6 @@ async fn do_connect(
         }
         Phase::Disconnected | Phase::Error => {}
     }
-
-    std::fs::create_dir_all(Config::log_dir())
-        .map_err(|error| format!("cannot create the log directory: {error}"))?;
 
     // Gateway resolution: an explicit pick from the panel wins, then the
     // preferred gateway, then gpclient's own auto-gateway order. The
@@ -997,4 +999,35 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running gp-bar");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_name;
+
+    #[test]
+    fn accepts_plain_hostnames() {
+        for name in ["vpn.example.com", "vpn-1", "gw_2", "a", "10.0.0.1.x"] {
+            assert!(valid_name(name), "{name:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_leading_dash_option_injection_and_bad_charset() {
+        // S4: a leading '-' would be read as an option by gpclient's
+        // parser, and '-' collides with the wrapper's auto-gateway
+        // sentinel.
+        for name in [
+            "",
+            "-",
+            "--ignore-tls-errors",
+            "-auto",
+            "space name",
+            "vpn/example",
+            "https://vpn.example.com",
+            "café",
+        ] {
+            assert!(!valid_name(name), "{name:?} should be rejected");
+        }
+    }
 }
