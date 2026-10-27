@@ -160,40 +160,7 @@ impl VpnController {
 
     /// Apply filesystem evidence (lock file present/absent, PID alive/dead).
     pub fn observe_lock(&self, app: &AppHandle, lock: Option<LockObservation>) {
-        self.update(app, |inner| match (lock, &inner.state.phase) {
-            (Some(obs), Phase::Disconnected | Phase::Error) => {
-                // A gpclient worker is running although we did not start it this
-                // session (e.g. started from a terminal, or the app restarted).
-                inner.state.phase = Phase::Connected;
-                inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-                inner.state.pid = Some(obs.pid);
-                if inner.worker_pid.is_none() {
-                    inner.worker_pid = Some(obs.pid);
-                }
-            }
-            (Some(obs), Phase::Connecting) => {
-                inner.state.phase = Phase::Connected;
-                inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-                inner.state.pid = Some(obs.pid);
-            }
-            (Some(_), Phase::Connected | Phase::Disconnecting) => {}
-            (None, Phase::Connected) => {
-                // The lock disappeared: gpclient exited and cleaned up.
-                inner.state.phase = Phase::Disconnected;
-                inner.state.connected_since_epoch_secs = None;
-                inner.state.pid = None;
-                inner.state.gateway = None;
-                inner.worker_pid = None;
-            }
-            (None, Phase::Disconnecting) => {
-                inner.state.phase = Phase::Disconnected;
-                inner.state.connected_since_epoch_secs = None;
-                inner.state.pid = None;
-                inner.state.gateway = None;
-                inner.worker_pid = None;
-            }
-            (None, _) => {}
-        });
+        self.update(app, |inner| apply_lock(inner, lock));
     }
 
     /// A parsed gateway name from the JSON log stream.
@@ -226,6 +193,39 @@ impl VpnController {
 fn apply_selected_portal(inner: &mut Inner, portal: Option<String>) {
     if matches!(inner.state.phase, Phase::Disconnected | Phase::Error) {
         inner.state.portal = portal;
+    }
+}
+
+/// Pure half of `VpnController::observe_lock`: the phase × observation
+/// transition table, unit-testable without an AppHandle. Documented by
+/// `tests::apply_lock_transitions`.
+fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
+    match (lock, &inner.state.phase) {
+        (Some(obs), Phase::Disconnected | Phase::Error) => {
+            // A gpclient worker is running although we did not start it this
+            // session (e.g. started from a terminal, or the app restarted).
+            inner.state.phase = Phase::Connected;
+            inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
+            inner.state.pid = Some(obs.pid);
+            if inner.worker_pid.is_none() {
+                inner.worker_pid = Some(obs.pid);
+            }
+        }
+        (Some(obs), Phase::Connecting) => {
+            inner.state.phase = Phase::Connected;
+            inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
+            inner.state.pid = Some(obs.pid);
+        }
+        (Some(_), Phase::Connected | Phase::Disconnecting) => {}
+        (None, Phase::Connected | Phase::Disconnecting) => {
+            // The lock disappeared: gpclient exited and cleaned up.
+            inner.state.phase = Phase::Disconnected;
+            inner.state.connected_since_epoch_secs = None;
+            inner.state.pid = None;
+            inner.state.gateway = None;
+            inner.worker_pid = None;
+        }
+        (None, _) => {}
     }
 }
 
@@ -825,6 +825,75 @@ mod tests {
         disconnecting.state.portal = Some("keep.example".to_string());
         apply_selected_portal(&mut disconnecting, None);
         assert_eq!(disconnecting.state.portal.as_deref(), Some("keep.example"));
+    }
+
+    #[test]
+    fn apply_lock_transitions() {
+        let obs = || LockObservation {
+            pid: 4242,
+            connected_since_epoch_secs: 1_700_000_000,
+        };
+        let inner_at = |phase: Phase| {
+            let mut inner = Inner::default();
+            inner.state.phase = phase;
+            inner
+        };
+
+        // -- observation Some (lock file present, PID alive) ----------------
+        //
+        // Idle phases are adopted: an outside worker is connected.
+        for phase in [Phase::Disconnected, Phase::Error] {
+            let mut inner = inner_at(phase);
+            apply_lock(&mut inner, Some(obs()));
+            assert_eq!(inner.state.phase, Phase::Connected);
+            assert_eq!(inner.state.pid, Some(4242));
+            assert_eq!(inner.state.connected_since_epoch_secs, Some(1_700_000_000));
+            assert_eq!(inner.worker_pid, Some(4242));
+        }
+        // Our own attempt completed: Connecting graduates to Connected.
+        {
+            let mut inner = inner_at(Phase::Connecting);
+            inner.state.portal = Some("vpn.example.com".to_string());
+            apply_lock(&mut inner, Some(obs()));
+            assert_eq!(inner.state.phase, Phase::Connected);
+            // The in-flight target survives the transition.
+            assert_eq!(inner.state.portal.as_deref(), Some("vpn.example.com"));
+        }
+        // Already-connected phases absorb the observation unchanged.
+        for phase in [Phase::Connected, Phase::Disconnecting] {
+            let mut inner = inner_at(phase.clone());
+            inner.state.gateway = Some("gw-keep".to_string());
+            apply_lock(&mut inner, Some(obs()));
+            assert_eq!(inner.state.phase, phase);
+            assert_eq!(inner.state.gateway.as_deref(), Some("gw-keep"));
+            // No adoption: the worker bookkeeping was not rewritten.
+            assert_eq!(inner.worker_pid, None);
+        }
+
+        // -- observation None (no lock file / dead PID) ---------------------
+        //
+        // Connected phases are torn down: the worker exited and cleaned up.
+        for phase in [Phase::Connected, Phase::Disconnecting] {
+            let mut inner = inner_at(phase);
+            inner.state.pid = Some(4242);
+            inner.state.connected_since_epoch_secs = Some(1_700_000_000);
+            inner.state.gateway = Some("gw-old".to_string());
+            inner.worker_pid = Some(4242);
+            apply_lock(&mut inner, None);
+            assert_eq!(inner.state.phase, Phase::Disconnected);
+            assert_eq!(inner.state.connected_since_epoch_secs, None);
+            assert_eq!(inner.state.pid, None);
+            assert_eq!(inner.state.gateway, None);
+            assert_eq!(inner.worker_pid, None);
+        }
+        // Idle and in-flight phases absorb a missing lock: Connecting keeps
+        // waiting for its worker (the poller decides exit-vs-authenticating
+        // separately, not here).
+        for phase in [Phase::Disconnected, Phase::Connecting, Phase::Error] {
+            let mut inner = inner_at(phase.clone());
+            apply_lock(&mut inner, None);
+            assert_eq!(inner.state.phase, phase);
+        }
     }
 
     #[test]
