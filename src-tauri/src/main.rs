@@ -5,14 +5,11 @@
 //! none of the proprietary GUI licensing machinery: connections last as long
 //! as the portal allows, with no client-side time limit.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod config;
 mod glass;
 mod icons;
 mod vpn;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,10 +47,7 @@ pub(crate) struct AppContext {
     /// When the panel was last hidden, to tell "the click that dismissed it"
     /// apart from a fresh open request (see `toggle_panel`).
     panel_hidden_at: Mutex<Option<Instant>>,
-    /// While an admin password dialog is up it steals the panel's focus; keep
-    /// the panel on screen so the user can watch the Connecting/Disconnecting
-    /// state (see `pin_panel`).
-    panel_pinned: AtomicBool,
+
     /// Which panel backdrop (native liquid glass vs CSS vibrancy) was
     /// resolved at startup; reported to the frontend via `get_panel_effect`.
     panel_effect: PanelEffect,
@@ -202,15 +196,13 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Stri
     let controller = state.controller.clone();
     // Interrupt a connecting worker by unloading the one-shot launchd job:
     // launchd terminates it, which runs the worker's own teardown instead of
-    // a blind kill. No admin dialog anymore: the NOPASSWD helper never asks.
-    pin_panel(&app, true);
+    // a blind kill.
     if let Err(error) = vpn::run_admin("cancel", &[]).await {
         log::warn!(
             "cancel failed: {}",
             vpn::admin_error_hint(&vpn::setup_script_path(&app), &error)
         );
     }
-    pin_panel(&app, false);
     controller.connect_failed(&app, "Connection canceled".to_string());
     Ok(())
 }
@@ -461,10 +453,10 @@ async fn do_connect(
     controller.try_begin_connect(&app, portal)?;
     let _ = app.emit("vpn-log-cleared", ());
 
-    // Keep the panel open while the operation runs.
-    pin_panel(&app, true);
+    // No focus bookkeeping around the admin call: the helper is NOPASSWD so
+    // no dialog steals the panel's focus mid-operation; popover hide-on-blur
+    // (see `on_window_event`) behaves normally during connects.
     let result = vpn::run_admin("start", &args).await;
-    pin_panel(&app, false);
     match result {
         Ok(_) => {
             // The start is confirmed: the launchd job now exists and belongs to
@@ -487,9 +479,9 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     // connect that lands between a `snapshot()` check and the transition must
     // not be torn down by a second disconnect.
     controller.try_begin_disconnect(&app)?;
-    pin_panel(&app, true);
+    // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
+    // helper never raises a dialog, so hide-on-blur stays in effect.
     let result = vpn::run_admin("stop", &[]).await;
-    pin_panel(&app, false);
     if let Err(error) = result {
         log::warn!("disconnect failed: {error}");
         let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
@@ -717,21 +709,6 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     );
 }
 
-fn pin_panel(app: &AppHandle, pinned: bool) {
-    app.state::<AppContext>()
-        .panel_pinned
-        .store(pinned, Ordering::Relaxed);
-    // Hand focus back to the still-visible panel when the dialog is gone, so
-    // the next click elsewhere dismisses it again as usual.
-    if !pinned {
-        if let Some(window) = app.get_webview_window("main") {
-            if window.is_visible().unwrap_or(false) {
-                let _ = window.set_focus();
-            }
-        }
-    }
-}
-
 fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
     // State events are emitted from the status poller's worker task, but
     // tauri's TrayIcon hops to the main thread itself (run_item_main_thread).
@@ -864,19 +841,16 @@ fn main() {
             controller: controller.clone(),
             config: Mutex::new(config),
             panel_hidden_at: Mutex::new(None),
-            panel_pinned: AtomicBool::new(false),
             panel_effect,
         })
         .on_window_event(|window, event| {
-            // Popover behaviour: dismiss the panel when it loses focus — except
-            // while `panel_pinned` is set, i.e. an admin password dialog is up and
-            // the user is mid connect/disconnect watching the state updates.
+            // Popover behaviour: dismiss the panel when it loses focus. The
+            // admin helper is NOPASSWD (no dialog can steal the focus), so
+            // no exception is needed while connecting/disconnecting.
             if let WindowEvent::Focused(false) = event {
                 let state = window.state::<AppContext>();
-                if !state.panel_pinned.load(Ordering::Relaxed) {
-                    let _ = window.hide();
-                    *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
-                }
+                let _ = window.hide();
+                *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
             }
         })
         .setup(move |app| {
