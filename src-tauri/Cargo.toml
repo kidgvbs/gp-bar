@@ -25,13 +25,6 @@ libc = "0.2"
 # plugin's own `log` dep.
 log = "0.4"
 tauri-plugin-log = "2"
-# Tray handles are created directly (not through tauri::tray), pinned to the
-# exact 0.25.0 verified working on this machine. The early theories about
-# menu-attach timing on macOS 27 beta were red herrings: the tray always
-# worked, the app was frozen by a poller deadlock (see vpn::update). Keep the
-# pin until 0.25.1 is explicitly re-verified; tauri's own requirement is
-# "0.25", so cargo unifies both onto 0.25.0 and muda stays at 0.20.
-tray-icon = { version = "=0.25.0", default-features = false, features = ["serde", "libappindicator"] }
 # Native liquid-glass panel backdrop (macOS 26+), behind the webview.
 window-vibrancy = "0.8.1"
 

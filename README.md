@@ -156,11 +156,9 @@ a GP Connect update (the source of the `gpclient` binary) — re-run the
 setup script to refresh the installed wrapper and the root-owned binary
 copies (it is idempotent, and it also performs the end-to-end selftest).
 
-`tray-icon` is pinned to `=0.25.0` as the configuration verified on this
-machine. (The early "menu attach" theories about the macOS 27 beta turned out
-to be red herrings — the app was frozen by a poller deadlock, since fixed in
-`vpn.rs`; see `RECAP.md` §8.12. The pin stays only until 0.25.1 is explicitly
-re-verified.)
+The tray icon is built through `tauri::tray`, so `tray-icon` comes in only as
+a transitive dependency of tauri itself (no direct pin; GP Bar never attaches
+a tray menu).
 
 ## Configuration
 
