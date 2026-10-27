@@ -5,24 +5,21 @@
 //! none of the proprietary GUI licensing machinery: connections last as long
 //! as the portal allows, with no client-side time limit.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod config;
 mod glass;
 mod icons;
 mod vpn;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::{
+    AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent, Wry,
     menu::{ContextMenu, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent, Wry,
 };
 
-use config::{valid_name, Config};
+use config::{Config, valid_name};
 use glass::PanelEffect;
 use vpn::{Phase, VpnController, VpnState};
 
@@ -30,12 +27,21 @@ const TRAY_ID: &str = "gp-bar";
 
 /// Handles for the right-click tray menu. The menu is NEVER attached to the
 /// tray (see the tray comment in `main`): on this macOS beta a natively
-/// attached status-item menu makes the system swallow left clicks before the
-/// app ever sees them, which used to kill the panel. It is popped up BY HAND
-/// on right-click instead — muda's position-less context-menu path anchors at
-/// `NSEvent::mouseLocation` (the icon the user just right-clicked) in screen
-/// coordinates, so the hidden panel window's geometry never enters into it.
+/// attached status-item menu makes the system swallow left clicks before
+/// the app ever sees them, killing the panel toggle. It is popped up BY
+/// HAND on right-click instead — muda's position-less context-menu path
+/// anchors at `NSEvent::mouseLocation` (the icon the user just
+/// right-clicked) in screen coordinates, so the hidden panel window's
+/// geometry never enters into it.
 static TRAY_MENU: OnceLock<TrayMenuHandles> = OnceLock::new();
+
+// Per-phase tray icons, rendered once and shared (the supersampled padlock
+// render is pure and cheap, but it runs on every state event otherwise).
+// tauri's image type owns its RGBA buffer, so clones hand out copies.
+static CONNECTED_ICON: LazyLock<tauri::image::Image<'static>> =
+    LazyLock::new(|| icons::padlock_icon(true));
+static OPEN_ICON: LazyLock<tauri::image::Image<'static>> =
+    LazyLock::new(|| icons::padlock_icon(false));
 
 struct TrayMenuHandles {
     menu: Menu<Wry>,
@@ -50,10 +56,7 @@ pub(crate) struct AppContext {
     /// When the panel was last hidden, to tell "the click that dismissed it"
     /// apart from a fresh open request (see `toggle_panel`).
     panel_hidden_at: Mutex<Option<Instant>>,
-    /// While an admin password dialog is up it steals the panel's focus; keep
-    /// the panel on screen so the user can watch the Connecting/Disconnecting
-    /// state (see `pin_panel`).
-    panel_pinned: AtomicBool,
+
     /// Which panel backdrop (native liquid glass vs CSS vibrancy) was
     /// resolved at startup; reported to the frontend via `get_panel_effect`.
     panel_effect: PanelEffect,
@@ -202,15 +205,13 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Stri
     let controller = state.controller.clone();
     // Interrupt a connecting worker by unloading the one-shot launchd job:
     // launchd terminates it, which runs the worker's own teardown instead of
-    // a blind kill. No admin dialog anymore: the NOPASSWD helper never asks.
-    pin_panel(&app, true);
+    // a blind kill.
     if let Err(error) = vpn::run_admin("cancel", &[]).await {
-        eprintln!(
-            "gp-bar: cancel failed: {}",
+        log::warn!(
+            "cancel failed: {}",
             vpn::admin_error_hint(&vpn::setup_script_path(&app), &error)
         );
     }
-    pin_panel(&app, false);
     controller.connect_failed(&app, "Connection canceled".to_string());
     Ok(())
 }
@@ -344,10 +345,10 @@ fn remove_gateway(
 /// Manual gateway add. On this deployment the portal is password-auth (its
 /// getconfig wants the real password, which GP Bar never handles by design),
 /// so the full list cannot be fetched pre-connect: the user reads it once
-/// from gpclient's interactive prompt and enters the names here. (The
-/// cookie-replication attempt of commit 8475510 was removed again in 587d3ea:
-/// the repeated auth-failed requests plausibly contributed to portal-side
-/// session invalidations during connects.)
+/// from gpclient's interactive prompt and enters the names here. Repeated
+/// unauthenticated getconfig attempts risk portal-side session
+/// invalidations during connects — no gateway-list fetching, ever.
+/// Gateways are harvested from connect logs and added manually.
 #[tauri::command]
 fn add_gateway(app: AppHandle, state: State<'_, AppContext>, name: String) -> Result<(), String> {
     let name = name.trim().to_string();
@@ -461,10 +462,10 @@ async fn do_connect(
     controller.try_begin_connect(&app, portal)?;
     let _ = app.emit("vpn-log-cleared", ());
 
-    // Keep the panel open while the operation runs.
-    pin_panel(&app, true);
+    // No focus bookkeeping around the admin call: the helper is NOPASSWD so
+    // no dialog steals the panel's focus mid-operation; popover hide-on-blur
+    // (see `on_window_event`) behaves normally during connects.
     let result = vpn::run_admin("start", &args).await;
-    pin_panel(&app, false);
     match result {
         Ok(_) => {
             // The start is confirmed: the launchd job now exists and belongs to
@@ -487,11 +488,11 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     // connect that lands between a `snapshot()` check and the transition must
     // not be torn down by a second disconnect.
     controller.try_begin_disconnect(&app)?;
-    pin_panel(&app, true);
+    // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
+    // helper never raises a dialog, so hide-on-blur stays in effect.
     let result = vpn::run_admin("stop", &[]).await;
-    pin_panel(&app, false);
     if let Err(error) = result {
-        eprintln!("gp-bar: disconnect failed: {error}");
+        log::warn!("disconnect failed: {error}");
         let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
         // Fail loud, never SIGKILL: the worker may ignore the signal and a
         // killed worker skips the vpnc-script teardown, leaving macOS DNS
@@ -503,35 +504,15 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
 }
 
 // -- panel window ---------------------------------------------------------------
-
-/// Positioning diagnostics: stderr (terminal launches only) AND an append
-/// log at ~/Library/Logs/gp-bar/panel.log (always). GUI launches show
-/// nothing on stderr, and the wrong-position reports only reproduce in
-/// real usage — the file is how the numbers get captured without asking
-/// anyone to run from a terminal.
-fn panel_log(msg: &str) {
-    eprintln!("gp-bar: {msg}");
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join("Library/Logs/gp-bar/panel.log");
-        // create_dir_all: OpenOptions never creates the parent, and a missing
-        // Logs/gp-bar would silently drop every line — the one failure mode
-        // this instrumentation must not have.
-        let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            use std::io::Write;
-            let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
-            let _ = writeln!(file, "{stamp} {msg}");
-        }
-    }
-}
+//
+// The toggle/positioning log lines below are the incident-forensics
+// channel (debug level → the panel.log file target; see `log_targets`):
+// wrong-position reports only reproduce in real GUI usage, so every
+// anchor/monitor/set_position decision leaves its numbers behind.
 
 fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     let Some(window) = app.get_webview_window("main") else {
-        panel_log("toggle: no 'main' window found");
+        log::warn!("toggle: no 'main' window found");
         return;
     };
     let state = app.state::<AppContext>();
@@ -540,7 +521,7 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
         *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
-        panel_log("toggle: dismissed (panel was visible)");
+        log::info!("toggle: dismissed (panel was visible)");
         return;
     }
 
@@ -552,10 +533,12 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         .panel_hidden_at
         .lock()
         .unwrap()
+        // take(): one lock instead of the is_some-then-clear double acquire —
+        // the check and the reset must be one atomic step anyway.
+        .take()
         .is_some_and(|hidden| hidden.elapsed() < Duration::from_millis(250));
-    *state.panel_hidden_at.lock().unwrap() = None;
     if just_hidden {
-        panel_log("toggle: ignored (same physical click that hid the panel)");
+        log::info!("toggle: ignored (same physical click that hid the panel)");
         return;
     }
 
@@ -592,9 +575,7 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         Some(payload) => (Some(payload), None),
         None => {
             let cursor = window.cursor_position().ok();
-            panel_log(&format!(
-                "toggle: no tray payload; cursor_position={cursor:?}"
-            ));
+            log::debug!("toggle: no tray payload; cursor_position={cursor:?}");
             let primary_scale = app
                 .primary_monitor()
                 .ok()
@@ -647,10 +628,13 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         })
         .collect();
     for mon in &mons {
-        panel_log(&format!(
+        log::debug!(
             "positioning: monitor {} scale={:.1} bounds={:?} work={:?}",
-            mon.name, mon.scale, mon.bounds, mon.work
-        ));
+            mon.name,
+            mon.scale,
+            mon.bounds,
+            mon.work
+        );
     }
 
     // Hit-test the anchor. A payload point is scaled by the tray screen's
@@ -690,21 +674,22 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
             } else {
                 ly.max(wy).min(wy + wh - panel_h)
             };
-            panel_log(&format!(
+            log::debug!(
                 "positioning: anchor logical=({lx:.1},{ly:.1}) monitor={} scale={:.1} \
                  work=({wx:.1},{wy:.1},{ww:.1},{wh:.1}) panel={panel_w:.1}x{panel_h:.1} \
                  -> set_position logical=({x:.1},{y:.1})",
-                mon.name, mon.scale
-            ));
+                mon.name,
+                mon.scale
+            );
             if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
-                panel_log(&format!("set_position failed: {error}"));
+                log::warn!("set_position failed: {error}");
             }
         }
         (None, Ok(size)) => {
             // Never seen on a real desk; degrade to the primary screen's
             // top-right corner instead of leaving the panel at its
             // creation-default mid-screen position.
-            panel_log("positioning: NO monitor matched the anchor — primary top-right fallback");
+            log::warn!("positioning: NO monitor matched the anchor — primary top-right fallback");
             if let Some(primary) = app.primary_monitor().ok().flatten() {
                 let scale = primary.scale_factor();
                 let work = primary.work_area();
@@ -714,11 +699,11 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
                 let panel_w = size.width as f64 / w_scale;
                 let (x, y) = (wx + work.size.width as f64 / scale - panel_w, wy);
                 if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
-                    panel_log(&format!("set_position failed: {error}"));
+                    log::warn!("set_position failed: {error}");
                 }
             }
         }
-        (_, Err(error)) => panel_log(&format!("positioning: outer_size error: {error}")),
+        (_, Err(error)) => log::warn!("positioning: outer_size error: {error}"),
     }
 
     let _ = window.show();
@@ -729,25 +714,10 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         .outer_position()
         .map(|p| (p.x, p.y))
         .map_err(|e| e.to_string());
-    panel_log(&format!(
+    log::debug!(
         "shown: visible={} actual outer physical={actual:?}",
         window.is_visible().unwrap_or(false)
-    ));
-}
-
-fn pin_panel(app: &AppHandle, pinned: bool) {
-    app.state::<AppContext>()
-        .panel_pinned
-        .store(pinned, Ordering::Relaxed);
-    // Hand focus back to the still-visible panel when the dialog is gone, so
-    // the next click elsewhere dismisses it again as usual.
-    if !pinned {
-        if let Some(window) = app.get_webview_window("main") {
-            if window.is_visible().unwrap_or(false) {
-                let _ = window.set_focus();
-            }
-        }
-    }
+    );
 }
 
 fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
@@ -762,7 +732,11 @@ fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
             Phase::Error => "GP Bar — Error",
             Phase::Disconnected => "GP Bar — Disconnected",
         };
-        let image = icons::padlock_icon(connected);
+        let image = if connected {
+            CONNECTED_ICON.clone()
+        } else {
+            OPEN_ICON.clone()
+        };
         let _ = tray.set_icon_with_as_template(Some(image), true);
         let _ = tray.set_tooltip(Some(tooltip));
     }
@@ -811,18 +785,51 @@ fn show_tray_menu(app: &AppHandle) {
         return;
     };
     let Some(panel) = app.get_webview_window("main") else {
-        panel_log("tray menu: main window not found — menu not shown");
+        log::warn!("tray menu: main window not found — menu not shown");
         return;
     };
     // ContextMenu::popup takes the hosting Window: unwrap the webview window
     // down to it (AsRef<Webview> → Webview::window()).
     match handles.menu.popup(panel.as_ref().window()) {
-        Ok(()) => panel_log("tray menu: popup at mouse location"),
-        Err(error) => panel_log(&format!("tray menu: popup failed: {error}")),
+        Ok(()) => log::info!("tray menu: popup at mouse location"),
+        Err(error) => log::warn!("tray menu: popup failed: {error}"),
     }
 }
 
 // -- entry ------------------------------------------------------------------------
+
+// -- logging ---------------------------------------------------------------------
+//
+// tauri-plugin-log owns the global `log` logger with two targets:
+//
+//   * stderr — terminal launches; kept at info and above so the console
+//     view stays an operational one-liner stream, not the forensic dump;
+//   * ~/Library/Logs/gp-bar/panel.log — the file that closed two real
+//     incidents without a terminal (see RECAP.md §13): it keeps the
+//     debug-level positioning/tray/toggle lines, rotated at 512 KiB
+//     with 2 archives kept (~1.5 MiB worst case on disk).
+//
+// `level_for("gp_bar", Debug)` raises ONLY this crate's modules to debug
+// while dependencies stay at the default info level; the message texts are
+// a stable grep contract (analysis scripts and RECAP quotes match on
+// them) — keep them byte-identical when touching log call sites.
+fn log_targets() -> Vec<tauri_plugin_log::Target> {
+    let mut targets = vec![
+        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr)
+            .filter(|metadata| metadata.level() <= log::Level::Info),
+    ];
+    // Without a home dir (vanishingly rare) the file target is skipped;
+    // stderr still carries everything at info and above.
+    if let Some(home) = dirs::home_dir() {
+        targets.push(tauri_plugin_log::Target::new(
+            tauri_plugin_log::TargetKind::Folder {
+                path: home.join("Library/Logs/gp-bar"),
+                file_name: Some("panel".to_string()),
+            },
+        ));
+    }
+    targets
+}
 
 fn main() {
     let controller = VpnController::new();
@@ -835,28 +842,36 @@ fn main() {
     let panel_effect = glass::resolve_effect(config.liquid_glass);
 
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets(log_targets())
+                .level(log::LevelFilter::Info)
+                .level_for("gp_bar", log::LevelFilter::Debug)
+                .max_file_size(512 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(2))
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .manage(AppContext {
             controller: controller.clone(),
             config: Mutex::new(config),
             panel_hidden_at: Mutex::new(None),
-            panel_pinned: AtomicBool::new(false),
             panel_effect,
         })
         .on_window_event(|window, event| {
-            // Popover behaviour: dismiss the panel when it loses focus — except
-            // while `panel_pinned` is set, i.e. an admin password dialog is up and
-            // the user is mid connect/disconnect watching the state updates.
+            // Popover behaviour: dismiss the panel when it loses focus. The
+            // admin helper is NOPASSWD (no dialog can steal the focus), so
+            // no exception is needed while connecting/disconnecting.
             if let WindowEvent::Focused(false) = event {
                 let state = window.state::<AppContext>();
-                if !state.panel_pinned.load(Ordering::Relaxed) {
-                    let _ = window.hide();
-                    *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
-                }
+                let _ = window.hide();
+                *state.panel_hidden_at.lock().unwrap() = Some(Instant::now());
             }
         })
         .setup(move |app| {
             // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // Panel backdrop: native liquid glass where the OS (26+) and the
             // config allow it, CSS vibrancy otherwise (see `glass`). Applied
@@ -867,7 +882,7 @@ fn main() {
             if effect == PanelEffect::LiquidGlass {
                 if let Some(panel) = app.get_webview_window("main") {
                     if let Err(error) = glass::apply_liquid_glass(&panel) {
-                        eprintln!("gp-bar: liquid glass failed: {error}");
+                        log::warn!("liquid glass failed: {error}");
                     }
                 }
             }
@@ -898,9 +913,8 @@ fn main() {
             // TRAY_MENU (built below) and is popped up BY HAND instead: nothing
             // for the button to open, so clicks flow to us and the panel keeps
             // taking over.
-            let image = icons::padlock_icon(false);
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
-                .icon(image)
+                .icon(OPEN_ICON.clone())
                 .icon_as_template(true)
                 .tooltip("GP Bar")
                 .on_tray_icon_event(|tray, event| {
@@ -953,12 +967,13 @@ fn main() {
                         };
                         // Tray payload diagnostics: the tray-icon crate's
                         // coordinate space is the recurring suspect (see
-                        // panel_log / toggle_panel for the rest of the chain).
-                        panel_log(&format!(
+                        // the positioning comments in toggle_panel).
+                        log::debug!(
                             "tray click: position=({px:.1},{py:.1}) rect=({rx:.1},{ry:.1} \
                              {rw:.1}x{rh:.1}) valid={rect_valid} anchor=({:.1},{:.1})",
-                            anchor.0, anchor.1
-                        ));
+                            anchor.0,
+                            anchor.1
+                        );
                         toggle_panel(tray.app_handle(), Some(anchor));
                     }
                 })
@@ -992,7 +1007,7 @@ fn main() {
                 })
                 .is_err()
             {
-                panel_log("tray menu: TRAY_MENU already set — built twice?");
+                log::warn!("tray menu: TRAY_MENU already set — built twice?");
             }
             // Match the items to the current phase before any vpn-state event
             // fires. Safe lock: setup runs on the main thread and the status
@@ -1051,7 +1066,7 @@ fn main() {
                     if let Err(error) =
                         do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
                     {
-                        panel_log(&format!("tray menu connect failed: {error}"));
+                        log::warn!("tray menu connect failed: {error}");
                     }
                 });
             }
@@ -1075,7 +1090,7 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppContext>();
                     if let Err(error) = do_disconnect(app.clone(), &state).await {
-                        panel_log(&format!("tray reconnect: disconnect failed: {error}"));
+                        log::warn!("tray reconnect: disconnect failed: {error}");
                         return;
                     }
                     // `gp-admin stop` returns once the worker is gone, but the
@@ -1090,7 +1105,7 @@ fn main() {
                             break;
                         }
                         if tokio::time::Instant::now() >= deadline {
-                            panel_log("tray reconnect: timed out waiting for Disconnecting");
+                            log::warn!("tray reconnect: timed out waiting for Disconnecting");
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1098,7 +1113,7 @@ fn main() {
                     if let Err(error) =
                         do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
                     {
-                        panel_log(&format!("tray reconnect: connect failed: {error}"));
+                        log::warn!("tray reconnect: connect failed: {error}");
                     }
                 });
             }
@@ -1107,7 +1122,7 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppContext>();
                     if let Err(error) = do_disconnect(app.clone(), &state).await {
-                        panel_log(&format!("tray menu disconnect failed: {error}"));
+                        log::warn!("tray menu disconnect failed: {error}");
                     }
                 });
             }

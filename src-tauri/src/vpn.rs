@@ -35,11 +35,11 @@ pub const LOCK_FILE: &str = "/var/run/gpclient.lock";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TAIL_INTERVAL: Duration = Duration::from_millis(400);
 
-// No serde rename: the frontend (src/main.ts render()), the CSS
-// `[data-phase="Connected"]` selector and the tray sync listener all expect
-// the variant names verbatim ("Connected"…). A `rename_all = "snake_case"`
-// here silently broke every panel state render (the switch fell through to
-// the Disconnected default).
+// No serde rename: the variant names ARE the wire format. The frontend
+// (src/main.ts render()), the CSS `[data-phase="Connected"]` selector and
+// the tray sync listener all match "Connected"… verbatim; a
+// `rename_all = "snake_case"` here would silently break every panel state
+// render (the switch falls through to the Disconnected default).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Phase {
     Disconnected,
@@ -76,8 +76,6 @@ impl Default for VpnState {
 #[derive(Default)]
 struct Inner {
     state: VpnState,
-    /// PID of the root gpclient worker we started, when connecting.
-    worker_pid: Option<u32>,
     /// Whether the in-flight connect attempt's `admin start` has been
     /// confirmed (the wrapper returned Ok and loaded a fresh launchd job).
     /// The status poller may blame a job without a pid on a dead worker ONLY
@@ -126,15 +124,13 @@ impl VpnController {
 
     // -- connect ---------------------------------------------------------------
 
-    /// Gate + transition for a connect attempt in ONE critical section.
-    ///
-    /// `do_connect` used to check the phase with `snapshot()` (lock taken and
-    /// released), do other work, and only then transition with
-    /// `begin_connect` (lock re-taken). On the multi-threaded tokio runtime
-    /// two invocations (double click, panel + tray menu) both passed the
-    /// gate, and the second `admin start` unloaded — killing — the first
-    /// worker mid-SSO. The check and the transition must be atomic; the
-    /// refusal error is the caller's to surface.
+    /// Gate + transition in ONE critical section. Checking the phase with a
+    /// separate `snapshot()` (lock taken and released) before transitioning
+    /// (lock re-taken) is a TOCTOU hole: on the multi-threaded tokio runtime
+    /// two invocations (double click, panel + tray menu) both pass the gate,
+    /// and the second `admin start` unloads — killing — the first worker
+    /// mid-SSO. The check and the transition must be atomic; the refusal
+    /// error is the caller's to surface.
     pub fn try_begin_connect(&self, app: &AppHandle, portal: &str) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
@@ -155,7 +151,7 @@ impl VpnController {
 
     /// Gate + transition for a disconnect attempt, atomic like
     /// `try_begin_connect`. A second disconnect while already Disconnecting
-    /// is idempotent (Ok), matching the old `do_disconnect` behavior.
+    /// is idempotent (Ok): the stop request is already in flight.
     pub fn try_begin_disconnect(&self, app: &AppHandle) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
@@ -178,7 +174,6 @@ impl VpnController {
         self.update(app, |inner| {
             inner.state.phase = Phase::Error;
             inner.state.last_error = Some(error);
-            inner.worker_pid = None;
             inner.worker_started = false;
         });
     }
@@ -299,9 +294,6 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
             inner.state.phase = Phase::Connected;
             inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
             inner.state.pid = Some(obs.pid);
-            if inner.worker_pid.is_none() {
-                inner.worker_pid = Some(obs.pid);
-            }
         }
         (Some(obs), Phase::Connecting) => {
             inner.state.phase = Phase::Connected;
@@ -315,7 +307,6 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
             inner.state.connected_since_epoch_secs = None;
             inner.state.pid = None;
             inner.state.gateway = None;
-            inner.worker_pid = None;
             inner.worker_started = false;
         }
         (None, _) => {}
@@ -339,9 +330,7 @@ pub fn read_lock_observation() -> Option<LockObservation> {
     // a crash without cleanup the PID may be ANY process's (C6). Require the
     // process to actually be gpclient, else treat the lock as stale.
     if !process_is_gpclient(pid) {
-        eprintln!(
-            "gp-bar: lock file PID {pid} is not a gpclient process — treating the lock as stale"
-        );
+        log::warn!("lock file PID {pid} is not a gpclient process — treating the lock as stale");
         return None;
     }
     let connected_since = fs::metadata(LOCK_FILE)
@@ -369,8 +358,9 @@ fn parse_lock_pid(raw: &str) -> Option<u32> {
 }
 
 /// `kill(pid, 0)` sends no signal: it only probes existence, and needs no
-/// fork/exec (the old `ps -p` spawned a subprocess every poll tick). When the
-/// probe fails with EPERM the process exists but belongs to root — our worker.
+/// fork/exec (a `ps -p` probe would spawn a subprocess every poll tick).
+/// When the probe fails with EPERM the process exists but belongs to root —
+/// our worker.
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -393,7 +383,7 @@ fn process_alive(pid: u32) -> bool {
 fn process_is_gpclient(pid: u32) -> bool {
     // SAFETY: proc_pidpath writes at most `buffersize` bytes into `buffer`
     // and only reads the integer `pid`; both come from here.
-    extern "C" {
+    unsafe extern "C" {
         fn proc_pidpath(pid: libc::pid_t, buffer: *mut u8, buffersize: u32) -> i32;
     }
     let mut buffer = [0u8; 4096];
@@ -525,7 +515,7 @@ fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<String> {
         let line = match String::from_utf8(raw) {
             Ok(line) => line,
             Err(error) => {
-                eprintln!("gp-bar: invalid UTF-8 in a connect log line: {error}");
+                log::warn!("invalid UTF-8 in a connect log line: {error}");
                 String::from_utf8_lossy(error.as_bytes()).into_owned()
             }
         };
@@ -693,7 +683,7 @@ fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
             cfg.gateway_hosts
                 .insert(address.to_string(), name.to_string());
             if let Err(error) = cfg.save() {
-                eprintln!("gp-bar: cannot save the gateway host map: {error}");
+                log::warn!("cannot save the gateway host map: {error}");
             }
             (cfg.clone(), true)
         }
@@ -724,7 +714,7 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
     // harvested straight from the log must not reach the picker if the
     // wrapper would refuse it (the picker would offer a dead entry).
     if !crate::config::valid_name(gateway) {
-        eprintln!("gp-bar: skipping harvested gateway {gateway:?}: invalid name");
+        log::warn!("skipping harvested gateway {gateway:?}: invalid name");
         return;
     }
     let (cfg, changed) = {
@@ -733,7 +723,7 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
         if changed {
             cfg.gateways.push(gateway.to_string());
             if let Err(error) = cfg.save() {
-                eprintln!("gp-bar: cannot save the harvested gateway: {error}");
+                log::warn!("cannot save the harvested gateway: {error}");
             }
         }
         (cfg.clone(), changed)
@@ -766,11 +756,11 @@ pub async fn active_service_dns() -> (Option<String>, Vec<String>) {
     let Some(interface) = scutil_primary_interface().await else {
         return (None, Vec::new());
     };
-    let order = command_stdout(&["/usr/sbin/networksetup", "-listnetworkserviceorder"]).await;
+    let order = command_stdout("/usr/sbin/networksetup", &["-listnetworkserviceorder"]).await;
     let Some(service) = parse_service_for_device(&order, &interface) else {
         return (None, Vec::new());
     };
-    let dns = command_stdout(&["/usr/sbin/networksetup", "-getdnsservers", &service]).await;
+    let dns = command_stdout("/usr/sbin/networksetup", &["-getdnsservers", &service]).await;
     (Some(service), parse_dns_servers(&dns))
 }
 
@@ -833,9 +823,9 @@ async fn scutil_primary_interface() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn command_stdout(command: &[&str]) -> String {
-    match tokio::process::Command::new(command[0])
-        .args(&command[1..])
+async fn command_stdout(program: &str, args: &[&str]) -> String {
+    match tokio::process::Command::new(program)
+        .args(args)
         .output()
         .await
     {
@@ -894,10 +884,16 @@ fn parse_service_for_device(output: &str, device: &str) -> Option<String> {
 /// arguments only — the wrapper file is the security boundary, see
 /// `scripts/gp-admin` (bundled under `Contents/Resources/scripts/`).
 /// The whole install prefix (wrapper + the gpclient binaries it executes)
-/// is root-owned under /Library/PrivilegedHelperTools — every parent of
-/// that path is system-owned, unlike the old /usr/local/lib location
-/// (which Homebrew chowns to the user on Intel Macs).
+/// is root-owned under /Library/PrivilegedHelperTools: every parent of
+/// that path is system-owned, unlike a /usr/local prefix that Homebrew
+/// chowns to the user on Intel Macs.
 pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
+
+/// The gpclient the admin wrapper actually executes (installed by the setup
+/// script under the same root-owned prefix as `ADMIN_WRAPPER`). The version
+/// reported in the About box is resolved from THIS binary when it exists, so
+/// the displayed version matches what the worker really runs.
+pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpclient";
 
 /// Run one admin operation (`selftest`, `start`, `stop`, `cancel`).
 ///
@@ -998,11 +994,13 @@ mod tests {
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
         // Missing sudoers rule and missing wrapper both mean "run the setup".
         assert!(admin_error_hint(setup, "sudo: a password is required").contains("setup-admin.sh"));
-        assert!(admin_error_hint(
-            setup,
-            "sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found"
-        )
-        .contains("setup-admin.sh"));
+        assert!(
+            admin_error_hint(
+                setup,
+                "sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found"
+            )
+            .contains("setup-admin.sh")
+        );
         // Operational failures pass through untouched.
         assert_eq!(
             admin_error_hint(setup, "gp-admin: the VPN worker did not stop"),
@@ -1095,7 +1093,6 @@ mod tests {
             assert_eq!(inner.state.phase, Phase::Connected);
             assert_eq!(inner.state.pid, Some(4242));
             assert_eq!(inner.state.connected_since_epoch_secs, Some(1_700_000_000));
-            assert_eq!(inner.worker_pid, Some(4242));
         }
         // Our own attempt completed: Connecting graduates to Connected.
         {
@@ -1113,8 +1110,8 @@ mod tests {
             apply_lock(&mut inner, Some(obs()));
             assert_eq!(inner.state.phase, phase);
             assert_eq!(inner.state.gateway.as_deref(), Some("gw-keep"));
-            // No adoption: the worker bookkeeping was not rewritten.
-            assert_eq!(inner.worker_pid, None);
+            // No adoption: the reported pid was not rewritten either.
+            assert_eq!(inner.state.pid, None);
         }
 
         // -- observation None (no lock file / dead PID) ---------------------
@@ -1125,13 +1122,11 @@ mod tests {
             inner.state.pid = Some(4242);
             inner.state.connected_since_epoch_secs = Some(1_700_000_000);
             inner.state.gateway = Some("gw-old".to_string());
-            inner.worker_pid = Some(4242);
             apply_lock(&mut inner, None);
             assert_eq!(inner.state.phase, Phase::Disconnected);
             assert_eq!(inner.state.connected_since_epoch_secs, None);
             assert_eq!(inner.state.pid, None);
             assert_eq!(inner.state.gateway, None);
-            assert_eq!(inner.worker_pid, None);
         }
         // Idle and in-flight phases absorb a missing lock: Connecting keeps
         // waiting for its worker (the poller decides exit-vs-authenticating

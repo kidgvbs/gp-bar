@@ -4,8 +4,8 @@ version = "1.0.0"
 description = "Menu bar client for the GlobalProtect VPN via the open-source gpclient CLI. No connection time limits."
 authors = ["kidgvbs"]
 license = "MIT"
-edition = "2021"
-rust-version = "1.77"
+edition = "2024"
+rust-version = "1.85"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -19,14 +19,12 @@ dirs = "5"
 # Only kill(pid, 0) for worker liveness (no fork/exec like the old `ps -p`),
 # no other libc use. tauri already links libc transitively.
 libc = "0.2"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# Tray handles are created directly (not through tauri::tray), pinned to the
-# exact 0.25.0 verified working on this machine. The early theories about
-# menu-attach timing on macOS 27 beta were red herrings: the tray always
-# worked, the app was frozen by a poller deadlock (see vpn::update). Keep the
-# pin until 0.25.1 is explicitly re-verified; tauri's own requirement is
-# "0.25", so cargo unifies both onto 0.25.0 and muda stays at 0.20.
-tray-icon = { version = "=0.25.0", default-features = false, features = ["serde", "libappindicator"] }
+# Logging: tauri-plugin-log installs itself as the global `log` logger and
+# owns the targets (stderr + the rotating ~/Library/Logs/gp-bar/panel.log),
+# so call sites use the `log` facade macros. Version-unified with the
+# plugin's own `log` dep.
+log = "0.4"
+tauri-plugin-log = "2"
 # Native liquid-glass panel backdrop (macOS 26+), behind the webview.
 window-vibrancy = "0.8.1"
 
@@ -36,12 +34,10 @@ window-vibrancy = "0.8.1"
 # with the one window-vibrancy 0.8.1 builds against (same maintainer tree).
 # objc2-foundation supplies NSProcessInfo for the runtime OS-version check.
 
-# (The pre-connect gateway-list fetch of commit 8475510 — reqwest + xmltree
-# replicating gpclient's portal getconfig with the cached cookie — was
-# removed again: the real portal is password-auth and rejected every
-# request, and the failed auth attempts plausibly contributed to portal-side
-# session invalidations. Gateways are harvested from connect logs and
-# added manually.)
+# No gateway-list fetching pre-connect: the real portal is password-auth and
+# rejects every unauthenticated getconfig request (and the failed attempts
+# risk portal-side session invalidations). Gateways are harvested from
+# connect logs and added manually.
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc2-app-kit", "WKWebView"] }

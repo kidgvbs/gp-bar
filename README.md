@@ -156,11 +156,14 @@ a GP Connect update (the source of the `gpclient` binary) — re-run the
 setup script to refresh the installed wrapper and the root-owned binary
 copies (it is idempotent, and it also performs the end-to-end selftest).
 
-`tray-icon` is pinned to `=0.25.0` as the configuration verified on this
-machine. (The early "menu attach" theories about the macOS 27 beta turned out
-to be red herrings — the app was frozen by a poller deadlock, since fixed in
-`vpn.rs`; see `RECAP.md` §8.12. The pin stays only until 0.25.1 is explicitly
-re-verified.)
+CI (`.github/workflows/ci.yml`) runs on every push/PR: `cargo fmt
+--check`, `cargo clippy -D warnings` and `cargo test` on Linux (the
+macOS-only code paths are `cfg`-gated), shellcheck on the two admin
+scripts, and `tsc --noEmit` + `vite build` on the frontend.
+
+The tray icon is built through `tauri::tray`, so `tray-icon` comes in only as
+a transitive dependency of tauri itself (no direct pin; GP Bar never attaches
+a tray menu).
 
 ## Configuration
 
@@ -182,10 +185,12 @@ re-verified.)
 * `reuse_cookie` — passes `--cookie-cache` so gpclient reuses the portal
   session cookie; fewer browser logins while the session stays valid.
 * `gpclient_path` — force a specific `gpclient` binary for the version
-  display; `null` auto-detects the Homebrew locations. (The root helper
-  executes only its own root-owned copy under
-  `/Library/PrivilegedHelperTools/gp-bar/bin`: a root-owned component must
-  not run binaries from user-configurable paths.)
+  display only (dev setups, non-standard installs); `null` resolves the
+  version from the root-owned copy the admin wrapper actually runs
+  (`/Library/PrivilegedHelperTools/gp-bar/bin/gpclient`), falling back to
+  Homebrew autodetect. The worker itself always executes that root-owned
+  copy: a root-owned component must not run binaries from
+  user-configurable paths.
 * `gateways` — entries of the gateway picker: added from the panel or
   harvested from connect logs, never fetched over the network. GP Bar makes
   no network calls of its own (a portal-side gateway fetch was removed —

@@ -14,7 +14,10 @@ pub struct Config {
     pub selected: Option<String>,
     #[serde(default = "default_true")]
     pub reuse_cookie: bool,
-    /// Absolute path to the `gpclient` executable; `None` = auto-detect.
+    /// Absolute path to a `gpclient` executable used ONLY to override which
+    /// binary `get_versions` reports (dev setups, non-standard installs).
+    /// The worker itself always runs `vpn::WORKER_GPCLIENT` via the admin
+    /// wrapper; this field never changes which binary connects.
     #[serde(default)]
     pub gpclient_path: Option<String>,
     /// Gateways seen in connect logs or added by the user. The picker lists
@@ -109,6 +112,10 @@ impl Config {
     /// A parse error means the file is corrupt (e.g. a crash mid-write): it
     /// is renamed aside so the next `save()` cannot silently overwrite the
     /// user's portals and gateways with the defaults.
+    ///
+    /// eprintln, not `log::`: `Config::load` runs in `main` before the
+    /// tauri-plugin-log logger is attached, so the `log` facade would
+    /// silently drop these lines — stderr is the only sink this early.
     fn load_from(dir: &Path) -> Config {
         let path = dir.join("config.json");
         match fs::read_to_string(&path) {
@@ -155,13 +162,19 @@ impl Config {
         fs::rename(&tmp, &path).map_err(|e| format!("cannot rename to {}: {e}", path.display()))
     }
 
-    /// Resolve the gpclient executable, preferring the configured path.
+    /// Resolve the gpclient executable: an explicit `gpclient_path` override
+    /// wins, then the binary the admin wrapper actually runs (the one that
+    /// produces the connect logs GP Bar parses), then Homebrew autodetect.
     pub fn resolve_gpclient(&self) -> Option<PathBuf> {
         if let Some(configured) = &self.gpclient_path {
             let path = Path::new(configured);
             if path.is_file() {
                 return Some(path.to_path_buf());
             }
+        }
+        let worker = Path::new(crate::vpn::WORKER_GPCLIENT);
+        if worker.is_file() {
+            return Some(worker.to_path_buf());
         }
         Self::detect_gpclient()
     }
