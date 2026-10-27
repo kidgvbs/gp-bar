@@ -43,6 +43,10 @@ jobs:
   web:
     name: Web (tsc, build)
     runs-on: ubuntu-latest
+    env:
+      # npm's update-notifier spawn kills the process ("Exit handler never
+      # called") on sandboxed runners — disable it.
+      NPM_CONFIG_UPDATE_NOTIFIER: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
