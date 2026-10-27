@@ -218,6 +218,14 @@ fn valid_gateway_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 
+/// Gateway resolution order: an explicit pick (the panel's picker, or the
+/// tray menu reading the same `selected_gateway` from the config) wins over
+/// the preferred gateway; None means gpclient's own auto-gateway order.
+/// The wrapper re-validates whatever lands in the args.
+fn resolve_connect_gateway(explicit: Option<String>, preferred: Option<String>) -> Option<String> {
+    explicit.or(preferred)
+}
+
 fn broadcast_config(app: &AppHandle, cfg: &Config) {
     // See vpn::update: emit outside the config lock.
     let _ = app.emit("config-updated", cfg);
@@ -379,13 +387,14 @@ async fn do_connect(
     std::fs::create_dir_all(Config::log_dir())
         .map_err(|error| format!("cannot create the log directory: {error}"))?;
 
-    // Gateway resolution: an explicit pick from the panel wins, then the
-    // preferred gateway, then gpclient's own auto-gateway order. The
-    // wrapper re-validates whatever lands in the args.
-    let resolved_gateway = {
-        let cfg = state.config.lock().unwrap();
-        gateway.or_else(|| cfg.preferred_gateway.clone())
-    };
+    // Gateway resolution: an explicit pick from the panel or the tray menu
+    // wins, then the preferred gateway, then gpclient's own auto-gateway
+    // order (resolve_connect_gateway). The wrapper re-validates whatever
+    // lands in the args.
+    let resolved_gateway = resolve_connect_gateway(
+        gateway,
+        state.config.lock().unwrap().preferred_gateway.clone(),
+    );
     if let Some(name) = &resolved_gateway {
         if !valid_gateway_name(name) {
             return Err("Invalid gateway name".to_string());
@@ -897,9 +906,10 @@ fn main() {
 
             // The right-click tray menu: built once here, popped up by hand in
             // the tray handler (never attached — see above). Connect mirrors the
-            // panel's action button exactly: the selected portal from config,
-            // the cookie-reuse setting, gateway None = Automatic (do_connect
-            // itself resolves preferred over --auto-gateway).
+            // panel's action button exactly: the selected portal and the
+            // cookie-reuse setting from config, plus the panel's explicit
+            // gateway pick (`selected_gateway`) — do_connect itself resolves
+            // the fallback chain (preferred, then gpclient auto-gateway).
             let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
             let disconnect_item =
                 MenuItem::with_id(app, "disconnect", "Disconnect", false, None::<&str>)?;
@@ -939,22 +949,24 @@ fn main() {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "connect" => {
                 // Same contract as the panel's Connect button: selected portal,
-                // configured cookie reuse, gateway None = Automatic.
+                // configured cookie reuse, and the panel's explicit gateway
+                // pick (`selected_gateway`) — None only means Automatic when
+                // the user never picked one.
                 let state = app.state::<AppContext>();
-                let (portal, reuse_cookie) = {
+                let (portal, reuse_cookie, gateway) = {
                     let cfg = state.config.lock().unwrap();
                     let portal = cfg
                         .selected
                         .clone()
                         .or_else(|| cfg.portals.first().cloned())
                         .unwrap_or_default();
-                    (portal, cfg.reuse_cookie)
+                    (portal, cfg.reuse_cookie, cfg.selected_gateway.clone())
                 };
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppContext>();
                     if let Err(error) =
-                        do_connect(app.clone(), &state, &portal, reuse_cookie, None).await
+                        do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
                     {
                         panel_log(&format!("tray menu connect failed: {error}"));
                     }
@@ -994,4 +1006,30 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running gp-bar");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_connect_gateway;
+
+    /// The C4 contract: the panel's explicit pick (what the tray menu now
+    /// forwards as `selected_gateway`) wins over the preferred gateway, and
+    /// None + None defers to gpclient's auto-gateway order.
+    #[test]
+    fn explicit_gateway_picks_win_over_preferred() {
+        assert_eq!(
+            resolve_connect_gateway(Some("gw-1".into()), Some("gw-2".into())),
+            Some("gw-1".to_string())
+        );
+        assert_eq!(
+            resolve_connect_gateway(None, Some("gw-2".into())),
+            Some("gw-2".to_string())
+        );
+        assert_eq!(resolve_connect_gateway(None, None), None);
+        // Automatic ("-" in the wrapper args) is the None case, not a name.
+        assert_eq!(
+            resolve_connect_gateway(Some("-".into()), None),
+            Some("-".to_string())
+        );
+    }
 }
