@@ -376,16 +376,6 @@ async fn do_connect(
 ) -> Result<(), String> {
     let controller = state.controller.clone();
 
-    match controller.snapshot().phase {
-        Phase::Connected | Phase::Connecting | Phase::Disconnecting => {
-            return Err(format!(
-                "cannot connect while {:?}",
-                controller.snapshot().phase
-            ));
-        }
-        Phase::Disconnected | Phase::Error => {}
-    }
-
     std::fs::create_dir_all(Config::log_dir())
         .map_err(|error| format!("cannot create the log directory: {error}"))?;
 
@@ -419,7 +409,10 @@ async fn do_connect(
         if reuse_cookie { "1" } else { "0" },
         gateway_arg.as_str(),
     ];
-    controller.begin_connect(&app, portal.to_string());
+    // Gate and transition atomically: a second concurrent Connect (double
+    // click, panel + tray menu) must be refused BEFORE it can launch another
+    // `admin start` and unload-kill the first worker mid-SSO.
+    controller.try_begin_connect(&app, portal)?;
     let _ = app.emit("vpn-log-cleared", ());
 
     // Keep the panel open while the operation runs.
@@ -427,7 +420,13 @@ async fn do_connect(
     let result = vpn::run_admin("start", &args).await;
     pin_panel(&app, false);
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // The start is confirmed: the launchd job now exists and belongs to
+            // THIS attempt. Only now may the poller blame a job without a pid
+            // on a dead worker (see `connecting_worker_started`).
+            controller.mark_worker_started();
+            Ok(())
+        }
         Err(error) => {
             let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
             controller.connect_failed(&app, error.clone());
@@ -438,12 +437,10 @@ async fn do_connect(
 
 async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<(), String> {
     let controller = state.controller.clone();
-    match controller.snapshot().phase {
-        Phase::Connected => {}
-        Phase::Disconnecting => return Ok(()),
-        _ => return Err("not connected".to_string()),
-    }
-    controller.begin_disconnect(&app);
+    // Gate and transition atomically (see try_begin_disconnect): a concurrent
+    // connect that lands between a `snapshot()` check and the transition must
+    // not be torn down by a second disconnect.
+    controller.try_begin_disconnect(&app)?;
     pin_panel(&app, true);
     let result = vpn::run_admin("stop", &[]).await;
     pin_panel(&app, false);
