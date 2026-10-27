@@ -27,11 +27,12 @@ const TRAY_ID: &str = "gp-bar";
 
 /// Handles for the right-click tray menu. The menu is NEVER attached to the
 /// tray (see the tray comment in `main`): on this macOS beta a natively
-/// attached status-item menu makes the system swallow left clicks before the
-/// app ever sees them, which used to kill the panel. It is popped up BY HAND
-/// on right-click instead — muda's position-less context-menu path anchors at
-/// `NSEvent::mouseLocation` (the icon the user just right-clicked) in screen
-/// coordinates, so the hidden panel window's geometry never enters into it.
+/// attached status-item menu makes the system swallow left clicks before
+/// the app ever sees them, killing the panel toggle. It is popped up BY
+/// HAND on right-click instead — muda's position-less context-menu path
+/// anchors at `NSEvent::mouseLocation` (the icon the user just
+/// right-clicked) in screen coordinates, so the hidden panel window's
+/// geometry never enters into it.
 static TRAY_MENU: OnceLock<TrayMenuHandles> = OnceLock::new();
 
 // Per-phase tray icons, rendered once and shared (the supersampled padlock
@@ -344,10 +345,10 @@ fn remove_gateway(
 /// Manual gateway add. On this deployment the portal is password-auth (its
 /// getconfig wants the real password, which GP Bar never handles by design),
 /// so the full list cannot be fetched pre-connect: the user reads it once
-/// from gpclient's interactive prompt and enters the names here. (The
-/// cookie-replication attempt of commit 8475510 was removed again in 587d3ea:
-/// the repeated auth-failed requests plausibly contributed to portal-side
-/// session invalidations during connects.)
+/// from gpclient's interactive prompt and enters the names here. Repeated
+/// unauthenticated getconfig attempts risk portal-side session
+/// invalidations during connects — no gateway-list fetching, ever.
+/// Gateways are harvested from connect logs and added manually.
 #[tauri::command]
 fn add_gateway(app: AppHandle, state: State<'_, AppContext>, name: String) -> Result<(), String> {
     let name = name.trim().to_string();

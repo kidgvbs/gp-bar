@@ -35,11 +35,11 @@ pub const LOCK_FILE: &str = "/var/run/gpclient.lock";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TAIL_INTERVAL: Duration = Duration::from_millis(400);
 
-// No serde rename: the frontend (src/main.ts render()), the CSS
-// `[data-phase="Connected"]` selector and the tray sync listener all expect
-// the variant names verbatim ("Connected"…). A `rename_all = "snake_case"`
-// here silently broke every panel state render (the switch fell through to
-// the Disconnected default).
+// No serde rename: the variant names ARE the wire format. The frontend
+// (src/main.ts render()), the CSS `[data-phase="Connected"]` selector and
+// the tray sync listener all match "Connected"… verbatim; a
+// `rename_all = "snake_case"` here would silently break every panel state
+// render (the switch falls through to the Disconnected default).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Phase {
     Disconnected,
@@ -124,15 +124,13 @@ impl VpnController {
 
     // -- connect ---------------------------------------------------------------
 
-    /// Gate + transition for a connect attempt in ONE critical section.
-    ///
-    /// `do_connect` used to check the phase with `snapshot()` (lock taken and
-    /// released), do other work, and only then transition with
-    /// `begin_connect` (lock re-taken). On the multi-threaded tokio runtime
-    /// two invocations (double click, panel + tray menu) both passed the
-    /// gate, and the second `admin start` unloaded — killing — the first
-    /// worker mid-SSO. The check and the transition must be atomic; the
-    /// refusal error is the caller's to surface.
+    /// Gate + transition in ONE critical section. Checking the phase with a
+    /// separate `snapshot()` (lock taken and released) before transitioning
+    /// (lock re-taken) is a TOCTOU hole: on the multi-threaded tokio runtime
+    /// two invocations (double click, panel + tray menu) both pass the gate,
+    /// and the second `admin start` unloads — killing — the first worker
+    /// mid-SSO. The check and the transition must be atomic; the refusal
+    /// error is the caller's to surface.
     pub fn try_begin_connect(&self, app: &AppHandle, portal: &str) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
@@ -153,7 +151,7 @@ impl VpnController {
 
     /// Gate + transition for a disconnect attempt, atomic like
     /// `try_begin_connect`. A second disconnect while already Disconnecting
-    /// is idempotent (Ok), matching the old `do_disconnect` behavior.
+    /// is idempotent (Ok): the stop request is already in flight.
     pub fn try_begin_disconnect(&self, app: &AppHandle) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
@@ -360,8 +358,9 @@ fn parse_lock_pid(raw: &str) -> Option<u32> {
 }
 
 /// `kill(pid, 0)` sends no signal: it only probes existence, and needs no
-/// fork/exec (the old `ps -p` spawned a subprocess every poll tick). When the
-/// probe fails with EPERM the process exists but belongs to root — our worker.
+/// fork/exec (a `ps -p` probe would spawn a subprocess every poll tick).
+/// When the probe fails with EPERM the process exists but belongs to root —
+/// our worker.
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -885,9 +884,9 @@ fn parse_service_for_device(output: &str, device: &str) -> Option<String> {
 /// arguments only — the wrapper file is the security boundary, see
 /// `scripts/gp-admin` (bundled under `Contents/Resources/scripts/`).
 /// The whole install prefix (wrapper + the gpclient binaries it executes)
-/// is root-owned under /Library/PrivilegedHelperTools — every parent of
-/// that path is system-owned, unlike the old /usr/local/lib location
-/// (which Homebrew chowns to the user on Intel Macs).
+/// is root-owned under /Library/PrivilegedHelperTools: every parent of
+/// that path is system-owned, unlike a /usr/local prefix that Homebrew
+/// chowns to the user on Intel Macs.
 pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
 
 /// The gpclient the admin wrapper actually executes (installed by the setup

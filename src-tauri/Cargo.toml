@@ -34,12 +34,10 @@ window-vibrancy = "0.8.1"
 # with the one window-vibrancy 0.8.1 builds against (same maintainer tree).
 # objc2-foundation supplies NSProcessInfo for the runtime OS-version check.
 
-# (The pre-connect gateway-list fetch of commit 8475510 — reqwest + xmltree
-# replicating gpclient's portal getconfig with the cached cookie — was
-# removed again: the real portal is password-auth and rejected every
-# request, and the failed auth attempts plausibly contributed to portal-side
-# session invalidations. Gateways are harvested from connect logs and
-# added manually.)
+# No gateway-list fetching pre-connect: the real portal is password-auth and
+# rejects every unauthenticated getconfig request (and the failed attempts
+# risk portal-side session invalidations). Gateways are harvested from
+# connect logs and added manually.
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc2-app-kit", "WKWebView"] }
