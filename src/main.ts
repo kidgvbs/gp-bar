@@ -537,6 +537,14 @@ gatewaySelect.addEventListener("change", async () => {
   // Reconnect ("Automatic" resolves to the preferred gateway here, per
   // the backend's connect resolution). Re-picking the live gateway
   // disarms it and restores the plain Disconnect.
+  // The right-click tray menu mirrors this condition backend-side
+  // (`tray_reconnect_armed` in src-tauri/src/main.rs): resolved target
+  // (pick > preferred) differs from connectedGateway, else not armed.
+  // They can drift in one timing corner: the tray re-arms on ANY
+  // config-updated or vpn-state event (it recomputes), while this
+  // button arms ONLY here — a ★ preferred change that crosses the
+  // live gateway shows in the tray immediately but in the panel only
+  // after the next state event. Update both if this condition changes.
   if (currentPhase === "Connected") {
     const target = gatewaySelect.value || preferredGateway;
     reconnectArmed =

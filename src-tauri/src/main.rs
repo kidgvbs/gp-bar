@@ -40,6 +40,7 @@ static TRAY_MENU: OnceLock<TrayMenuHandles> = OnceLock::new();
 struct TrayMenuHandles {
     menu: Menu<Wry>,
     connect: MenuItem<Wry>,
+    reconnect: MenuItem<Wry>,
     disconnect: MenuItem<Wry>,
 }
 
@@ -218,6 +219,30 @@ fn valid_gateway_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 
+/// The C4 contract: the panel's explicit pick (what the tray menu now
+/// forwards as `selected_gateway`) wins over the preferred gateway, and
+/// None + None defers to gpclient's own auto-gateway order.
+fn resolve_connect_gateway(explicit: Option<String>, preferred: Option<String>) -> Option<String> {
+    explicit.or(preferred)
+}
+
+/// Whether the tray's Reconnect item is armed: a Connected tunnel whose
+/// live gateway differs from what a fresh connect would resolve to
+/// (`resolve_connect_gateway`: explicit `selected_gateway`, else the
+/// preferred, else gpclient auto). This mirrors the frontend's amber-button
+/// condition in src/main.ts (target !== connectedGateway) — keep the two in
+/// step when either changes. `live` is `state.gateway`, which may be None
+/// while the tunnel gateway is still unknown: any non-auto resolution then
+/// counts as a switch (Some != None).
+fn tray_reconnect_armed(
+    selected: Option<String>,
+    preferred: Option<String>,
+    live: Option<String>,
+) -> bool {
+    let resolved = resolve_connect_gateway(selected, preferred);
+    resolved.is_some() && resolved != live
+}
+
 fn broadcast_config(app: &AppHandle, cfg: &Config) {
     // See vpn::update: emit outside the config lock.
     let _ = app.emit("config-updated", cfg);
@@ -376,26 +401,17 @@ async fn do_connect(
 ) -> Result<(), String> {
     let controller = state.controller.clone();
 
-    match controller.snapshot().phase {
-        Phase::Connected | Phase::Connecting | Phase::Disconnecting => {
-            return Err(format!(
-                "cannot connect while {:?}",
-                controller.snapshot().phase
-            ));
-        }
-        Phase::Disconnected | Phase::Error => {}
-    }
-
     std::fs::create_dir_all(Config::log_dir())
         .map_err(|error| format!("cannot create the log directory: {error}"))?;
 
-    // Gateway resolution: an explicit pick from the panel wins, then the
-    // preferred gateway, then gpclient's own auto-gateway order. The
-    // wrapper re-validates whatever lands in the args.
-    let resolved_gateway = {
-        let cfg = state.config.lock().unwrap();
-        gateway.or_else(|| cfg.preferred_gateway.clone())
-    };
+    // Gateway resolution: an explicit pick from the panel or the tray menu
+    // wins, then the preferred gateway, then gpclient's own auto-gateway
+    // order (resolve_connect_gateway). The wrapper re-validates whatever
+    // lands in the args.
+    let resolved_gateway = resolve_connect_gateway(
+        gateway,
+        state.config.lock().unwrap().preferred_gateway.clone(),
+    );
     if let Some(name) = &resolved_gateway {
         if !valid_gateway_name(name) {
             return Err("Invalid gateway name".to_string());
@@ -419,7 +435,10 @@ async fn do_connect(
         if reuse_cookie { "1" } else { "0" },
         gateway_arg.as_str(),
     ];
-    controller.begin_connect(&app, portal.to_string());
+    // Gate and transition atomically: a second concurrent Connect (double
+    // click, panel + tray menu) must be refused BEFORE it can launch another
+    // `admin start` and unload-kill the first worker mid-SSO.
+    controller.try_begin_connect(&app, portal)?;
     let _ = app.emit("vpn-log-cleared", ());
 
     // Keep the panel open while the operation runs.
@@ -427,7 +446,13 @@ async fn do_connect(
     let result = vpn::run_admin("start", &args).await;
     pin_panel(&app, false);
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // The start is confirmed: the launchd job now exists and belongs to
+            // THIS attempt. Only now may the poller blame a job without a pid
+            // on a dead worker (see `connecting_worker_started`).
+            controller.mark_worker_started();
+            Ok(())
+        }
         Err(error) => {
             let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
             controller.connect_failed(&app, error.clone());
@@ -438,12 +463,10 @@ async fn do_connect(
 
 async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<(), String> {
     let controller = state.controller.clone();
-    match controller.snapshot().phase {
-        Phase::Connected => {}
-        Phase::Disconnecting => return Ok(()),
-        _ => return Err("not connected".to_string()),
-    }
-    controller.begin_disconnect(&app);
+    // Gate and transition atomically (see try_begin_disconnect): a concurrent
+    // connect that lands between a `snapshot()` check and the transition must
+    // not be torn down by a second disconnect.
+    controller.try_begin_disconnect(&app)?;
     pin_panel(&app, true);
     let result = vpn::run_admin("stop", &[]).await;
     pin_panel(&app, false);
@@ -707,12 +730,12 @@ fn pin_panel(app: &AppHandle, pinned: bool) {
     }
 }
 
-fn sync_tray_with_state(app: &AppHandle, phase: Phase) {
+fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
     // State events are emitted from the status poller's worker task, but
     // tauri's TrayIcon hops to the main thread itself (run_item_main_thread).
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let connected = phase == Phase::Connected;
-        let tooltip = match phase {
+        let connected = state.phase == Phase::Connected;
+        let tooltip = match state.phase {
             Phase::Connected => "GP Bar — Connected",
             Phase::Connecting => "GP Bar — Connecting…",
             Phase::Disconnecting => "GP Bar — Disconnecting…",
@@ -723,16 +746,39 @@ fn sync_tray_with_state(app: &AppHandle, phase: Phase) {
         let _ = tray.set_icon_with_as_template(Some(image), true);
         let _ = tray.set_tooltip(Some(tooltip));
     }
-    // Keep the right-click menu consistent with the same phase. Connect where
-    // the panel would offer it, Disconnect while connected; during the
-    // in-flight phases both stay dimmed — do_connect/do_disconnect already
-    // guard the transitions, this just prevents the misleading click.
-    if let Some(handles) = TRAY_MENU.get() {
-        let _ = handles
-            .connect
-            .set_enabled(matches!(phase, Phase::Disconnected | Phase::Error));
-        let _ = handles.disconnect.set_enabled(phase == Phase::Connected);
-    }
+    sync_tray_menu(app, state);
+}
+
+/// Keep the right-click menu items consistent with the phase AND the config:
+/// Connect where the panel would offer it; while Connected, either the armed
+/// Reconnect (a gateway switch: `tray_reconnect_armed`) or the plain
+/// Disconnect — never both; during the in-flight phases all stay dimmed
+/// (do_connect/do_disconnect guard the transitions, this just prevents the
+/// misleading click). Re-run on BOTH the vpn-state and config-updated paths:
+/// the armed condition depends on `selected_gateway`/`preferred_gateway`, and
+/// a picker/star change from the panel must reach the tray menu immediately.
+///
+/// Reads only the config lock (never the controller's): the vpn-state
+/// listener may run on the poller's thread, and both locks together would
+/// re-introduce the cross-lock coupling the `update()` discipline avoids.
+fn sync_tray_menu(app: &AppHandle, state: &VpnState) {
+    let Some(handles) = TRAY_MENU.get() else {
+        return;
+    };
+    let (selected, preferred) = {
+        let state = app.state::<AppContext>();
+        let cfg = state.config.lock().unwrap();
+        (cfg.selected_gateway.clone(), cfg.preferred_gateway.clone())
+        // Guard dropped before any menu call that could emit.
+    };
+    let armed = tray_reconnect_armed(selected, preferred, state.gateway.clone());
+    let _ = handles
+        .connect
+        .set_enabled(matches!(state.phase, Phase::Disconnected | Phase::Error));
+    let _ = handles.reconnect.set_enabled(armed);
+    let _ = handles
+        .disconnect
+        .set_enabled(state.phase == Phase::Connected && !armed);
 }
 
 /// Pop up the right-click tray menu. `Menu::popup` WITHOUT a position takes
@@ -900,18 +946,28 @@ fn main() {
 
             // The right-click tray menu: built once here, popped up by hand in
             // the tray handler (never attached — see above). Connect mirrors the
-            // panel's action button exactly: the selected portal from config,
-            // the cookie-reuse setting, gateway None = Automatic (do_connect
-            // itself resolves preferred over --auto-gateway).
+            // panel's action button exactly: the selected portal and the
+            // cookie-reuse setting from config, plus the panel's explicit
+            // gateway pick (`selected_gateway`) — do_connect itself resolves
+            // the fallback chain (preferred, then gpclient auto-gateway).
+            // Reconnect replaces a plain Disconnect while the panel's amber
+            // button would show (a Connected gateway switch, see
+            // `tray_reconnect_armed`); enablement lives in `sync_tray_menu`.
             let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
+            let reconnect_item =
+                MenuItem::with_id(app, "reconnect", "Reconnect", false, None::<&str>)?;
             let disconnect_item =
                 MenuItem::with_id(app, "disconnect", "Disconnect", false, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit GP Bar", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&connect_item, &disconnect_item, &quit_item])?;
+            let tray_menu = Menu::with_items(
+                app,
+                &[&connect_item, &reconnect_item, &disconnect_item, &quit_item],
+            )?;
             if TRAY_MENU
                 .set(TrayMenuHandles {
                     menu: tray_menu,
                     connect: connect_item,
+                    reconnect: reconnect_item,
                     disconnect: disconnect_item,
                 })
                 .is_err()
@@ -921,7 +977,7 @@ fn main() {
             // Match the items to the current phase before any vpn-state event
             // fires. Safe lock: setup runs on the main thread and the status
             // poller has not started yet.
-            sync_tray_with_state(app.handle(), controller.snapshot().phase);
+            sync_tray_with_state(app.handle(), &controller.snapshot());
 
             vpn::spawn_status_poller(app.handle().clone(), poller_controller);
             vpn::spawn_log_tailer(app.handle().clone(), tailer_controller);
@@ -933,8 +989,22 @@ fn main() {
             let icon_handle = app.handle().clone();
             app.listen_any("vpn-state", move |event| {
                 if let Ok(state) = serde_json::from_str::<VpnState>(event.payload()) {
-                    sync_tray_with_state(&icon_handle, state.phase);
+                    sync_tray_with_state(&icon_handle, &state);
                 }
+            });
+
+            // Gateway picks/stars change the config without a vpn-state event
+            // (`select_gateway`, `set_preferred_gateway`, the harvested map):
+            // re-sync the Reconnect/Disconnect enablement on every
+            // config-updated too. Safe snapshot: the config lock is always
+            // dropped before that event is emitted (see `broadcast_config`
+            // and vpn::learn_gateway_host/harvest_gateway).
+            let menu_handle = app.handle().clone();
+            app.listen_any("config-updated", move |_| {
+                sync_tray_menu(
+                    &menu_handle,
+                    &menu_handle.state::<AppContext>().controller.snapshot(),
+                );
             });
 
             Ok(())
@@ -942,24 +1012,73 @@ fn main() {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "connect" => {
                 // Same contract as the panel's Connect button: selected portal,
-                // configured cookie reuse, gateway None = Automatic.
+                // configured cookie reuse, and the panel's explicit gateway
+                // pick (`selected_gateway`) — None only means Automatic when
+                // the user never picked one.
                 let state = app.state::<AppContext>();
-                let (portal, reuse_cookie) = {
+                let (portal, reuse_cookie, gateway) = {
                     let cfg = state.config.lock().unwrap();
                     let portal = cfg
                         .selected
                         .clone()
                         .or_else(|| cfg.portals.first().cloned())
                         .unwrap_or_default();
-                    (portal, cfg.reuse_cookie)
+                    (portal, cfg.reuse_cookie, cfg.selected_gateway.clone())
                 };
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppContext>();
                     if let Err(error) =
-                        do_connect(app.clone(), &state, &portal, reuse_cookie, None).await
+                        do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
                     {
                         panel_log(&format!("tray menu connect failed: {error}"));
+                    }
+                });
+            }
+            "reconnect" => {
+                // The armed gateway switch: same chain as the panel's amber
+                // Reconnect button — tear the tunnel down, then connect with
+                // the resolved gateway (do_connect itself resolves
+                // selected_gateway > preferred > gpclient auto).
+                let state = app.state::<AppContext>();
+                let (portal, reuse_cookie, gateway) = {
+                    let cfg = state.config.lock().unwrap();
+                    let portal = cfg
+                        .selected
+                        .clone()
+                        .or_else(|| cfg.portals.first().cloned())
+                        .unwrap_or_default();
+                    (portal, cfg.reuse_cookie, cfg.selected_gateway.clone())
+                    // Guard dropped before the async work.
+                };
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<AppContext>();
+                    if let Err(error) = do_disconnect(app.clone(), &state).await {
+                        panel_log(&format!("tray reconnect: disconnect failed: {error}"));
+                        return;
+                    }
+                    // `gp-admin stop` returns once the worker is gone, but the
+                    // backend phase flips to Disconnected via its poller — a
+                    // connect sent straight away is refused ("cannot connect
+                    // while Disconnecting"). Wait the observation out (same
+                    // pattern as the frontend's Reconnect), then connect.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                    loop {
+                        let phase = state.controller.snapshot().phase;
+                        if phase != Phase::Disconnecting {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            panel_log("tray reconnect: timed out waiting for Disconnecting");
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    if let Err(error) =
+                        do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
+                    {
+                        panel_log(&format!("tray reconnect: connect failed: {error}"));
                     }
                 });
             }
@@ -997,4 +1116,56 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running gp-bar");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_connect_gateway, tray_reconnect_armed};
+
+    /// The C4 contract: the panel's explicit pick (what the tray menu now
+    /// forwards as `selected_gateway`) wins over the preferred gateway, and
+    /// None + None defers to gpclient's auto-gateway order.
+    #[test]
+    fn explicit_gateway_picks_win_over_preferred() {
+        assert_eq!(
+            resolve_connect_gateway(Some("gw-1".into()), Some("gw-2".into())),
+            Some("gw-1".to_string())
+        );
+        assert_eq!(
+            resolve_connect_gateway(None, Some("gw-2".into())),
+            Some("gw-2".to_string())
+        );
+        assert_eq!(resolve_connect_gateway(None, None), None);
+        // Automatic ("-" in the wrapper args) is the None case, not a name.
+        assert_eq!(
+            resolve_connect_gateway(Some("-".into()), None),
+            Some("-".to_string())
+        );
+    }
+
+    /// The tray Reconnect enablement: armed exactly when a fresh connect
+    /// would resolve to a gateway other than the live tunnel's.
+    #[test]
+    fn tray_reconnect_arms_only_on_a_real_gateway_switch() {
+        let g = |s: &str| Some(s.to_string());
+        // Explicit pick equal to the live gateway: no switch.
+        assert!(!tray_reconnect_armed(g("gw-1"), None, g("gw-1")));
+        // Explicit pick differing from the live gateway: switch.
+        assert!(tray_reconnect_armed(g("gw-1"), None, g("gw-2")));
+        // Automatic + preferred == live: no switch.
+        assert!(!tray_reconnect_armed(None, g("gw-1"), g("gw-1")));
+        // Automatic + preferred != live: armed on the preferred.
+        assert!(tray_reconnect_armed(None, g("gw-1"), g("gw-2")));
+        // Automatic with no preferred: gpclient auto-order, nothing to arm.
+        assert!(!tray_reconnect_armed(None, None, g("gw-1")));
+        assert!(!tray_reconnect_armed(None, None, None));
+        // Live gateway unknown (tunnel up before the tailer parsed it): any
+        // non-auto resolution counts as a switch.
+        assert!(tray_reconnect_armed(g("gw-1"), None, None));
+        assert!(tray_reconnect_armed(None, g("gw-1"), None));
+        assert!(!tray_reconnect_armed(None, None, None));
+        // The explicit pick wins over the preferred, so it decides.
+        assert!(!tray_reconnect_armed(g("gw-1"), g("gw-2"), g("gw-1")));
+        assert!(tray_reconnect_armed(g("gw-2"), g("gw-1"), g("gw-1")));
+    }
 }
