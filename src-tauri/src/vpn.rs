@@ -384,7 +384,7 @@ fn process_alive(pid: u32) -> bool {
 fn process_is_gpclient(pid: u32) -> bool {
     // SAFETY: proc_pidpath writes at most `buffersize` bytes into `buffer`
     // and only reads the integer `pid`; both come from here.
-    extern "C" {
+    unsafe extern "C" {
         fn proc_pidpath(pid: libc::pid_t, buffer: *mut u8, buffersize: u32) -> i32;
     }
     let mut buffer = [0u8; 4096];

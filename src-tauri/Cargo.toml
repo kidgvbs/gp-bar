@@ -4,8 +4,8 @@ version = "1.0.0"
 description = "Menu bar client for the GlobalProtect VPN via the open-source gpclient CLI. No connection time limits."
 authors = ["kidgvbs"]
 license = "MIT"
-edition = "2021"
-rust-version = "1.77"
+edition = "2024"
+rust-version = "1.85"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
