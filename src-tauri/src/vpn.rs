@@ -890,6 +890,12 @@ fn parse_service_for_device(output: &str, device: &str) -> Option<String> {
 /// (which Homebrew chowns to the user on Intel Macs).
 pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
 
+/// The gpclient the admin wrapper actually executes (installed by the setup
+/// script under the same root-owned prefix as `ADMIN_WRAPPER`). The version
+/// reported in the About box is resolved from THIS binary when it exists, so
+/// the displayed version matches what the worker really runs.
+pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpclient";
+
 /// Run one admin operation (`selftest`, `start`, `stop`, `cancel`).
 ///
 /// `sudo -n` never prompts: without the sudoers rule it fails fast, and

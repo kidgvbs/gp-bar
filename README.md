@@ -182,10 +182,12 @@ re-verified.)
 * `reuse_cookie` — passes `--cookie-cache` so gpclient reuses the portal
   session cookie; fewer browser logins while the session stays valid.
 * `gpclient_path` — force a specific `gpclient` binary for the version
-  display; `null` auto-detects the Homebrew locations. (The root helper
-  executes only its own root-owned copy under
-  `/Library/PrivilegedHelperTools/gp-bar/bin`: a root-owned component must
-  not run binaries from user-configurable paths.)
+  display only (dev setups, non-standard installs); `null` resolves the
+  version from the root-owned copy the admin wrapper actually runs
+  (`/Library/PrivilegedHelperTools/gp-bar/bin/gpclient`), falling back to
+  Homebrew autodetect. The worker itself always executes that root-owned
+  copy: a root-owned component must not run binaries from
+  user-configurable paths.
 * `gateways` — entries of the gateway picker: added from the panel or
   harvested from connect logs, never fetched over the network. GP Bar makes
   no network calls of its own (a portal-side gateway fetch was removed —
