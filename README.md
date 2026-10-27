@@ -40,23 +40,52 @@ survives GP Bar restarts and logouts of the app.
 
 Creating the tunnel requires root. GP Bar never handles a password itself:
 
-* The app only ever runs `sudo -n /usr/local/lib/gp-bar/admin <op>` — a
+* The app only ever runs
+  `sudo -n /Library/PrivilegedHelperTools/gp-bar/admin <op>` — a
   **root-owned wrapper** with a fixed set of operations
-  (`selftest | start <portal> <reuse 0|1> | stop | cancel`) and self-validated
-  arguments. It generates the worker's launchd job itself: **no
-  caller-controlled paths, no eval, no user-writable staging files**.
-* The one-time setup installs the wrapper (root-owned, 0755) and grants
-  passwordless sudo on that exact path only, via `/etc/sudoers.d/gp-bar`:
+  (`selftest | start <portal> <reuse 0|1> | stop | cancel | repair`) and
+  self-validated arguments. It generates the worker's launchd job itself:
+  **no caller-controlled paths, no eval, no user-writable staging files**.
+* The one-time setup installs, all root-owned under
+  `/Library/PrivilegedHelperTools/gp-bar` (a prefix whose every parent
+  directory is system-owned):
+
+  * `admin` — the wrapper (0755),
+  * `bin/gpclient` and `bin/gpauth` — **root-owned copies** of the worker
+    binaries, resolved from the Homebrew locations. The wrapper executes
+    these only, never anything under `/opt/homebrew`, `/usr/local` or an
+    app bundle, and refuses to run unless the binary, its realpath and
+    every parent directory are root-owned,
+  * `Frameworks/*.dylib` — the `@executable_path` dylibs gpclient links
+    (libopenconnect and its closure), copied layout-preserving so the
+    whole load chain is root-owned too,
+  * the sudoers grant, written atomically: a dotted, inert temp file in
+    `/etc/sudoers.d`, validated on its own with `visudo -cf`, then renamed
+    into place. A malformed file can never be live.
 
   ```sh
   sudo bash "/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh"
   ```
 
   Run it in **Terminal**, where the admin prompt offers Touch ID (the same
-  `pam_tid` as a regular `sudo`). After the setup, connect/disconnect/cancel
-  need **no prompt and no password, ever**.
-* Residual risk, deliberate and documented: anything running as your user can
-  toggle the VPN on/off through the wrapper — nothing more.
+  `pam_tid` as a regular `sudo`). After the setup,
+  connect/disconnect/cancel need **no prompt and no password, ever**.
+
+* The connect log (`gpclient-connect.log`, which the panel tails live) is
+  written by the ROOT worker into the root-owned, world-readable
+  `/Library/Logs/gp-bar/` — never into `~/Library` (a user symlink there
+  would let any user process truncate system files as root). The app only
+  reads it, as the user.
+
+* Residual risk, stated honestly: anything running as your user can toggle
+  the VPN on/off through the wrapper, and `repair` clears manual DNS on
+  network services (that is its job). The root exec chain itself is closed
+  on this machine: wrapper, binaries and their `@executable_path` dylibs
+  are all root-owned copies outside Homebrew. If a future gpclient build
+  were to link user-writable dylibs by absolute path, that residual would
+  re-open — re-running the setup script after every `brew upgrade`
+  refreshes the copies, and the wrapper's ownership checks fail loudly if
+  anything drifts.
 
 An alternative elevation design (SMAppService LaunchDaemon + XPC, the
 macOS-blessed road) exists on the `solution-1-smappservice` branch: the daemon
@@ -113,8 +142,10 @@ npm run icons        # regenerate src-tauri/icons/* (drawn in scripts/gen-app-ic
 npm run tauri build  # release bundle
 ```
 
-After changing `src-tauri/scripts/gp-admin`, re-run the setup script to
-refresh the installed wrapper (it is idempotent).
+After changing `src-tauri/scripts/gp-admin` — or after `brew upgrade` /
+a GP Connect update (the source of the `gpclient` binary) — re-run the
+setup script to refresh the installed wrapper and the root-owned binary
+copies (it is idempotent, and it also performs the end-to-end selftest).
 
 `tray-icon` is pinned to `=0.25.0` as the configuration verified on this
 machine. (The early "menu attach" theories about the macOS 27 beta turned out
@@ -143,8 +174,9 @@ re-verified.)
   session cookie; fewer browser logins while the session stays valid.
 * `gpclient_path` — force a specific `gpclient` binary for the version
   display; `null` auto-detects the Homebrew locations. (The root helper
-  always resolves gpclient from the fixed Homebrew paths: a root-owned
-  component must not execute user-configured paths.)
+  executes only its own root-owned copy under
+  `/Library/PrivilegedHelperTools/gp-bar/bin`: a root-owned component must
+  not run binaries from user-configurable paths.)
 * `gateways` — entries of the gateway picker: added from the panel or
   harvested from connect logs, never fetched over the network. GP Bar makes
   no network calls of its own (a portal-side gateway fetch was removed —
