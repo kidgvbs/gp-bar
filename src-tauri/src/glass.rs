@@ -113,7 +113,7 @@ pub fn apply_liquid_glass(window: &tauri::WebviewWindow) -> Result<(), String> {
                 if let Err(error) = apply_liquid_glass(&callback_window, options) {
                     // Unreachable in practice (gated on the OS version), but
                     // never take the panel down over a cosmetic effect.
-                    eprintln!("gp-bar: liquid glass unavailable: {error}");
+                    log::warn!("liquid glass unavailable: {error}");
                 }
             })
             .map_err(|error| format!("with_webview failed: {error}"))?;

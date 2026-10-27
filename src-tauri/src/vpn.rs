@@ -332,9 +332,7 @@ pub fn read_lock_observation() -> Option<LockObservation> {
     // a crash without cleanup the PID may be ANY process's (C6). Require the
     // process to actually be gpclient, else treat the lock as stale.
     if !process_is_gpclient(pid) {
-        eprintln!(
-            "gp-bar: lock file PID {pid} is not a gpclient process — treating the lock as stale"
-        );
+        log::warn!("lock file PID {pid} is not a gpclient process — treating the lock as stale");
         return None;
     }
     let connected_since = fs::metadata(LOCK_FILE)
@@ -518,7 +516,7 @@ fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<String> {
         let line = match String::from_utf8(raw) {
             Ok(line) => line,
             Err(error) => {
-                eprintln!("gp-bar: invalid UTF-8 in a connect log line: {error}");
+                log::warn!("invalid UTF-8 in a connect log line: {error}");
                 String::from_utf8_lossy(error.as_bytes()).into_owned()
             }
         };
@@ -686,7 +684,7 @@ fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
             cfg.gateway_hosts
                 .insert(address.to_string(), name.to_string());
             if let Err(error) = cfg.save() {
-                eprintln!("gp-bar: cannot save the gateway host map: {error}");
+                log::warn!("cannot save the gateway host map: {error}");
             }
             (cfg.clone(), true)
         }
@@ -717,7 +715,7 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
     // harvested straight from the log must not reach the picker if the
     // wrapper would refuse it (the picker would offer a dead entry).
     if !crate::config::valid_name(gateway) {
-        eprintln!("gp-bar: skipping harvested gateway {gateway:?}: invalid name");
+        log::warn!("skipping harvested gateway {gateway:?}: invalid name");
         return;
     }
     let (cfg, changed) = {
@@ -726,7 +724,7 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
         if changed {
             cfg.gateways.push(gateway.to_string());
             if let Err(error) = cfg.save() {
-                eprintln!("gp-bar: cannot save the harvested gateway: {error}");
+                log::warn!("cannot save the harvested gateway: {error}");
             }
         }
         (cfg.clone(), changed)

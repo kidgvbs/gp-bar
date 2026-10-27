@@ -1205,9 +1205,9 @@ dependencies = [
 name = "gp-bar"
 version = "1.0.0"
 dependencies = [
- "chrono",
  "dirs 5.0.1",
  "libc",
+ "log",
  "objc2-foundation",
  "objc2-web-kit",
  "serde",

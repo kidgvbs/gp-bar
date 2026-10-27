@@ -109,6 +109,10 @@ impl Config {
     /// A parse error means the file is corrupt (e.g. a crash mid-write): it
     /// is renamed aside so the next `save()` cannot silently overwrite the
     /// user's portals and gateways with the defaults.
+    ///
+    /// eprintln, not `log::`: `Config::load` runs in `main` before the
+    /// tauri-plugin-log logger is attached, so the `log` facade would
+    /// silently drop these lines — stderr is the only sink this early.
     fn load_from(dir: &Path) -> Config {
         let path = dir.join("config.json");
         match fs::read_to_string(&path) {

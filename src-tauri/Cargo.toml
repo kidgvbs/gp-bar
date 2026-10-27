@@ -19,7 +19,12 @@ dirs = "5"
 # Only kill(pid, 0) for worker liveness (no fork/exec like the old `ps -p`),
 # no other libc use. tauri already links libc transitively.
 libc = "0.2"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Logging: tauri-plugin-log installs itself as the global `log` logger and
+# owns the targets (stderr + the rotating ~/Library/Logs/gp-bar/panel.log),
+# so call sites use the `log` facade macros. Version-unified with the
+# plugin's own `log` dep.
+log = "0.4"
+tauri-plugin-log = "2"
 # Tray handles are created directly (not through tauri::tray), pinned to the
 # exact 0.25.0 verified working on this machine. The early theories about
 # menu-attach timing on macOS 27 beta were red herrings: the tray always
@@ -29,7 +34,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tray-icon = { version = "=0.25.0", default-features = false, features = ["serde", "libappindicator"] }
 # Native liquid-glass panel backdrop (macOS 26+), behind the webview.
 window-vibrancy = "0.8.1"
-tauri-plugin-log = "2.0.0-rc.2"
 
 # Liquid glass: the panel's own WKWebView, handed to window-vibrancy via
 # LiquidGlassOptions::content_view so the crate reparents it into the glass
