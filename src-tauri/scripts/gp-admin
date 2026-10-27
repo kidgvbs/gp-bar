@@ -148,15 +148,25 @@ start)
   # A leftover lock from a crashed worker (or a forced reboot) would make the
   # next gpclient refuse to start ("another instance is running"). If the PID
   # it names is gone, the lock is stale: remove it before starting. We are
-  # root here, so kill -0 sees root PIDs too.
+  # root here, so kill -0 sees root PIDs too. An EMPTY or garbage lock file
+  # names no checkable PID (a crashed/truncated write): it must be removed
+  # like any other stale lock, never treated as "already running" — dying
+  # there would block every future start forever.
   if [ -f "$LOCK" ]; then
     old_pid=$(cat "$LOCK" 2>/dev/null || true)
-    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
-      echo "gp-admin: removing stale lock file (PID $old_pid is gone)" >&2
-      rm -f "$LOCK"
-    else
-      die "a VPN worker is already running (PID $old_pid)"
-    fi
+    case "$old_pid" in
+      ''|*[!0-9]*)
+        echo "gp-admin: removing unreadable stale lock file" >&2
+        rm -f "$LOCK"
+        ;;
+      *)
+        if kill -0 "$old_pid" 2>/dev/null; then
+          die "a VPN worker is already running (PID $old_pid)"
+        fi
+        echo "gp-admin: removing stale lock file (PID $old_pid is gone)" >&2
+        rm -f "$LOCK"
+        ;;
+    esac
   fi
 
   # One log per attempt, in the root-owned world-readable log directory:
