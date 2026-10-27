@@ -385,8 +385,9 @@ repair)
   else
     # Restore IPv4 AND IPv6 together — networksetup takes both in one call,
     # and a v4-only restore would drop the user's manual v6 resolvers.
+    # shellcheck disable=SC2086  # word-splitting is the point: server list
     /usr/sbin/networksetup -setdnsservers "$svc" $restore_v4 $restore_v6
-    echo "gp-admin: restored DNS on '$svc' to the pre-VPN setting: $(echo $restore_v4 $restore_v6)"
+    echo "gp-admin: restored DNS on '$svc' to the pre-VPN setting: $restore_v4 $restore_v6"
   fi
   # The same VPN DNS can sit on services that were active during past
   # connects (docks, USB adapters, now disabled — vpnc-script never reverts
