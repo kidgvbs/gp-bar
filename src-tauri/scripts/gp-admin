@@ -1,7 +1,8 @@
 #!/bin/sh
 # GP Bar privileged helper — the only executable /etc/sudoers.d/gp-bar
 # allows the user to run as root without a password (installed root-owned
-# 0755 by scripts/setup-admin.sh).
+# 0755 by scripts/setup-admin.sh, together with the worker binaries it
+# executes, under /Library/PrivilegedHelperTools/gp-bar).
 #
 # This file IS the security boundary, hence the rules:
 #   * fixed operations only:
@@ -10,37 +11,71 @@
 #   * no caller-controlled paths, no eval, no sh -c of interpolated strings
 #   * the launchd job plist is fully generated from validated values, so a
 #     user-writable staging file can never become arbitrary root execution
+#   * every executable this script runs as root is resolved from the
+#     root-owned install prefix ONLY — never from PATH, Homebrew or
+#     /Applications — and refuses to start unless the file, its realpath
+#     target and every parent directory are root-owned and not
+#     group/world-writable (see `require_root_owned`)
 #
-# Residual risk with NOPASSWD, deliberate and documented: anything running
-# as this user can toggle the VPN on/off, nothing more.
+# Honest trust model with NOPASSWD on this path:
+#   * granted: running the fixed operations above, which toggle the VPN
+#     and touch root-owned files (/Library/Logs/gp-bar, the job plist,
+#     network DNS settings while repairing)
+#   * closed: the wrapper and the gpclient binaries it executes are
+#     root-owned copies outside Homebrew and the app bundles; the connect
+#     log lives in a root-owned directory (no symlinked truncation of
+#     user-chosen system files); sudoers is written atomically after
+#     validation (see setup-admin.sh)
+#   * residual: `repair` clears manual DNS on network services (that is
+#     its job); anything running as this user can toggle the VPN on/off.
+#     The copied binaries' own @executable_path dylibs are copied and
+#     root-owned too, so the exec chain is closed on this machine; if a
+#     future gpclient build links user-writable dylibs absolutely, that
+#     would re-open the hole (setup-admin copies only what otool shows
+#     today — re-run it after every brew/app upgrade).
 
 set -eu
 
+PREFIX='/Library/PrivilegedHelperTools/gp-bar'
 DAEMON_DIR='/Library/Application Support/GP Bar'
 PLIST="$DAEMON_DIR/dev.gpbar.worker.plist"
 LOCK=/var/run/gpclient.lock
+LOG_DIR=/Library/Logs/gp-bar
+LOG_PATH="$LOG_DIR/gpclient-connect.log"
+
+# The worker binaries resolve from the root-owned install prefix only.
+# setup-admin.sh copies gpclient (and its sibling gpauth + Frameworks
+# dylibs) here from the Homebrew paths; nothing under /opt/homebrew,
+# /usr/local or /Applications is ever executed as root by this script.
+GPCLIENT="$PREFIX/bin/gpclient"
 
 die() { echo "gp-admin: $*" >&2; exit 1; }
 
-# Same locations as Config::detect_gpclient in the app. The app cannot
-# pass a custom path in: that would be arbitrary root execution.
-find_gpclient() {
-  if [ -x /opt/homebrew/bin/gpclient ]; then
-    printf '%s' /opt/homebrew/bin/gpclient
-    return 0
-  fi
-  if [ -x /usr/local/bin/gpclient ]; then
-    printf '%s' /usr/local/bin/gpclient
-    return 0
-  fi
-  return 1
+# Refuse to run unless `path` (symlink-resolved) and EVERY component of
+# its directory chain is owned by root and not group/world-writable.
+# A user-writable parent (or a user-swappable file) would make the
+# NOPASSWD grant equivalent to arbitrary root execution.
+require_root_owned() {
+  real=$(realpath "$1") || die "cannot resolve $1"
+  d=$real
+  while :; do
+    [ "$(stat -f %u "$d")" = 0 ] || die "$d is not root-owned — re-run setup-admin.sh"
+    case "$(stat -f %Sp "$d")" in
+      ?????w????|????????w?) die "$d is group/world-writable — re-run setup-admin.sh" ;;
+    esac
+    [ "$d" = / ] && break
+    d=$(dirname "$d")
+  done
 }
 
-# Strict charset: also keeps the value XML-safe for the job plist. Shared by
-# portal and gateway names (both end up in the job plist).
-valid_portal() {
+# Strict charset: also keeps the value XML-safe for the job plist. Shared
+# by portal and gateway names (both end up in the job plist). A leading
+# '-' is rejected: gpclient's option parser would read it as an option
+# (argument injection), and '-' collides with the "auto-gateway"
+# sentinel below.
+valid_name() {
   case "$1" in
-    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    ''|-*|*[!A-Za-z0-9._-]*) return 1 ;;
   esac
   return 0
 }
@@ -66,12 +101,25 @@ service_dns() {
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
 }
 
+# Resolve the root-owned worker binary and verify the whole ownership
+# chain before any privileged use.
+require_gpclient() {
+  [ -x "$GPCLIENT" ] || die "gpclient not installed at $GPCLIENT — re-run setup-admin.sh"
+  require_root_owned "$GPCLIENT"
+}
+
 op="${1:-}"
 
 case "$op" in
 selftest)
-  find_gpclient >/dev/null || die "gpclient not found"
+  require_gpclient
+  # The SAML drop-in helper, when present, must pass the same checks
+  # (gpclient resolves it as a sibling of its own executable).
+  if [ -e "$PREFIX/bin/gpauth" ]; then
+    require_root_owned "$PREFIX/bin/gpauth"
+  fi
   mkdir -p "$DAEMON_DIR" 2>/dev/null || die "cannot create $DAEMON_DIR"
+  install -d -m 0755 -o root -g wheel "$LOG_DIR"
   echo ok
   ;;
 
@@ -79,21 +127,23 @@ start)
   portal="${2:-}"
   reuse="${3:-0}"
   gateway="${4:--}"
-  valid_portal "$portal" || die "invalid portal name"
+  valid_name "$portal" || die "invalid portal name"
   if [ "$reuse" != 0 ] && [ "$reuse" != 1 ]; then die "invalid reuse flag"; fi
   if [ "$gateway" != "-" ]; then
-    valid_portal "$gateway" || die "invalid gateway name"
+    valid_name "$gateway" || die "invalid gateway name"
   fi
-  gpclient=$(find_gpclient) || die "gpclient not found"
-  [ -e /dev/console ] || die "no console user"
-  uid=$(stat -f %u /dev/console) || die "no console user"
-  user=$(id -nu "$uid") || die "no console user"
-  home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
-  [ -n "$home" ] || die "no home directory for $user"
+  require_gpclient
+  # The invoking user comes from sudo itself (SUDO_UID/SUDO_USER): the
+  # caller cannot fake these, and with fast user switching /dev/console
+  # names whoever is in front of the screen, not who ran sudo.
+  uid="${SUDO_UID:?must run via sudo}"
+  case "$uid" in *[!0-9]*) die "invalid SUDO_UID" ;; esac
+  user=$(id -nu "$uid") || die "no user for uid $uid"
+  [ "${SUDO_USER:-}" = "$user" ] || echo "gp-admin: SUDO_USER (${SUDO_USER:-unset}) does not match uid $uid ($user); using $user" >&2
 
-  log_dir="$home/Library/Logs/gp-bar"
-  log_path="$log_dir/gpclient-connect.log"
-  mkdir -p "$DAEMON_DIR" "$log_dir"
+  install -d -m 0755 -o root -g wheel "$DAEMON_DIR"
+  install -d -m 0755 -o root -g wheel "$LOG_DIR"
+  require_root_owned "$LOG_DIR"
 
   # A leftover lock from a crashed worker (or a forced reboot) would make the
   # next gpclient refuse to start ("another instance is running"). If the PID
@@ -109,9 +159,13 @@ start)
     fi
   fi
 
-  # One log per attempt: the panel tailer rewinds on shrink, so truncating
-  # here is the "new attempt" signal (same contract as the old flow).
-  : > "$log_path"
+  # One log per attempt, in the root-owned world-readable log directory:
+  # the panel tailer rewinds on shrink, so truncating here is the "new
+  # attempt" signal. Never a user-writable path — a symlinked log under
+  # ~/Library would let any user process truncate system files as root.
+  rm -f "$LOG_PATH"
+  : > "$LOG_PATH"
+  chmod 0644 "$LOG_PATH"
 
   if [ "$reuse" = 1 ]; then
     cookie='<string>--cookie-cache</string>'
@@ -134,17 +188,22 @@ start)
     : > "$DAEMON_DIR/dns-snapshot.txt"
   fi
 
+  # PATH carries the root-owned bin/ FIRST and no Homebrew prefix: root
+  # must not go looking for executables in user-writable directories.
+  # (The worker is invoked by absolute path anyway; the PATH is for the
+  # tools gpclient and vpnc-script spawn.)
   umask 022
   cat > "$PLIST" <<JOB
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>dev.gpbar.worker</string>
-<key>ProgramArguments</key><array><string>$gpclient</string><string>--log-format</string><string>json</string><string>connect</string><string>$portal</string><string>--browser</string>$gateway_args$cookie</array>
-<key>EnvironmentVariables</key><dict><key>HOME</key><string>/var/root</string><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>SUDO_UID</key><string>$uid</string><key>SUDO_USER</key><string>$user</string></dict>
-<key>StandardOutPath</key><string>$log_path</string>
-<key>StandardErrorPath</key><string>$log_path</string>
+<key>ProgramArguments</key><array><string>$GPCLIENT</string><string>--log-format</string><string>json</string><string>connect</string><string>$portal</string><string>--browser</string>$gateway_args$cookie</array>
+<key>EnvironmentVariables</key><dict><key>HOME</key><string>/var/root</string><key>PATH</key><string>$PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>SUDO_UID</key><string>$uid</string><key>SUDO_USER</key><string>$user</string></dict>
+<key>StandardOutPath</key><string>$LOG_PATH</string>
+<key>StandardErrorPath</key><string>$LOG_PATH</string>
 <key>RunAtLoad</key><true/>
+<key>ExitTimeOut</key><integer>60</integer>
 </dict></plist>
 JOB
   chown root:wheel "$PLIST"
@@ -153,18 +212,21 @@ JOB
   # The worker must be born from launchd to stay signalable: root children
   # spawned outside launchd ignore catchable signals on this macOS beta
   # (see RECAP.md). The leading unload keeps the load idempotent and
-  # recovers from a worker that exited outside GP Bar.
+  # recovers from a worker that exited outside GP Bar. ExitTimeOut above
+  # gives the worker 60 s of SIGTERM grace at unload/bootout instead of
+  # launchd's 20 s default SIGKILL — a killed worker skips the
+  # vpnc-script teardown that restores DNS.
   launchctl unload -w "$PLIST" 2>/dev/null || true
   launchctl load -w "$PLIST"
   ;;
 
 stop)
-  gpclient=$(find_gpclient) || die "gpclient not found"
+  require_gpclient
   # gpclient disconnect signals the lock-file PID with SIGINT and exits 0
   # even when the signal went nowhere: the lock file is the truth. Fail
   # loud, never SIGKILL — a killed worker skips the vpnc-script teardown
   # that restores DNS settings and routes.
-  "$gpclient" disconnect
+  "$GPCLIENT" disconnect
   i=0
   while [ "$i" -lt 20 ] && [ -e "$LOCK" ]; do
     sleep 0.5
@@ -179,7 +241,8 @@ stop)
 
 cancel)
   # Unloading the one-shot job makes launchd terminate the worker, which
-  # runs its own teardown instead of a blind kill.
+  # runs its own teardown instead of a blind kill (SIGTERM first, with
+  # the 60 s ExitTimeOut grace — see the plist above).
   launchctl unload -w "$PLIST" 2>/dev/null || true
   ;;
 
