@@ -53,10 +53,10 @@ install -m 0755 -o root -g wheel "$SRC/gp-admin" "$DEST"
 # S2: close the Homebrew hole. The root exec chain must never touch a
 # user-writable executable: /opt/homebrew/bin is the user's, and today's
 # gpclient there is a symlink into the GP Connect.app bundle (user-writable
-# too). Copy gpclient — plus the sibling gpauth (the SAML drop-in, resolved
-# by gpclient next to its own executable) and the @executable_path Frameworks
-# dylibs it links — into the root-owned prefix. gp-admin resolves binaries
-# ONLY from here (see its header).
+# too). Copy gpclient and the @executable_path Frameworks dylibs it links
+# into the root-owned prefix; copy the "GP Connect Login.app" bundle for
+# gpauth (see the comment below — it must exec in bundle context).
+# gp-admin resolves binaries ONLY from here (see its header).
 SRC_GPCLIENT=''
 for candidate in /opt/homebrew/bin/gpclient /usr/local/bin/gpclient; do
   if [ -x "$candidate" ]; then
@@ -70,9 +70,32 @@ REAL_DIR=$(dirname "$REAL_GPCLIENT")
 
 install -d -m 0755 "$DEST_DIR/bin"
 install -m 0755 -o root -g wheel "$REAL_GPCLIENT" "$DEST_DIR/bin/gpclient"
-if [ -e "$REAL_DIR/gpauth" ]; then
-  install -m 0755 -o root -g wheel "$REAL_DIR/gpauth" "$DEST_DIR/bin/gpauth"
+# The SAML drop-in helper (gpauth) is Hardened Runtime: its code signature
+# validates against its BUNDLE context (Info.plist + _CodeSignature), and
+# the kernel kills such a binary at exec when the context is broken — a
+# bare Mach-O copy dies instantly (SIGKILL). So the whole
+# "GP Connect Login.app" bundle is copied root-owned (ditto preserves the
+# bundle layout, modes and signature), and $PREFIX/bin/gpauth becomes a
+# RELATIVE symlink into it: gpclient resolves gpauth as a sibling of its
+# own realpath'd executable, and the symlink keeps that discovery working
+# while the kernel execs the binary in its bundle context.
+LOGIN_APP_DST="$DEST_DIR/GP Connect Login.app"
+LOGIN_APP_SRC="$REAL_DIR/GP Connect Login.app"
+if [ ! -d "$LOGIN_APP_SRC" ]; then
+  echo "setup-admin: $LOGIN_APP_SRC not found (SAML browser auth needs the GP Connect Login bundle)" >&2
+  exit 1
 fi
+rm -rf "$LOGIN_APP_DST"
+ditto "$LOGIN_APP_SRC" "$LOGIN_APP_DST"
+chown -R root:wheel "$LOGIN_APP_DST"
+# Root-owned, non-writable by anyone else: dirs 0755, files keep their
+# executable bits and lose group/world write. (Mode changes do not touch
+# the code signature; chown/chmod here are the same values the bundle
+# ships with, enforced anyway.)
+find "$LOGIN_APP_DST" -type d -exec chmod 0755 {} +
+find "$LOGIN_APP_DST" -type f -exec chmod go-w {} +
+# ln -sf also replaces a stale bare gpauth file from an earlier install.
+ln -sfn '../GP Connect Login.app/Contents/MacOS/gpauth' "$DEST_DIR/bin/gpauth"
 # gpclient links @executable_path/../Frameworks/*.dylib (libopenconnect,
 # libgnutls and their transitive closure): a layout-preserving copy keeps
 # those relative load commands valid, so no install_name_tool rewriting is
