@@ -855,7 +855,8 @@ fn main() {
         })
         .setup(move |app| {
             // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // Panel backdrop: native liquid glass where the OS (26+) and the
             // config allow it, CSS vibrancy otherwise (see `glass`). Applied
