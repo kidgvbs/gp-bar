@@ -954,17 +954,23 @@ pub fn setup_script_path(app: &AppHandle) -> PathBuf {
 /// Map sudo/wrapper failures to the one-time setup hint when the helper is
 /// not installed; operational failures pass through unchanged.
 pub fn admin_error_hint(setup_script: &Path, error: &str) -> String {
-    // Locale-independent fast path (R5): no wrapper file means the setup is
-    // missing, whatever the exact sudo/OS error string says. sudo's stderr
-    // is forced to LC_ALL=C by `run_admin`, so the string matches below are
-    // stable, but the existence check works even without them.
+    admin_error_hint_for(Path::new(ADMIN_WRAPPER).exists(), setup_script, error)
+}
+
+/// Pure core of [`admin_error_hint`]: `wrapper_installed` is the caller's
+/// locale-independent existence check (R5) so tests are environment-free.
+pub fn admin_error_hint_for(wrapper_installed: bool, setup_script: &Path, error: &str) -> String {
+    // No wrapper file means the setup is missing, whatever the exact
+    // sudo/OS error string says. sudo's stderr is forced to LC_ALL=C by
+    // `run_admin`, so the string matches below are stable, but the
+    // existence check works even without them.
     let hint = || {
         format!(
             "The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '{}'",
             setup_script.display()
         )
     };
-    if !Path::new(ADMIN_WRAPPER).exists()
+    if !wrapper_installed
         || error.contains("a password is required")
         || error.contains("command not found")
     {
@@ -993,6 +999,10 @@ mod tests {
     fn admin_errors_map_to_the_setup_hint() {
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
         // Missing sudoers rule and missing wrapper both mean "run the setup".
+        assert!(
+            admin_error_hint_for(false, setup, "sudo: some other failure")
+                .contains("setup-admin.sh")
+        );
         assert!(admin_error_hint(setup, "sudo: a password is required").contains("setup-admin.sh"));
         assert!(
             admin_error_hint(
@@ -1003,7 +1013,7 @@ mod tests {
         );
         // Operational failures pass through untouched.
         assert_eq!(
-            admin_error_hint(setup, "gp-admin: the VPN worker did not stop"),
+            admin_error_hint_for(true, setup, "gp-admin: the VPN worker did not stop"),
             "gp-admin: the VPN worker did not stop"
         );
     }
@@ -1297,7 +1307,7 @@ mod tests {
         // one — it must pass through and be surfaced by the caller.
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
         let error = "admin op 'stop' timed out";
-        assert_eq!(admin_error_hint(setup, error), error);
+        assert_eq!(admin_error_hint_for(true, setup, error), error);
     }
 
     #[test]
