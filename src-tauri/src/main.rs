@@ -10,16 +10,16 @@ mod glass;
 mod icons;
 mod vpn;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::{
+    AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent, Wry,
     menu::{ContextMenu, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent, Wry,
 };
 
-use config::{valid_name, Config};
+use config::{Config, valid_name};
 use glass::PanelEffect;
 use vpn::{Phase, VpnController, VpnState};
 
@@ -33,6 +33,14 @@ const TRAY_ID: &str = "gp-bar";
 /// `NSEvent::mouseLocation` (the icon the user just right-clicked) in screen
 /// coordinates, so the hidden panel window's geometry never enters into it.
 static TRAY_MENU: OnceLock<TrayMenuHandles> = OnceLock::new();
+
+// Per-phase tray icons, rendered once and shared (the supersampled padlock
+// render is pure and cheap, but it runs on every state event otherwise).
+// tauri's image type owns its RGBA buffer, so clones hand out copies.
+static CONNECTED_ICON: LazyLock<tauri::image::Image<'static>> =
+    LazyLock::new(|| icons::padlock_icon(true));
+static OPEN_ICON: LazyLock<tauri::image::Image<'static>> =
+    LazyLock::new(|| icons::padlock_icon(false));
 
 struct TrayMenuHandles {
     menu: Menu<Wry>,
@@ -524,8 +532,10 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         .panel_hidden_at
         .lock()
         .unwrap()
+        // take(): one lock instead of the is_some-then-clear double acquire —
+        // the check and the reset must be one atomic step anyway.
+        .take()
         .is_some_and(|hidden| hidden.elapsed() < Duration::from_millis(250));
-    *state.panel_hidden_at.lock().unwrap() = None;
     if just_hidden {
         log::info!("toggle: ignored (same physical click that hid the panel)");
         return;
@@ -721,7 +731,11 @@ fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
             Phase::Error => "GP Bar — Error",
             Phase::Disconnected => "GP Bar — Disconnected",
         };
-        let image = icons::padlock_icon(connected);
+        let image = if connected {
+            CONNECTED_ICON.clone()
+        } else {
+            OPEN_ICON.clone()
+        };
         let _ = tray.set_icon_with_as_template(Some(image), true);
         let _ = tray.set_tooltip(Some(tooltip));
     }
@@ -898,9 +912,8 @@ fn main() {
             // TRAY_MENU (built below) and is popped up BY HAND instead: nothing
             // for the button to open, so clicks flow to us and the panel keeps
             // taking over.
-            let image = icons::padlock_icon(false);
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
-                .icon(image)
+                .icon(OPEN_ICON.clone())
                 .icon_as_template(true)
                 .tooltip("GP Bar")
                 .on_tray_icon_event(|tray, event| {

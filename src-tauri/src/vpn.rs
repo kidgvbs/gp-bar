@@ -757,11 +757,11 @@ pub async fn active_service_dns() -> (Option<String>, Vec<String>) {
     let Some(interface) = scutil_primary_interface().await else {
         return (None, Vec::new());
     };
-    let order = command_stdout(&["/usr/sbin/networksetup", "-listnetworkserviceorder"]).await;
+    let order = command_stdout("/usr/sbin/networksetup", &["-listnetworkserviceorder"]).await;
     let Some(service) = parse_service_for_device(&order, &interface) else {
         return (None, Vec::new());
     };
-    let dns = command_stdout(&["/usr/sbin/networksetup", "-getdnsservers", &service]).await;
+    let dns = command_stdout("/usr/sbin/networksetup", &["-getdnsservers", &service]).await;
     (Some(service), parse_dns_servers(&dns))
 }
 
@@ -824,9 +824,9 @@ async fn scutil_primary_interface() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn command_stdout(command: &[&str]) -> String {
-    match tokio::process::Command::new(command[0])
-        .args(&command[1..])
+async fn command_stdout(program: &str, args: &[&str]) -> String {
+    match tokio::process::Command::new(program)
+        .args(args)
         .output()
         .await
     {
@@ -995,11 +995,13 @@ mod tests {
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
         // Missing sudoers rule and missing wrapper both mean "run the setup".
         assert!(admin_error_hint(setup, "sudo: a password is required").contains("setup-admin.sh"));
-        assert!(admin_error_hint(
-            setup,
-            "sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found"
-        )
-        .contains("setup-admin.sh"));
+        assert!(
+            admin_error_hint(
+                setup,
+                "sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found"
+            )
+            .contains("setup-admin.sh")
+        );
         // Operational failures pass through untouched.
         assert_eq!(
             admin_error_hint(setup, "gp-admin: the VPN worker did not stop"),

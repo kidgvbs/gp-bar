@@ -82,7 +82,7 @@ fn macos_version_at_least(major: isize) -> bool {
 pub fn apply_liquid_glass(window: &tauri::WebviewWindow) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        use window_vibrancy::{apply_liquid_glass, LiquidGlassOptions, NSGlassEffectViewStyle};
+        use window_vibrancy::{LiquidGlassOptions, NSGlassEffectViewStyle, apply_liquid_glass};
 
         // `with_webview` hands us the platform webview on the main thread;
         // the closure must be `Send + 'static` and outlives the borrowed
