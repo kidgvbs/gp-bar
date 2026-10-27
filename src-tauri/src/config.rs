@@ -70,19 +70,18 @@ impl Config {
             .join("gp-bar")
     }
 
-    pub fn log_dir() -> PathBuf {
-        dirs::home_dir()
-            .expect("the user's home directory must be available")
-            .join("Library")
-            .join("Logs")
-            .join("gp-bar")
-    }
-
     /// The file the connect flow redirects `gpclient` stdout/stderr into.
-    /// It is created by the privileged shell with umask 022, so it stays
-    /// readable by the user and can be tailed live by the panel.
+    ///
+    /// It lives in the root-owned, world-readable `/Library/Logs/gp-bar`
+    /// (created 0755 root:wheel by `setup-admin.sh`): the ROOT worker
+    /// writes it, so it must never sit under a user-writable directory —
+    /// a user symlink there would let any user process truncate system
+    /// files as root (S1). The wrapper recreates the file per attempt
+    /// (0644), which is the tailer's "new attempt" rewind signal; the
+    /// app only ever READS it, as the user. The app's own `panel.log`
+    /// stays under `~/Library/Logs/gp-bar` (written by the app as user).
     pub fn connect_log_path() -> PathBuf {
-        Self::log_dir().join("gpclient-connect.log")
+        PathBuf::from("/Library/Logs/gp-bar/gpclient-connect.log")
     }
 
     pub fn load() -> Config {

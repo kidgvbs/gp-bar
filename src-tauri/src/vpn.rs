@@ -775,7 +775,11 @@ fn parse_service_for_device(output: &str, device: &str) -> Option<String> {
 /// nothing else) to run passwordless. Fixed operations with validated
 /// arguments only — the wrapper file is the security boundary, see
 /// `scripts/gp-admin` (bundled under `Contents/Resources/scripts/`).
-pub const ADMIN_WRAPPER: &str = "/usr/local/lib/gp-bar/admin";
+/// The whole install prefix (wrapper + the gpclient binaries it executes)
+/// is root-owned under /Library/PrivilegedHelperTools — every parent of
+/// that path is system-owned, unlike the old /usr/local/lib location
+/// (which Homebrew chowns to the user on Intel Macs).
+pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
 
 /// Run one admin operation (`selftest`, `start`, `stop`, `cancel`).
 ///
@@ -850,7 +854,7 @@ mod tests {
         assert!(admin_error_hint(setup, "sudo: a password is required").contains("setup-admin.sh"));
         assert!(admin_error_hint(
             setup,
-            "sudo: /usr/local/lib/gp-bar/admin: command not found"
+            "sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found"
         )
         .contains("setup-admin.sh"));
         // Operational failures pass through untouched.
