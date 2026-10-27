@@ -331,8 +331,17 @@ pub struct LockObservation {
 
 pub fn read_lock_observation() -> Option<LockObservation> {
     let raw = fs::read_to_string(LOCK_FILE).ok()?;
-    let pid: u32 = raw.trim().parse().ok()?;
+    let pid = parse_lock_pid(&raw)?;
     if !process_alive(pid) {
+        return None;
+    }
+    // kill(pid, 0) == EPERM only says "a process with this PID exists"; after
+    // a crash without cleanup the PID may be ANY process's (C6). Require the
+    // process to actually be gpclient, else treat the lock as stale.
+    if !process_is_gpclient(pid) {
+        eprintln!(
+            "gp-bar: lock file PID {pid} is not a gpclient process — treating the lock as stale"
+        );
         return None;
     }
     let connected_since = fs::metadata(LOCK_FILE)
@@ -349,6 +358,16 @@ pub fn read_lock_observation() -> Option<LockObservation> {
     })
 }
 
+/// PID from the lock file (`gpclient` writes its own `std::process::id()`).
+/// Parse into a u32 FIRST and bound it to the positive i32 range: a `u32`
+/// cast straight to `libc::pid_t` would wrap negative above `i32::MAX`, and
+/// `kill(-1, 0)` means "every process" — a phantom-alive lock (C6).
+/// Empty or garbage content is treated like a missing PID.
+fn parse_lock_pid(raw: &str) -> Option<u32> {
+    let pid = raw.trim().parse::<u32>().ok()?;
+    (pid > 0 && pid <= i32::MAX as u32).then_some(pid)
+}
+
 /// `kill(pid, 0)` sends no signal: it only probes existence, and needs no
 /// fork/exec (the old `ps -p` spawned a subprocess every poll tick). When the
 /// probe fails with EPERM the process exists but belongs to root — our worker.
@@ -360,6 +379,39 @@ fn process_alive(pid: u32) -> bool {
     // check; it never delivers a signal.
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
     ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether the process behind `pid` is actually a `gpclient` binary — the
+/// best identity check available without privileges (C6). `kill(pid, 0)`
+/// returning EPERM only proves that SOME process owns the PID; after a
+/// crash without cleanup the PID may have been reused by anything, and the
+/// app would show Connected forever. `proc_pidpath` (libproc, unprivileged)
+/// reports the executable path of the process: compare its basename against
+/// the worker's binary name (setup-admin.sh copies gpclient to
+/// `$PREFIX/bin/gpclient`, so the name is stable regardless of install).
+#[cfg(target_os = "macos")]
+fn process_is_gpclient(pid: u32) -> bool {
+    // SAFETY: proc_pidpath writes at most `buffersize` bytes into `buffer`
+    // and only reads the integer `pid`; both come from here.
+    extern "C" {
+        fn proc_pidpath(pid: libc::pid_t, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+    let mut buffer = [0u8; 4096];
+    let len = unsafe { proc_pidpath(pid as libc::pid_t, buffer.as_mut_ptr(), buffer.len() as u32) };
+    if len <= 0 {
+        // Dead PID, or not permitted: cannot confirm, do not trust.
+        return false;
+    }
+    let path = std::str::from_utf8(&buffer[..len as usize])
+        .ok()
+        .map(Path::new);
+    path.is_some_and(|path| path.file_name().is_some_and(|name| name == "gpclient"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_is_gpclient(_pid: u32) -> bool {
+    // No proc_pidpath off macOS: keep the kill(pid, 0) semantics only.
+    true
 }
 
 // -- background tasks ---------------------------------------------------------
@@ -439,7 +491,10 @@ pub fn spawn_log_tailer(app: AppHandle, controller: Arc<VpnController>) {
     tauri::async_runtime::spawn(async move {
         let path = Config::connect_log_path();
         let mut offset: u64 = 0;
-        let mut buffer = String::new();
+        // BYTE buffer, never a String: a multibyte UTF-8 character split
+        // across two reads must not become two U+FFFD (R3). Only complete
+        // lines are decoded, inside `drain_complete_lines`.
+        let mut buffer: Vec<u8> = Vec::new();
         loop {
             // The connect flow truncates the file with `>` before gpclient starts,
             // so a shrink means a new connection attempt: rewind to the start.
@@ -457,12 +512,37 @@ pub fn spawn_log_tailer(app: AppHandle, controller: Arc<VpnController>) {
     });
 }
 
+/// Split complete lines off the byte buffer, decoding each one
+/// individually. Splitting on `b'\n'` is UTF-8-safe: no multibyte sequence
+/// contains a 0x0A byte, so a line boundary can never cut a character.
+/// Incomplete trailing bytes stay buffered for the next chunk; a line with
+/// invalid bytes (corrupt log, a partial write made visible by the
+/// truncate-rewind race) is decoded lossily — at most one U+FFFD per line.
+fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        let raw: Vec<u8> = buffer.drain(..=pos).collect();
+        let line = match String::from_utf8(raw) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("gp-bar: invalid UTF-8 in a connect log line: {error}");
+                String::from_utf8_lossy(error.as_bytes()).into_owned()
+            }
+        };
+        let line = line.trim_end_matches(['\n', '\r']);
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
 /// Read everything past `offset` that forms complete lines, emit them, and
 /// return the new offset.
 async fn tail_chunk(
     path: &Path,
     offset: u64,
-    buffer: &mut String,
+    buffer: &mut Vec<u8>,
     app: &AppHandle,
     controller: &VpnController,
 ) -> u64 {
@@ -480,16 +560,10 @@ async fn tail_chunk(
         return offset;
     }
     let mut new_offset = offset + chunk.len() as u64;
-    buffer.push_str(&String::from_utf8_lossy(&chunk));
+    buffer.extend_from_slice(&chunk);
 
-    // Emit every complete line; keep any trailing partial line in the buffer.
-    while let Some(pos) = buffer.find('\n') {
-        let line: String = buffer.drain(..=pos).collect();
-        let line = line.trim_end_matches(['\n', '\r']);
-        if line.is_empty() {
-            continue;
-        }
-        emit_log_line(app, controller, line);
+    for line in drain_complete_lines(buffer) {
+        emit_log_line(app, controller, &line);
     }
     // Guard: never grow the buffer unboundedly if gpclient never prints a newline.
     if buffer.len() > 1 << 20 {
@@ -646,6 +720,13 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
     let Some(ctx) = app.try_state::<crate::AppContext>() else {
         return;
     };
+    // Same charset the wrapper and `select_gateway` enforce (R4): a name
+    // harvested straight from the log must not reach the picker if the
+    // wrapper would refuse it (the picker would offer a dead entry).
+    if !crate::config::valid_name(gateway) {
+        eprintln!("gp-bar: skipping harvested gateway {gateway:?}: invalid name");
+        return;
+    }
     let (cfg, changed) = {
         let mut cfg = ctx.config.lock().unwrap();
         let changed = !cfg.gateways.iter().any(|g| g == gateway);
@@ -790,14 +871,32 @@ pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
 /// turned out to be impossible: `pam_tid` falls back to the password for
 /// any process that is not an interactive terminal, verified empirically
 /// — see RECAP.md).
+/// How long to wait for one privileged helper operation before giving up
+/// and reporting a timeout (R2). 30 s is far above every healthy op (start
+/// ≈1 s, stop waits on the worker's 60 s SIGTERM grace — a stop that long
+/// means a stuck `gpclient disconnect`, exactly what must not hang the UI
+/// forever); short enough that the "Disconnecting…" state resolves within
+/// half a minute instead of never.
+const ADMIN_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn run_admin(op: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("/usr/bin/sudo")
+    // LC_ALL/LANG=C: sudo and the wrapper run with stable, non-localized
+    // error strings, which `admin_error_hint` matches on (R5).
+    let fut = Command::new("/usr/bin/sudo")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         .arg("-n")
         .arg(ADMIN_WRAPPER)
         .arg(op)
         .args(args)
-        .output()
+        // Reap the child if this future is dropped by the timeout below:
+        // a hung `gpclient disconnect` must not survive as a stray root
+        // process (sudo forwards nothing here; the worker is launchd's).
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(ADMIN_OP_TIMEOUT, fut)
         .await
+        .map_err(|_| format!("admin op '{op}' timed out"))?
         .map_err(|e| format!("sudo failed to run: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -822,11 +921,21 @@ pub fn setup_script_path(app: &AppHandle) -> PathBuf {
 /// Map sudo/wrapper failures to the one-time setup hint when the helper is
 /// not installed; operational failures pass through unchanged.
 pub fn admin_error_hint(setup_script: &Path, error: &str) -> String {
-    if error.contains("a password is required") || error.contains("command not found") {
+    // Locale-independent fast path (R5): no wrapper file means the setup is
+    // missing, whatever the exact sudo/OS error string says. sudo's stderr
+    // is forced to LC_ALL=C by `run_admin`, so the string matches below are
+    // stable, but the existence check works even without them.
+    let hint = || {
         format!(
             "The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '{}'",
             setup_script.display()
         )
+    };
+    if !Path::new(ADMIN_WRAPPER).exists()
+        || error.contains("a password is required")
+        || error.contains("command not found")
+    {
+        hint()
     } else {
         error.to_string()
     }
@@ -1084,6 +1193,79 @@ mod tests {
         }
         apply_lock(&mut controller.inner.lock().unwrap(), None);
         assert!(!controller.connecting_worker_started());
+    }
+
+    #[test]
+    fn splits_lines_on_bytes_without_breaking_utf8_across_reads() {
+        // R3: the two halves of a multibyte character arrive in separate
+        // reads. The byte buffer must hold the first half and reassemble
+        // the character, not emit two U+FFFD.
+        let mut buffer = Vec::new();
+        // "café" with é split across the chunk boundary: no line complete yet.
+        buffer.extend_from_slice(b"caf");
+        assert!(drain_complete_lines(&mut buffer).is_empty());
+        buffer.extend_from_slice(b"\xc3\xa9\n");
+        assert_eq!(
+            drain_complete_lines(&mut buffer),
+            vec!["caf\u{e9}".to_string()]
+        );
+        assert_eq!(buffer, Vec::<u8>::new());
+
+        // Multiple complete lines at once, plus a trailing partial one that
+        // stays buffered for the next read; CRLF endings are cleaned and
+        // empty lines skipped like before.
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"one\r\nplain text\n\npartial");
+        assert_eq!(
+            drain_complete_lines(&mut buffer),
+            vec!["one".to_string(), "plain text".to_string()]
+        );
+        assert_eq!(buffer, b"partial".to_vec());
+
+        // A second multibyte split, completing in the NEXT chunk: the full
+        // character's bytes (東, U+6771 = e6 9d b1) split from its newline.
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"gateway \xe6\x9d");
+        assert!(drain_complete_lines(&mut buffer).is_empty());
+        buffer.extend_from_slice(b"\xb1\n");
+        assert_eq!(
+            drain_complete_lines(&mut buffer),
+            vec!["gateway \u{6771}".to_string()]
+        );
+
+        // An invalid line (a truncated write made visible) decodes lossily —
+        // one U+FFFD per bad byte at most, never a panic.
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"bad \xff\xfe\n");
+        assert_eq!(
+            drain_complete_lines(&mut buffer),
+            vec!["bad \u{fffd}\u{fffd}".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_lock_pids_within_the_positive_i32_range() {
+        // C6: values above i32::MAX must not wrap negative through `as`
+        // (kill(-1, 0) = "every process" = phantom alive).
+        assert_eq!(parse_lock_pid("4242\n"), Some(4242));
+        assert_eq!(parse_lock_pid("  4242  "), Some(4242));
+        assert_eq!(parse_lock_pid("0"), None);
+        assert_eq!(parse_lock_pid("2147483648"), None);
+        assert_eq!(parse_lock_pid("4294967295"), None);
+        assert_eq!(parse_lock_pid("99999999999999"), None);
+        // Empty or garbage lock content is stale-removable, never alive.
+        assert_eq!(parse_lock_pid(""), None);
+        assert_eq!(parse_lock_pid("not a pid"), None);
+        assert_eq!(parse_lock_pid("-1"), None);
+    }
+
+    #[test]
+    fn admin_timeout_errors_reach_the_setup_hint_unchanged() {
+        // R2/R5: the timeout string is an operational failure, not a setup
+        // one — it must pass through and be surfaced by the caller.
+        let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
+        let error = "admin op 'stop' timed out";
+        assert_eq!(admin_error_hint(setup, error), error);
     }
 
     #[test]

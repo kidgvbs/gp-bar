@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub portals: Vec<String>,
     pub selected: Option<String>,
@@ -45,6 +45,22 @@ pub struct Config {
 
 fn default_true() -> bool {
     true
+}
+
+/// Shared charset for every name that reaches the privileged wrapper
+/// (portals and gateways): ASCII letters, digits, dots, dashes and
+/// underscores. A LEADING DASH is rejected on purpose: gpclient's option
+/// parser would read it as an option (argument injection), and `-`
+/// collides with the wrapper's "auto-gateway" sentinel argument. This is
+/// the app-side twin of `valid_name` in scripts/gp-admin; every path that
+/// inserts a name into the config (manual adds AND log harvesting) must
+/// go through it, or the picker would offer names the wrapper rejects.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
 }
 
 impl Default for Config {
@@ -85,25 +101,58 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        let path = Self::config_dir().join("config.json");
+        Self::load_from(&Self::config_dir())
+    }
+
+    /// A missing config (first run) is the normal default; anything else —
+    /// permissions, I/O — is reported but must never panic a menu-bar app.
+    /// A parse error means the file is corrupt (e.g. a crash mid-write): it
+    /// is renamed aside so the next `save()` cannot silently overwrite the
+    /// user's portals and gateways with the defaults.
+    fn load_from(dir: &Path) -> Config {
+        let path = dir.join("config.json");
         match fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
-                eprintln!(
-                    "gp-bar: ignoring invalid config {}: {error}",
-                    path.display()
-                );
+                let corrupt = path.with_extension("json.corrupt");
+                match fs::rename(&path, &corrupt) {
+                    Ok(()) => eprintln!(
+                        "gp-bar: config {} is not valid JSON ({error}); kept as {}",
+                        path.display(),
+                        corrupt.display()
+                    ),
+                    Err(rename_error) => eprintln!(
+                        "gp-bar: config {} is not valid JSON ({error}); cannot keep it aside: {rename_error}",
+                        path.display()
+                    ),
+                }
                 Config::default()
             }),
-            Err(_) => Config::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(error) => {
+                eprintln!("gp-bar: cannot read config {}: {error}", path.display());
+                Config::default()
+            }
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let dir = Self::config_dir();
-        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
+        self.save_to(&Self::config_dir())
+    }
+
+    /// Write temp + fsync + rename: `fs::write` truncates before writing, so
+    /// a crash or a full disk mid-write would leave a truncated `config.json`
+    /// that the next `save()` would overwrite with the defaults. The rename
+    /// is atomic on the same filesystem.
+    fn save_to(&self, dir: &Path) -> Result<(), String> {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let path = dir.join("config.json");
-        let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(path, raw).map_err(|e| e.to_string())
+        let tmp = dir.join("config.json.tmp");
+        let mut file =
+            fs::File::create(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        serde_json::to_writer_pretty(&mut file, self).map_err(|e| e.to_string())?;
+        file.sync_all()
+            .map_err(|e| format!("cannot sync {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("cannot rename to {}: {e}", path.display()))
     }
 
     /// Resolve the gpclient executable, preferring the configured path.
@@ -126,5 +175,75 @@ impl Config {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("gp-bar-config-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let dir = temp_dir("roundtrip");
+        let mut cfg = Config::default();
+        cfg.portals.push("vpn-2.example.com".to_string());
+        cfg.gateways.push("gw-1".to_string());
+        cfg.selected_gateway = Some("gw-1".to_string());
+        cfg.save_to(&dir).unwrap();
+        let loaded = Config::load_from(&dir);
+        assert_eq!(loaded.portals, cfg.portals);
+        assert_eq!(loaded.gateways, cfg.gateways);
+        assert_eq!(loaded.selected_gateway, Some("gw-1".to_string()));
+        // The atomic save leaves no temp file behind.
+        assert!(!dir.join("config.json.tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_config_is_kept_aside_and_defaults_are_served() {
+        let dir = temp_dir("corrupt");
+        fs::write(dir.join("config.json"), r#"{"portals": ["trunc"#).unwrap();
+        let cfg = Config::load_from(&dir);
+        assert_eq!(cfg, Config::default());
+        // The user's data is not lost: it survives beside the fresh defaults.
+        assert!(dir.join("config.json.corrupt").exists());
+        assert!(!dir.join("config.json").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_config_is_the_plain_default() {
+        let dir = temp_dir("missing");
+        let cfg = Config::load_from(&dir);
+        assert_eq!(cfg, Config::default());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_match_the_wrapper_charset() {
+        // Same contract as valid_name in scripts/gp-admin.
+        for name in ["vpn.example.com", "vpn-1", "gw_2", "a", "10.0.0.1.x"] {
+            assert!(valid_name(name), "{name:?} should be valid");
+        }
+        for name in [
+            "",
+            "-",
+            "--ignore-tls-errors",
+            "-auto",
+            "space name",
+            "vpn/example",
+            "https://vpn.example.com",
+            "café",
+        ] {
+            assert!(!valid_name(name), "{name:?} should be rejected");
+        }
     }
 }

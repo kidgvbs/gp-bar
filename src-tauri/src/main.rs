@@ -22,7 +22,7 @@ use tauri::{
     AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent, Wry,
 };
 
-use config::Config;
+use config::{valid_name, Config};
 use glass::PanelEffect;
 use vpn::{Phase, VpnController, VpnState};
 
@@ -106,15 +106,19 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
                 .to_string(),
         );
     }
+    // Mutate a clone, save the clone, and commit to the live config only on
+    // success: a failed save must not leave memory diverged from disk (R4).
     let selected = {
         let mut cfg = state.config.lock().unwrap();
-        if !cfg.portals.contains(&portal) {
-            cfg.portals.push(portal.clone());
+        let mut next = cfg.clone();
+        if !next.portals.contains(&portal) {
+            next.portals.push(portal.clone());
         }
-        if cfg.selected.is_none() {
-            cfg.selected = Some(portal);
+        if next.selected.is_none() {
+            next.selected = Some(portal);
         }
-        cfg.save()?;
+        next.save()?;
+        *cfg = next;
         cfg.selected.clone()
     };
     state.controller.note_selected_portal(&app, selected);
@@ -129,11 +133,14 @@ fn remove_portal(
 ) -> Result<(), String> {
     let selected = {
         let mut cfg = state.config.lock().unwrap();
-        cfg.portals.retain(|p| p != &portal);
-        if cfg.selected.as_deref() == Some(portal.as_str()) {
-            cfg.selected = cfg.portals.first().cloned();
+        // Clone-save-commit (see add_portal): no divergence on save failure.
+        let mut next = cfg.clone();
+        next.portals.retain(|p| p != &portal);
+        if next.selected.as_deref() == Some(portal.as_str()) {
+            next.selected = next.portals.first().cloned();
         }
-        cfg.save()?;
+        next.save()?;
+        *cfg = next;
         cfg.selected.clone()
     };
     state.controller.note_selected_portal(&app, selected);
@@ -148,10 +155,15 @@ fn select_portal(
 ) -> Result<(), String> {
     let selected = {
         let mut cfg = state.config.lock().unwrap();
-        if cfg.portals.contains(&portal) {
-            cfg.selected = Some(portal);
+        // An unknown portal must fail loud — not silently re-save and Ok.
+        if !cfg.portals.contains(&portal) {
+            return Err(format!("unknown portal: {portal}"));
         }
-        cfg.save()?;
+        // Clone-save-commit (see add_portal): no divergence on save failure.
+        let mut next = cfg.clone();
+        next.selected = Some(portal);
+        next.save()?;
+        *cfg = next;
         cfg.selected.clone()
     };
     state.controller.note_selected_portal(&app, selected);
@@ -161,8 +173,12 @@ fn select_portal(
 #[tauri::command]
 fn set_reuse_cookie(state: State<'_, AppContext>, value: bool) -> Result<(), String> {
     let mut cfg = state.config.lock().unwrap();
-    cfg.reuse_cookie = value;
-    cfg.save()
+    // Clone-save-commit (see add_portal): no divergence on save failure.
+    let mut next = cfg.clone();
+    next.reuse_cookie = value;
+    next.save()?;
+    *cfg = next;
+    Ok(())
 }
 
 #[tauri::command]
@@ -206,24 +222,6 @@ fn quit(app: AppHandle) {
 
 // -- gateway selection -----------------------------------------------------------
 
-/// Shared charset for every name that reaches the privileged wrapper
-/// (portals and gateways): ASCII letters, digits, dots, dashes and
-/// underscores. A LEADING DASH is rejected on purpose: gpclient's option
-/// parser would read it as an option (argument injection, S4), and `-`
-/// collides with the wrapper's "auto-gateway" sentinel argument.
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('-')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
-}
-
-/// Same charset the wrapper enforces (the name lands in the job plist).
-fn valid_gateway_name(name: &str) -> bool {
-    valid_name(name)
-}
-
 /// The C4 contract: the panel's explicit pick (what the tray menu now
 /// forwards as `selected_gateway`) wins over the preferred gateway, and
 /// None + None defers to gpclient's own auto-gateway order.
@@ -261,23 +259,26 @@ fn select_gateway(
 ) -> Result<(), String> {
     let cfg = {
         let mut cfg = state.config.lock().unwrap();
+        // Clone-save-commit (see add_portal): no divergence on save failure.
+        let mut next = cfg.clone();
         match gateway.as_deref() {
             // null = "Auto": back to auto-gateway (preferred still applies).
-            None => cfg.selected_gateway = None,
+            None => next.selected_gateway = None,
             Some(name) => {
-                if !valid_gateway_name(name) {
+                if !valid_name(name) {
                     return Err(
                         "Gateway may only contain letters, digits, dots, dashes and underscores"
                             .to_string(),
                     );
                 }
-                if !cfg.gateways.iter().any(|g| g == name) {
+                if !next.gateways.iter().any(|g| g == name) {
                     return Err("Unknown gateway".to_string());
                 }
-                cfg.selected_gateway = Some(name.to_string());
+                next.selected_gateway = Some(name.to_string());
             }
         }
-        cfg.save()?;
+        next.save()?;
+        *cfg = next;
         cfg.clone()
         // Guard dropped before emitting (deadlock discipline, see vpn::update).
     };
@@ -293,19 +294,22 @@ fn set_preferred_gateway(
 ) -> Result<(), String> {
     let cfg = {
         let mut cfg = state.config.lock().unwrap();
+        // Clone-save-commit (see add_portal): no divergence on save failure.
+        let mut next = cfg.clone();
         match gateway.as_deref() {
-            None => cfg.preferred_gateway = None,
+            None => next.preferred_gateway = None,
             Some(name) => {
-                if !valid_gateway_name(name) {
+                if !valid_name(name) {
                     return Err("Invalid gateway name".to_string());
                 }
-                if !cfg.gateways.iter().any(|g| g == name) {
+                if !next.gateways.iter().any(|g| g == name) {
                     return Err("Unknown gateway".to_string());
                 }
-                cfg.preferred_gateway = Some(name.to_string());
+                next.preferred_gateway = Some(name.to_string());
             }
         }
-        cfg.save()?;
+        next.save()?;
+        *cfg = next;
         cfg.clone()
     };
     broadcast_config(&app, &cfg);
@@ -320,14 +324,17 @@ fn remove_gateway(
 ) -> Result<(), String> {
     let cfg = {
         let mut cfg = state.config.lock().unwrap();
-        cfg.gateways.retain(|g| g != &name);
-        if cfg.preferred_gateway.as_deref() == Some(name.as_str()) {
-            cfg.preferred_gateway = None;
+        // Clone-save-commit (see add_portal): no divergence on save failure.
+        let mut next = cfg.clone();
+        next.gateways.retain(|g| g != &name);
+        if next.preferred_gateway.as_deref() == Some(name.as_str()) {
+            next.preferred_gateway = None;
         }
-        if cfg.selected_gateway.as_deref() == Some(name.as_str()) {
-            cfg.selected_gateway = None;
+        if next.selected_gateway.as_deref() == Some(name.as_str()) {
+            next.selected_gateway = None;
         }
-        cfg.save()?;
+        next.save()?;
+        *cfg = next;
         cfg.clone()
     };
     broadcast_config(&app, &cfg);
@@ -344,17 +351,20 @@ fn remove_gateway(
 #[tauri::command]
 fn add_gateway(app: AppHandle, state: State<'_, AppContext>, name: String) -> Result<(), String> {
     let name = name.trim().to_string();
-    if !valid_gateway_name(&name) {
+    if !valid_name(&name) {
         return Err(
             "Gateway may only contain letters, digits, dots, dashes and underscores".to_string(),
         );
     }
     let cfg = {
         let mut cfg = state.config.lock().unwrap();
-        if !cfg.gateways.iter().any(|g| g == &name) {
-            cfg.gateways.push(name.clone());
-            cfg.save()?;
+        // Clone-save-commit (see add_portal): no divergence on save failure.
+        let mut next = cfg.clone();
+        if !next.gateways.iter().any(|g| g == &name) {
+            next.gateways.push(name.clone());
+            next.save()?;
         }
+        *cfg = next;
         cfg.clone()
         // Guard dropped before emitting (deadlock discipline, see vpn::update).
     };
@@ -415,7 +425,7 @@ async fn do_connect(
         state.config.lock().unwrap().preferred_gateway.clone(),
     );
     if let Some(name) = &resolved_gateway {
-        if !valid_gateway_name(name) {
+        if !valid_name(name) {
             return Err("Invalid gateway name".to_string());
         }
     }
@@ -1122,33 +1132,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_connect_gateway, tray_reconnect_armed, valid_name};
-
-    #[test]
-    fn accepts_plain_hostnames() {
-        for name in ["vpn.example.com", "vpn-1", "gw_2", "a", "10.0.0.1.x"] {
-            assert!(valid_name(name), "{name:?} should be valid");
-        }
-    }
-
-    #[test]
-    fn rejects_leading_dash_option_injection_and_bad_charset() {
-        // S4: a leading '-' would be read as an option by gpclient's
-        // parser, and '-' collides with the wrapper's auto-gateway
-        // sentinel.
-        for name in [
-            "",
-            "-",
-            "--ignore-tls-errors",
-            "-auto",
-            "space name",
-            "vpn/example",
-            "https://vpn.example.com",
-            "café",
-        ] {
-            assert!(!valid_name(name), "{name:?} should be rejected");
-        }
-    }
+    use super::{resolve_connect_gateway, tray_reconnect_armed};
+    // `valid_name` (the wrapper charset) is tested in config::tests.
 
     /// The C4 contract: the panel's explicit pick (what the tray menu now
     /// forwards as `selected_gateway`) wins over the preferred gateway, and
