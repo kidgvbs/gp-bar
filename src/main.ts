@@ -14,17 +14,23 @@ interface VpnState {
   last_error: string | null;
 }
 
+// Mirrors src-tauri/src/config.rs `Config` field-for-field (frontend and
+// backend ship in one bundle: no tolerances for missing fields).
 interface PortalsConfig {
   portals: string[];
   selected: string | null;
   reuse_cookie: boolean;
-  gpclient_path: string;
+  gpclient_path: string | null;
   // Gateway contract with the backend: the known gateway names (harvested
   // from connect logs), the user's favorite (used when the picker selection
   // is "Automatic"), and the explicit picker choice (null = "Automatic").
   gateways: string[];
   preferred_gateway: string | null;
   selected_gateway: string | null;
+  // Reverse display map: gateway FQDN → picker name (see config.rs).
+  gateway_hosts: Record<string, string>;
+  // null = auto: native glass backdrop where available, CSS vibrancy below.
+  liquid_glass: boolean | null;
 }
 
 // get_network_health(): stale=true when the VPN is DOWN but the active
@@ -63,6 +69,7 @@ const dnsBanner = document.getElementById("dns-banner")!;
 const dnsBannerText = document.getElementById("dns-banner-text")!;
 const dnsRepair = document.getElementById("dns-repair") as HTMLButtonElement;
 const dnsResult = document.getElementById("dns-result")!;
+const cmdError = document.getElementById("cmd-error")!;
 const cookieCache = document.getElementById("cookie-cache") as HTMLInputElement;
 const actionBtn = document.getElementById("action-btn") as HTMLButtonElement;
 const logEl = document.getElementById("log")!;
@@ -84,12 +91,9 @@ const fullHeight = winInner.height / winScale;
 // Panel backdrop: on macOS 26+ the backend installs a native NSGlassEffectView
 // behind the webview (see src-tauri/src/glass.rs); the body then drops its own
 // CSS blur/tint (kept stronger otherwise, see panel.css) so the glass shows
-// through. Tolerate a backend without the command: keep the CSS backdrop.
-try {
-  const effect = await invoke<string>("get_panel_effect");
-  if (effect === "liquid-glass") document.body.classList.add("liquid-glass");
-} catch {
-  // Older backend build: CSS vibrancy stays.
+// through.
+if ((await invoke<string>("get_panel_effect")) === "liquid-glass") {
+  document.body.classList.add("liquid-glass");
 }
 
 function collapsedHeight(): number {
@@ -142,6 +146,42 @@ let removeConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 let networkHealth: NetworkHealth | null = null;
 let dnsResultTimer: ReturnType<typeof setTimeout> | undefined;
 
+// -- inline command errors -----------------------------------------------------
+// A rejected `invoke` (invalid portal name, connect refused mid-teardown…)
+// must be visible in the panel: a native alert() would steal focus and
+// dismiss the popover. One shared red line, auto-hidden after 6 s.
+let cmdErrorTimer: ReturnType<typeof setTimeout> | undefined;
+
+function showCmdError(message: string) {
+  cmdError.textContent = message;
+  cmdError.classList.remove("hidden");
+  clearTimeout(cmdErrorTimer);
+  cmdErrorTimer = setTimeout(() => {
+    cmdError.classList.add("hidden");
+    syncWindowSize();
+  }, 6000);
+  syncWindowSize();
+}
+
+function clearCmdError() {
+  clearTimeout(cmdErrorTimer);
+  cmdError.classList.add("hidden");
+}
+
+// -- action button in-flight guard ----------------------------------------------
+// The action button changes meaning with the phase: a fast double click would
+// send `connect` and then — once the Connecting event arrives — `cancel`.
+// While an invoke is in flight the button stays disabled; render() keeps the
+// guard into account so a vpn-state event cannot re-enable it mid-flight.
+let opInFlight = false;
+// Last rendered state: re-applied when an invoke settles, so the button is
+// re-enabled only after the state render that follows the invoke.
+let lastState: VpnState | null = null;
+
+function setActionDisabled(disabled: boolean) {
+  actionBtn.disabled = opInFlight || disabled;
+}
+
 function appendLog(event: LogEvent) {
   const line = `${event.level.padEnd(5)} ${event.message}`;
   logLines.push(line);
@@ -169,6 +209,7 @@ function tickDuration() {
 
 function render(state: VpnState) {
   currentPhase = state.phase;
+  lastState = state;
   connectedSince = state.connected_since_epoch_secs;
   connectedGateway = state.gateway ?? null;
   statusDot.className = "status-dot " + state.phase.toLowerCase();
@@ -186,31 +227,31 @@ function render(state: VpnState) {
       } else {
         actionBtn.textContent = "Disconnect";
       }
-      actionBtn.disabled = false;
+      setActionDisabled(false);
       break;
     case "Connecting":
       stateLabel.textContent = "Connecting…";
       stateDetail.textContent = state.portal ?? "";
       actionBtn.textContent = "Cancel";
-      actionBtn.disabled = false;
+      setActionDisabled(false);
       break;
     case "Disconnecting":
       stateLabel.textContent = "Disconnecting…";
       stateDetail.textContent = state.portal ?? "";
       actionBtn.textContent = "Disconnecting…";
-      actionBtn.disabled = true;
+      setActionDisabled(true);
       break;
     case "Error":
       stateLabel.textContent = "Error";
       stateDetail.textContent = state.last_error ?? "Something went wrong";
       actionBtn.textContent = "Connect";
-      actionBtn.disabled = false;
+      setActionDisabled(false);
       break;
     default:
       stateLabel.textContent = "Disconnected";
       stateDetail.textContent = state.portal ? `${state.portal} ready` : "Add a portal to get started";
       actionBtn.textContent = "Connect";
-      actionBtn.disabled = state.portal === null;
+      setActionDisabled(state.portal === null);
       break;
   }
   tickDuration();
@@ -250,8 +291,14 @@ function renderPortals(config: PortalsConfig) {
     rm.textContent = "−";
     rm.title = "Remove";
     rm.onclick = async () => {
-      await invoke("remove_portal", { portal: p });
-      await refreshPortals();
+      clearCmdError();
+      try {
+        await invoke("remove_portal", { portal: p });
+        await refreshPortals();
+      } catch (error) {
+        showCmdError(String(error));
+        return;
+      }
       syncWindowSize();
     };
     li.appendChild(rm);
@@ -268,10 +315,9 @@ function renderPortals(config: PortalsConfig) {
 // live in the select's tooltip.
 
 function renderGateways(config: PortalsConfig) {
-  // `??` tolerates a backend build that predates the gateway contract.
-  const gateways = config.gateways ?? [];
-  const preferred = config.preferred_gateway ?? null;
-  const selected = config.selected_gateway ?? null;
+  const gateways = config.gateways;
+  const preferred = config.preferred_gateway;
+  const selected = config.selected_gateway;
 
   // Skip no-op rebuilds: `config-updated` can fire mid-connect (gateway
   // harvested from the log) and rebuilding identical options would close an
@@ -345,7 +391,7 @@ function updateGatewayControls() {
 
 // The remove confirmation is inline: a native confirm() steals focus and
 // the popover dismisses on Focused(false) (see main.rs). First click turns
-// the button into "Confermi?" for three seconds, the second click removes.
+// the button into "Confirm?" for three seconds, the second click removes.
 function resetRemoveConfirm() {
   removeArmedFor = null;
   clearTimeout(removeConfirmTimer);
@@ -386,7 +432,7 @@ function updateDnsBanner() {
     dnsBannerText.textContent =
       `VPN DNS settings left behind by a crash (${formatDnsServers(health.servers)}) — restore them?`;
     dnsBanner.title = health.service
-      ? `Il servizio di rete "${health.service}" ha ancora DNS manuali.`
+      ? `Network service "${health.service}" still has manual DNS servers.`
       : "";
   }
   // Visibility flipped: the popover is content-sized with the log collapsed,
@@ -410,8 +456,8 @@ async function refreshNetworkHealth() {
   try {
     networkHealth = await invoke<NetworkHealth>("get_network_health");
   } catch (error) {
-    // Advisory only: if the backend cannot answer (e.g. a build that
-    // predates the network-health commands) keep the banner hidden.
+    // Advisory only: the banner depends on it, a failing health probe
+    // (e.g. scutil error) just keeps it hidden.
     console.warn("get_network_health failed:", error);
     networkHealth = null;
   }
@@ -419,46 +465,74 @@ async function refreshNetworkHealth() {
 }
 
 actionBtn.addEventListener("click", async () => {
-  if (currentPhase === "Connected" && reconnectArmed) {
-    // Gateway switch: tear the tunnel down, then bring it back up through
-    // the newly picked gateway. The disconnect invoke resolves once the
-    // worker is gone, but the backend's phase still flips to Disconnected
-    // via its poller — wait that out before connecting, or do_connect
-    // refuses ("cannot connect while Disconnecting").
-    const gateway = gatewaySelect.value || null;
-    const portal = portalSelect.value;
-    const reuseCookie = cookieCache.checked;
-    await invoke("disconnect");
-    const deadline = Date.now() + 15000;
-    while (Date.now() < deadline) {
-      const state = await invoke<VpnState>("get_state");
-      if (state.phase !== "Disconnecting") break;
-      await new Promise((r) => setTimeout(r, 250));
+  // In-flight guard: a second click (double click, or one landing while the
+  // phase event is still in flight) must not re-enter — it would read the new
+  // phase and send `cancel` right after `connect`.
+  if (opInFlight) return;
+  opInFlight = true;
+  setActionDisabled(true);
+  clearCmdError();
+  try {
+    if (currentPhase === "Connected" && reconnectArmed) {
+      // Gateway switch: tear the tunnel down, then bring it back up through
+      // the newly picked gateway. The disconnect invoke resolves once the
+      // worker is gone, but the backend's phase still flips to Disconnected
+      // via its poller — wait that out before connecting, or do_connect
+      // refuses ("cannot connect while Disconnecting").
+      const gateway = gatewaySelect.value || null;
+      const portal = portalSelect.value;
+      const reuseCookie = cookieCache.checked;
+      await invoke("disconnect");
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        const state = await invoke<VpnState>("get_state");
+        if (state.phase !== "Disconnecting") break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      await invoke("connect", { portal, reuseCookie, gateway });
+    } else if (currentPhase === "Connected" || currentPhase === "Disconnecting") {
+      await invoke("disconnect");
+    } else if (currentPhase === "Connecting") {
+      await invoke("cancel");
+    } else {
+      // Third argument per the gateway contract: null ("Automatic") lets the
+      // backend resolve the preferred gateway, a name forces it.
+      await invoke("connect", {
+        portal: portalSelect.value,
+        reuseCookie: cookieCache.checked,
+        gateway: gatewaySelect.value || null,
+      });
     }
-    await invoke("connect", { portal, reuseCookie, gateway });
-  } else if (currentPhase === "Connected" || currentPhase === "Disconnecting") {
-    await invoke("disconnect");
-  } else if (currentPhase === "Connecting") {
-    await invoke("cancel");
-  } else {
-    // Third argument per the gateway contract: null ("Automatic") lets the
-    // backend resolve the preferred gateway, a name forces it.
-    await invoke("connect", {
-      portal: portalSelect.value,
-      reuseCookie: cookieCache.checked,
-      gateway: gatewaySelect.value || null,
-    });
+  } catch (error) {
+    showCmdError(String(error));
+  } finally {
+    // Re-enable only after the state render that follows the invoke: if the
+    // backend already emitted a vpn-state event it re-rendered with the
+    // guard held; re-apply the last rendered state either way.
+    opInFlight = false;
+    if (lastState) render(lastState);
   }
 });
 
 portalSelect.addEventListener("change", async () => {
-  await invoke("select_portal", { portal: portalSelect.value });
+  clearCmdError();
+  try {
+    await invoke("select_portal", { portal: portalSelect.value });
+  } catch (error) {
+    showCmdError(String(error));
+  }
 });
 
 gatewaySelect.addEventListener("change", async () => {
   resetRemoveConfirm();
   // Empty value ("Automatic") = null: no explicit gateway selection.
-  await invoke("select_gateway", { gateway: gatewaySelect.value || null });
+  clearCmdError();
+  try {
+    await invoke("select_gateway", { gateway: gatewaySelect.value || null });
+  } catch (error) {
+    showCmdError(String(error));
+    return;
+  }
   // While connected, a pick that differs from the live tunnel arms a
   // Reconnect ("Automatic" resolves to the preferred gateway here, per
   // the backend's connect resolution). Re-picking the live gateway
@@ -478,9 +552,15 @@ gatewayPrefer.addEventListener("click", async () => {
   if (!name) return; // "Automatic": the star is disabled there
   // Toggle: starring the already-preferred gateway clears it — that is the
   // documented way to remove a preferred gateway.
-  await invoke("set_preferred_gateway", {
-    gateway: name === preferredGateway ? null : name,
-  });
+  clearCmdError();
+  try {
+    await invoke("set_preferred_gateway", {
+      gateway: name === preferredGateway ? null : name,
+    });
+  } catch (error) {
+    showCmdError(String(error));
+    return;
+  }
   await refreshPortals();
 });
 
@@ -498,7 +578,13 @@ gatewayRemove.addEventListener("click", async () => {
   resetRemoveConfirm();
   // If the removed gateway was the preferred and/or selected one the backend
   // zeroes those fields; the refreshed config re-renders the row.
-  await invoke("remove_gateway", { name });
+  clearCmdError();
+  try {
+    await invoke("remove_gateway", { name });
+  } catch (error) {
+    showCmdError(String(error));
+    return;
+  }
   await refreshPortals();
 });
 
@@ -508,7 +594,7 @@ dnsRepair.addEventListener("click", async () => {
   try {
     // repair_network runs the root helper and returns an outcome message.
     const message = await invoke<string>("repair_network");
-    showDnsResult(message || "DNS ripristinati", false);
+    showDnsResult(message || "DNS restored", false);
   } catch (error) {
     showDnsResult(String(error), true);
   } finally {
@@ -519,7 +605,12 @@ dnsRepair.addEventListener("click", async () => {
 });
 
 cookieCache.addEventListener("change", async () => {
-  await invoke("set_reuse_cookie", { value: cookieCache.checked });
+  clearCmdError();
+  try {
+    await invoke("set_reuse_cookie", { value: cookieCache.checked });
+  } catch (error) {
+    showCmdError(String(error));
+  }
 });
 
 portalEdit.addEventListener("click", () => {
@@ -533,7 +624,14 @@ portalEdit.addEventListener("click", () => {
 portalAdd.addEventListener("click", async () => {
   const value = portalInput.value.trim();
   if (!value) return;
-  await invoke("add_portal", { portal: value });
+  clearCmdError();
+  try {
+    await invoke("add_portal", { portal: value });
+  } catch (error) {
+    // e.g. "https://vpn.example.com": add_portal rejects ':' and '/'.
+    showCmdError(String(error));
+    return;
+  }
   portalInput.value = "";
   await refreshPortals();
   // The refreshed portal list may grow (new <li>): refit here too.
@@ -545,6 +643,7 @@ portalAdd.addEventListener("click", async () => {
 gatewayAddBtn.addEventListener("click", async () => {
   const value = gatewayInput.value.trim();
   if (!value) return;
+  clearCmdError();
   try {
     await invoke("add_gateway", { name: value });
     gatewayInput.value = "";

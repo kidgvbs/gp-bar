@@ -64,6 +64,11 @@
           </div>
         </div>
 
+        <!-- Inline error line for failed commands (add/remove, connect,
+             gateway/portal selection): never a native dialog — it would
+             steal focus and dismiss the popover. -->
+        <div id="cmd-error" class="cmd-error hidden"></div>
+
         <button id="action-btn" class="btn primary">Connect</button>
       </section>
 
