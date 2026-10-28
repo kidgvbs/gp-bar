@@ -339,28 +339,46 @@ async fn reconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), A
 }
 
 #[tauri::command]
-async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
+async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), ActionError> {
     let controller = state.controller.clone();
-    // Serialized with the start this very cancel is racing (see ADMIN_OPS):
+    // Gate first, transitionless: only a Connecting phase has an attempt
+    // to cancel — anything else refuses with the phase. (The frontend
+    // only offers Cancel while Connecting; the command itself stays
+    // honest about it instead of tearing down a live tunnel.)
+    let attempt = controller
+        .try_begin_cancel()
+        .map_err(ActionError::Message)?;
+    // Serialized with the start this cancel is racing (see ADMIN_OPS):
     // the unload happens after any in-flight `admin start` has loaded the
     // job, so it unloads something real instead of losing the cancel.
     let _guard = vpn::ADMIN_OPS.lock().await;
+    // The gate verdict may be stale by now: the start's failure, the
+    // poller's "worker exited" blame, or the tunnel coming up could all
+    // have resolved the attempt while this cancel waited for the guard.
+    // Re-check before the privileged teardown — booting a CONNECTED
+    // tunnel's worker out of a "cancel" would be the opposite of honest.
+    if !controller.attempt_is_connecting(attempt) {
+        return Err(ActionError::Message(
+            "cannot cancel: the connection attempt already finished".to_string(),
+        ));
+    }
     // Interrupt a connecting worker by unloading the one-shot launchd job:
     // launchd terminates it, which runs the worker's own teardown instead of
     // a blind kill.
     if let Err(error) = vpn::run_admin("cancel", &[]).await {
-        log::warn!(
-            "cancel failed: {}",
-            vpn::admin_error_hint(&vpn::setup_script_path(&app), error)
-        );
+        // Not confirmed: the phase stays as it is — the poller reports the
+        // truth (the worker may die anyway, the tunnel may yet come up) —
+        // and the failure reaches the invoker instead of the old
+        // log-and-claim-canceled swallow.
+        let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
+        log::warn!("cancel failed: {error}");
+        return Err(error.into());
     }
     // The completion carries the in-flight attempt's id and is fenced inside
     // `connect_failed` (id match + phase still Connecting): a cancel whose
-    // attempt already resolved — the tunnel came up, the poller blamed the
-    // worker first — is a no-op instead of an Error overwrite.
-    if let Some(attempt) = controller.connecting_attempt() {
-        controller.connect_failed(attempt, "Connection canceled".to_string());
-    }
+    // attempt resolved between the re-check and here is a no-op instead of
+    // an Error overwrite.
+    controller.connect_failed(attempt, "Connection canceled".to_string());
     Ok(())
 }
 
@@ -692,6 +710,11 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
         // settings pointing at VPN resolvers. The poller reports the
         // still-connected truth from the lock file.
         controller.disconnect_failed(format!("disconnect failed: {error}"));
+        // The invoker learns of it too: the old shape moved the state to
+        // Error and still returned Ok(()) as if the disconnect had
+        // succeeded — a reconnect chained on that Ok would try to start a
+        // second tunnel beside the still-standing one.
+        return Err(error.into());
     }
     Ok(())
 }

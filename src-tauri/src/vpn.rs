@@ -259,6 +259,21 @@ impl VpnController {
         }
     }
 
+    /// Gate for a cancel, atomic like the other begin-gates but
+    /// transitionless: a cancel is addressed to the in-flight connect
+    /// attempt, and its own completion (`connect_failed`) or the poller
+    /// resolves the phase — an intermediate "Canceling" phase would race
+    /// both. On success the caller receives the addressed attempt's id:
+    /// the post-guard re-check and the completion fence on it.
+    pub fn try_begin_cancel(&self) -> Result<AttemptId, String> {
+        let inner = self.inner.lock().unwrap();
+        match gate_cancel(&inner) {
+            Ok(attempt) => Ok(attempt),
+            Err(phase) => Err(format!("cannot cancel while {phase:?}")),
+        }
+        // No publish: a cancel transitions nothing (see `gate_cancel`).
+    }
+
     /// A completion of connect attempt `id` that failed: applies ONLY if
     /// `id` is still the current attempt AND the phase is still Connecting —
     /// anything else is a stale completion (the attempt was superseded, or
@@ -310,6 +325,14 @@ impl VpnController {
     pub fn connecting_attempt(&self) -> Option<AttemptId> {
         let inner = self.inner.lock().unwrap();
         (inner.state.phase == Phase::Connecting).then_some(inner.attempt)
+    }
+
+    /// Whether `id` is still the in-flight connect attempt: the fence a
+    /// gated async op re-checks after an `.await` that could have
+    /// outlived its own gate verdict (waiting for the admin-op lock, the
+    /// privileged call itself).
+    pub fn attempt_is_connecting(&self, id: AttemptId) -> bool {
+        self.connecting_attempt() == Some(id)
     }
 
     /// The in-flight connect attempt's id, iff the poller may attribute a
@@ -456,6 +479,19 @@ fn enter_disconnecting(inner: &mut Inner) -> Result<(), Phase> {
         }
         Phase::Disconnecting => Ok(()),
         phase => Err(phase),
+    }
+}
+
+/// Pure half of `VpnController::try_begin_cancel`: only a Connecting
+/// phase has an attempt to cancel — every other phase refuses with
+/// itself. No transition: the cancel's own completion
+/// (`apply_connect_failed`) or the poller's lock observation resolves the
+/// phase, so the gate only hands out the addressee's id for the caller to
+/// fence with.
+fn gate_cancel(inner: &Inner) -> Result<AttemptId, Phase> {
+    match &inner.state.phase {
+        Phase::Connecting => Ok(inner.attempt),
+        phase => Err(phase.clone()),
     }
 }
 
@@ -1617,6 +1653,33 @@ mod tests {
             let mut inner = Inner::default();
             inner.state.phase = phase.clone();
             assert_eq!(enter_disconnecting(&mut inner), Err(phase));
+        }
+    }
+
+    /// A cancel is addressed to the in-flight connect attempt: the gate
+    /// hands out its id and mutates nothing — the completion or the
+    /// poller resolves the phase, never the gate itself.
+    #[test]
+    fn cancel_gate_only_allows_connecting_and_transitions_nothing() {
+        let mut inner = Inner::default();
+        let attempt = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        inner.worker_started = true;
+        assert_eq!(gate_cancel(&inner), Ok(attempt));
+        assert_eq!(inner.state.phase, Phase::Connecting);
+        assert_eq!(inner.attempt, attempt);
+        assert!(inner.worker_started);
+
+        // Every other phase refuses with itself — a cancel must never
+        // touch a live tunnel (Connected) or a teardown in flight.
+        for phase in [
+            Phase::Disconnected,
+            Phase::Connected,
+            Phase::Disconnecting,
+            Phase::Error,
+        ] {
+            let mut inner = Inner::default();
+            inner.state.phase = phase.clone();
+            assert_eq!(gate_cancel(&inner), Err(phase));
         }
     }
 
