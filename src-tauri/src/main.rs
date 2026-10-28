@@ -349,8 +349,9 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Acti
         .try_begin_cancel()
         .map_err(ActionError::Message)?;
     // Serialized with the start this cancel is racing (see ADMIN_OPS):
-    // the unload happens after any in-flight `admin start` has loaded the
-    // job, so it unloads something real instead of losing the cancel.
+    // the bootout happens after any in-flight `admin start` has
+    // bootstrapped the job, so it removes something real instead of
+    // losing the cancel.
     let _guard = vpn::ADMIN_OPS.lock().await;
     // The gate verdict may be stale by now: the start's failure, the
     // poller's "worker exited" blame, or the tunnel coming up could all
@@ -362,9 +363,9 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Acti
             "cannot cancel: the connection attempt already finished".to_string(),
         ));
     }
-    // Interrupt a connecting worker by unloading the one-shot launchd job:
-    // launchd terminates it, which runs the worker's own teardown instead of
-    // a blind kill.
+    // Interrupt a connecting worker by booting the one-shot launchd job
+    // out: launchd terminates it, which runs the worker's own teardown
+    // instead of a blind kill.
     if let Err(error) = vpn::run_admin("cancel", &[]).await {
         // Not confirmed: the phase stays as it is — the poller reports the
         // truth (the worker may die anyway, the tunnel may yet come up) —
@@ -641,10 +642,10 @@ async fn do_connect(
     // the exception: auto-gateway is what the cookie path would do anyway.)
     let reuse_cookie = reuse_cookie && resolved_gateway.is_none();
 
-    // The root-owned wrapper (scripts/gp-admin) generates and loads the
-    // launchd job itself: no staged files, no credentials, no dialogs. It
-    // returns fast; the status poller adopts the worker from the lock file
-    // once the tunnel is established.
+    // The root-owned wrapper (scripts/gp-admin) generates and bootstraps
+    // the launchd job itself: no staged files, no credentials, no
+    // dialogs. It returns fast; the status poller adopts the worker from
+    // the lock file once the tunnel is established.
     let args = [
         portal,
         if reuse_cookie { "1" } else { "0" },
@@ -653,11 +654,12 @@ async fn do_connect(
     // Serialized privileged ops, guard BEFORE the gate: a Cancel can only
     // pass its own gate while THIS gate has already set Connecting, so a
     // cancel always ends up waiting on this guard until the start has
-    // loaded the job — then unloads a job that is actually loaded instead
-    // of racing ahead of the start and unloading nothing (the lost cancel).
-    // A second concurrent Connect waits here too and is refused by the
-    // gate the moment the first one holds it — before it can launch
-    // another `admin start` and unload-kill the first worker mid-SSO.
+    // bootstrapped the job — then boots out a job that is actually loaded
+    // instead of racing ahead of the start and removing nothing (the lost
+    // cancel). A second concurrent Connect waits here too and is refused
+    // by the gate the moment the first one holds it — before it can
+    // launch another `admin start`, whose leading bootout would kill the
+    // first worker mid-SSO.
     let _guard = vpn::ADMIN_OPS.lock().await;
     // Gate and transition atomically; the returned id is this attempt's
     // identity — every async completion of it must carry it back.

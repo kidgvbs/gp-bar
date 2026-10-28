@@ -208,7 +208,7 @@ impl VpnController {
     /// separate `snapshot()` (lock taken and released) before transitioning
     /// (lock re-taken) is a TOCTOU hole: on the multi-threaded tokio runtime
     /// two invocations (double click, panel + tray menu) both pass the gate,
-    /// and the second `admin start` unloads — killing — the first worker
+    /// and the second `admin start` boots out — killing — the first worker
     /// mid-SSO. The check and the transition must be atomic; the refusal
     /// error is the caller's to surface.
     ///
@@ -718,7 +718,7 @@ const WORKER_LABEL: &str = "dev.gpbar.worker";
 /// * `Some(true)` — the `pid =` line is there: the worker process is alive.
 /// * `Some(false)` — the job is loaded but has no `pid =`: it ran and exited.
 /// * `None` — the job is not in the domain (exit 113, e.g. before the
-///   wrapper's first `launchctl load`) or launchctl failed: unknown.
+///   wrapper's first `launchctl bootstrap`) or launchctl failed: unknown.
 async fn worker_has_active_pid(label: &str) -> Option<bool> {
     let target = format!("system/{label}");
     let output = tokio::process::Command::new("/bin/launchctl")
@@ -1262,7 +1262,7 @@ pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpc
 /// start's `load` ran, unload nothing, show "Connection canceled", and
 /// then let the start load the job anyway: the SSO browser opens and the
 /// VPN connects. Serialized, the cancel waits for the start's sudo to
-/// finish and THEN unloads a job that is actually loaded. The same
+/// finish and THEN boots out a job that is actually loaded. The same
 /// ordering protects stop vs. a concurrent start (no half-fresh job for
 /// the next teardown to miss). The wrapper itself stays stateless; this
 /// lock sequences the APP's operations, nothing more.
@@ -1272,7 +1272,8 @@ pub static ADMIN_OPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 /// and reporting a timeout. The wrapper bounds every internal wait BELOW
 /// this (see scripts/gp-admin): a `stop` is at worst 5 s
 /// (`gpclient disconnect`) + 10 s (lock-file wait) + 5 s (final job
-/// unload) = 20 s, a `cancel` at worst 10 s, the rest ≈1 s — so hitting
+/// bootout) = 20 s, a `cancel` at worst 10 s, a `start` at worst ~10 s
+/// (the leading bootout of a previous job; normally <1 s) — so hitting
 /// this timeout means the wrapper itself is stuck (a hung sudo, a wedged
 /// launchctl), never a merely slow teardown. 30 s keeps ~10 s of margin
 /// over that worst case while still resolving a stuck "Disconnecting…"

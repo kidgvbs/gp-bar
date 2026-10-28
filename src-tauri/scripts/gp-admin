@@ -46,6 +46,13 @@ PLIST="$DAEMON_DIR/dev.gpbar.worker.plist"
 LOCK=/var/run/gpclient.lock
 LOG_DIR=/Library/Logs/gp-bar
 LOG_PATH="$LOG_DIR/gpclient-connect.log"
+# The worker job's launchd target: system domain + label. `launchctl print`
+# on it is the loaded/not-loaded probe (exit 113 = not in the domain — the
+# same observation vpn.rs's `worker_has_active_pid` is documented on; exit
+# statuses only, never stderr text, which is neither localized nor stable),
+# and `bootout` on it is the modern unload with honest exit codes — the old
+# `unload -w` often exited 0 having done nothing (S6/N9b).
+WORKER_TARGET='system/dev.gpbar.worker'
 
 # The worker binaries resolve from the root-owned install prefix only.
 # setup-admin.sh copies gpclient (with its Frameworks dylibs) and the whole
@@ -79,6 +86,41 @@ wait_bounded() {
     sleep 0.5
     wb_ticks=$((wb_ticks - 1))
   done
+  return 0
+}
+
+# Whether the worker job is currently loaded in the system domain.
+worker_job_loaded() {
+  launchctl print "$WORKER_TARGET" >/dev/null 2>&1
+}
+
+# Boot the worker job out of the system domain: unloads it AND terminates
+# its process with the job's own SIGTERM/ExitTimeOut discipline. Bounded by
+# `$1` seconds (see wait_bounded). Idempotent: a job that is not loaded is
+# a success — there is nothing to boot out. Real failures return 1 with the
+# reason on stderr. The WORKER is never SIGKILLed from here; on a budget
+# expiry only OUR launchctl client is killed, to bound this script —
+# launchd keeps servicing the request it was sent, and the job's
+# ExitTimeOut bounds the worker side on its own.
+bootout_worker() {
+  worker_job_loaded || return 0
+  launchctl bootout "$WORKER_TARGET" 2>/dev/null &
+  bo_pid=$!
+  if ! wait_bounded "$bo_pid" "$1"; then
+    kill -9 "$bo_pid" 2>/dev/null || true
+    wait "$bo_pid" 2>/dev/null || true
+    echo "gp-admin: bootout of $WORKER_TARGET did not finish within $1 s" >&2
+    return 1
+  fi
+  bo_status=0
+  wait "$bo_pid" 2>/dev/null || bo_status=$?
+  # 113 = the job left the domain between the probe and the bootout (the
+  # app's own ops are serialized; this is an external racer doing our work
+  # for us). Anything else non-zero is a real failure.
+  if [ "$bo_status" -ne 0 ] && [ "$bo_status" -ne 113 ]; then
+    echo "gp-admin: bootout of $WORKER_TARGET failed (exit $bo_status)" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -366,13 +408,23 @@ start)
 
   # The worker must be born from launchd to stay signalable: root children
   # spawned outside launchd ignore catchable signals on this macOS beta
-  # (see RECAP.md). The leading unload keeps the load idempotent and
-  # recovers from a worker that exited outside GP Bar. ExitTimeOut above
-  # gives the worker 60 s of SIGTERM grace at unload/bootout instead of
-  # launchd's 20 s default SIGKILL — a killed worker skips the
-  # vpnc-script teardown that restores DNS.
-  launchctl unload -w "$PLIST" 2>/dev/null || true
-  launchctl load -w "$PLIST"
+  # (see RECAP.md). The leading bootout keeps the bootstrap idempotent and
+  # recovers from a worker that exited outside GP Bar — and unlike the old
+  # `unload -w`, which often exited 0 having done nothing, its exit code is
+  # checked (S6/N9b). ExitTimeOut above gives the worker 60 s of SIGTERM
+  # grace at bootout instead of launchd's 20 s default SIGKILL — a killed
+  # worker skips the vpnc-script teardown that restores DNS.
+  if ! bootout_worker 10; then
+    die "the previous worker job did not unload"
+  fi
+  # Bridge off the old wrapper: its `unload -w`/`load -w` toggled the
+  # launchd "disabled" override on every stop and start, so a machine that
+  # last stopped (or canceled) under the OLD wrapper still carries a
+  # disabled mark for this label — and `bootstrap` respects it, loading
+  # the job without ever running it. Clear it: idempotent, and a no-op on
+  # any machine whose override was already clean.
+  launchctl enable "$WORKER_TARGET"
+  launchctl bootstrap system "$PLIST"
   ;;
 
 stop)
@@ -403,35 +455,26 @@ stop)
     exit 1
   fi
   # The last step only retires the one-shot job, and the VPN is already
-  # down (the lock file is gone): bounded (5 s) but warn-not-fail. The
-  # kill bounds OUR launchctl client, never the worker — launchd keeps
-  # servicing the request it was sent, and its ExitTimeOut bounds the
-  # worker side on its own.
-  launchctl unload -w "$PLIST" 2>/dev/null &
-  unload_pid=$!
-  if ! wait_bounded "$unload_pid" 5; then
-    kill -9 "$unload_pid" 2>/dev/null || true
-    echo "gp-admin: the final job unload did not finish within 5 s (the VPN is down; launchd's ExitTimeOut bounds the rest)" >&2
+  # down (the lock file is gone): bounded (5 s) but warn-not-fail —
+  # bootout_worker has already said why on stderr. A leftover loaded job
+  # blocks nothing until the next start, whose own leading bootout retries
+  # the removal and dies loud if it fails.
+  if ! bootout_worker 5; then
+    echo "gp-admin: the final job bootout failed; the VPN is down, launchd's ExitTimeOut bounds whatever is left" >&2
   fi
-  wait "$unload_pid" 2>/dev/null || true
   ;;
 
 cancel)
-  # Unloading the one-shot job makes launchd terminate the worker, which
+  # Booting the one-shot job out makes launchd terminate the worker, which
   # runs its own teardown instead of a blind kill (SIGTERM first, with
-  # the 60 s ExitTimeOut grace — see the plist above). Bounded (10 s):
-  # this unload is the whole operation, and a hang would hold the app's
-  # ADMIN_OPS serialization forever. The kill bounds only OUR launchctl
-  # client; launchd keeps servicing the request, and its ExitTimeOut
-  # bounds the worker side.
-  launchctl unload -w "$PLIST" 2>/dev/null &
-  unload_pid=$!
-  if ! wait_bounded "$unload_pid" 10; then
-    kill -9 "$unload_pid" 2>/dev/null || true
-    wait "$unload_pid" 2>/dev/null || true
-    die "the job unload did not finish within 10 s"
+  # the 60 s ExitTimeOut grace — see the plist above). Bounded (10 s) and
+  # exit-code-checked: this bootout is the whole operation, a hang would
+  # hold the app's ADMIN_OPS serialization forever, and the old
+  # `unload -w || true` swallowed real failures as successes. The reason
+  # is on stderr from bootout_worker already.
+  if ! bootout_worker 10; then
+    exit 1
   fi
-  wait "$unload_pid" 2>/dev/null || true
   ;;
 
 repair)
