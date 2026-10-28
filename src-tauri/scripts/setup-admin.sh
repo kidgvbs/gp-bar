@@ -36,7 +36,7 @@ LOG_DIR=/Library/Logs/gp-bar
 # `codesign -dv <binary>` (prints TeamIdentifier=… on stderr).
 EXPECTED_TEAM_ID="2V53V62NSV"
 
-# S3: the sudoers grant is only as sound as EVERY directory along the wrapper
+# The sudoers grant is only as sound as EVERY directory along the wrapper
 # path. On Intel Macs Homebrew chowns /usr/local (and its lib) to the user,
 # which is exactly why the install moved to the system-owned
 # /Library/PrivilegedHelperTools. Fail loudly if any parent is not
@@ -57,7 +57,7 @@ done
 install -d -m 0755 "$DEST_DIR"
 install -m 0755 -o root -g wheel "$SRC/gp-admin" "$DEST"
 
-# S2: close the Homebrew hole. The root exec chain must never touch a
+# Close the Homebrew hole. The root exec chain must never touch a
 # user-writable executable: /opt/homebrew/bin is the user's, and today's
 # gpclient there is a symlink into the GP Connect.app bundle (user-writable
 # too). Copy gpclient and the @executable_path Frameworks dylibs it links
@@ -143,11 +143,11 @@ if [ -d "$FW_SRC" ]; then
   done
 fi
 
-# S1: the connect log lives in a root-owned, world-readable directory; the
+# The connect log lives in a root-owned, world-readable directory; the
 # wrapper creates the file per attempt (0644). Never under ~/Library.
 install -d -m 0755 -o root -g wheel "$LOG_DIR"
 
-# S7: write the sudoers file atomically. A dotted temp name is inert (sudo
+# Write the sudoers file atomically. A dotted temp name is inert (sudo
 # ignores files containing a dot in sudoers.d), so a malformed file can never
 # be live; validate THE FILE ALONE with visudo -cf, then rename into place.
 SUDOERS_DIR=/etc/sudoers.d
@@ -163,9 +163,9 @@ if ! visudo -cf "$tmp"; then
 fi
 mv -f "$tmp" "$SUDOERS_DIR/gp-bar"
 
-# Migration from the pre-v1.1 install (S3): the old wrapper lived under
-# /usr/local/lib, whose parents Homebrew may chown to the user on Intel
-# Macs. Remove it so no stale, potentially user-replaceable copy remains.
+# Remove any pre-v1.1 install at /usr/local/lib/gp-bar: Homebrew may chown
+# /usr/local (and its parents) to the user on Intel Macs, so a stale copy
+# there must not survive.
 if [ "$OLD_DEST_DIR" != "$DEST_DIR" ] && [ -d "$OLD_DEST_DIR" ]; then
   rm -rf "$OLD_DEST_DIR"
   echo "setup-admin: removed the old install at $OLD_DEST_DIR"

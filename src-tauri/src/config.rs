@@ -95,7 +95,7 @@ impl Config {
     /// (created 0755 root:wheel by `setup-admin.sh`): the ROOT worker
     /// writes it, so it must never sit under a user-writable directory —
     /// a user symlink there would let any user process truncate system
-    /// files as root (S1). The wrapper recreates the file per attempt
+    /// files as root. The wrapper recreates the file per attempt
     /// (0644), which is the tailer's "new attempt" rewind signal; the
     /// app only ever READS it, as the user. The app's own `panel.log`
     /// stays under `~/Library/Logs/gp-bar` (written by the app as user).
