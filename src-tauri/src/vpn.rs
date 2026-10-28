@@ -27,7 +27,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tokio::process::Command;
+use tokio::{process::Command, sync::watch};
 
 use crate::config::Config;
 
@@ -98,44 +98,72 @@ struct Inner {
     reconnect_target: Option<String>,
 }
 
+/// The VPN state machine, with its publishing decoupled: `inner` is the
+/// single source of truth, and every mutation sends the new [`VpnState`]
+/// on the `tx` watch channel instead of emitting a Tauri event itself.
+/// Publishing is structural — `main` owns the ONE subscriber
+/// (`spawn_state_publisher`) that forwards each change to the tray and
+/// then the frontend — so the controller carries no `AppHandle` and has
+/// no opinion about UI. `watch` also coalesces: a subscriber that reads
+/// only the latest value may miss transient intermediates, which the
+/// consumers tolerate by rendering absolutely (from the state, never
+/// from a diff).
 pub struct VpnController {
     inner: Mutex<Inner>,
+    tx: watch::Sender<VpnState>,
 }
 
 impl VpnController {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
+            // The seed is the default state; `subscribe` marks it seen, so
+            // the setup-time notes (portal, reconnect target) are the first
+            // *changes* the publisher forwards — nothing is re-sent at spawn.
+            tx: watch::channel(VpnState::default()).0,
         })
+    }
+
+    /// The live state feed. A late subscriber's `borrow` starts at the
+    /// CURRENT value, then sees every change from there.
+    pub fn subscribe(&self) -> watch::Receiver<VpnState> {
+        self.tx.subscribe()
     }
 
     pub fn snapshot(&self) -> VpnState {
         self.inner.lock().unwrap().state.clone()
     }
 
-    fn update(&self, app: &AppHandle, mutate: impl FnOnce(&mut Inner)) -> VpnState {
+    /// One state → every subscriber. `send` fails only when no receiver
+    /// is alive (the publisher task holds one for the app's lifetime):
+    /// ignored like the old `let _ = app.emit`, same "no one listens"
+    /// semantics.
+    fn publish(&self, state: VpnState) {
+        let _ = self.tx.send(state);
+    }
+
+    fn update(&self, mutate: impl FnOnce(&mut Inner)) -> VpnState {
         let state = {
             let mut inner = self.inner.lock().unwrap();
             let before = inner.state.clone();
             mutate(&mut inner);
             // The armed flag is derived state, never a second source of
-            // truth: recompute it after every mutation so every emitted
+            // truth: recompute it after every mutation so every published
             // state satisfies the formula (see `apply_reconnect_armed`).
             apply_reconnect_armed(&mut inner);
             if inner.state == before {
                 // Nothing observable changed (e.g. a poll tick with the same
-                // phase): skip the event instead of waking every listener.
+                // phase): skip the publish instead of waking every listener.
                 return before;
             }
             inner.state.clone()
-            // The guard is dropped here, BEFORE emitting. `Emitter::emit` runs
-            // Rust listeners synchronously on this thread; emitting while still
-            // holding the guard self-deadlocked the poller the moment any
-            // listener read the state back through `snapshot()`, freezing the
-            // main thread on its next `get_state` and stalling the whole
-            // NSApplication run loop (dead tray, dead window).
+            // The guard is dropped here, before publishing. `watch::send`
+            // runs no listener code on this thread (unlike the old direct
+            // emit, whose synchronous listeners re-reading `snapshot()`
+            // self-deadlocked the poller), but dropping every guard before
+            // any kind of notification stays the crate's uniform rule.
         };
-        let _ = app.emit("vpn-state", &state);
+        self.publish(state.clone());
         state
     }
 
@@ -148,18 +176,18 @@ impl VpnController {
     /// and the second `admin start` unloads — killing — the first worker
     /// mid-SSO. The check and the transition must be atomic; the refusal
     /// error is the caller's to surface.
-    pub fn try_begin_connect(&self, app: &AppHandle, portal: &str) -> Result<(), String> {
+    pub fn try_begin_connect(&self, portal: &str) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
             match enter_connecting(&mut inner, portal) {
                 Ok(()) => Ok(inner.state.clone()),
                 Err(phase) => Err(format!("cannot connect while {phase:?}")),
             }
-            // Guard dropped BEFORE emitting (the `update` discipline).
+            // Guard dropped BEFORE publishing (the `update` discipline).
         };
         match outcome {
             Ok(state) => {
-                let _ = app.emit("vpn-state", &state);
+                self.publish(state);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -169,26 +197,26 @@ impl VpnController {
     /// Gate + transition for a disconnect attempt, atomic like
     /// `try_begin_connect`. A second disconnect while already Disconnecting
     /// is idempotent (Ok): the stop request is already in flight.
-    pub fn try_begin_disconnect(&self, app: &AppHandle) -> Result<(), String> {
+    pub fn try_begin_disconnect(&self) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
             match enter_disconnecting(&mut inner) {
                 Ok(()) => Ok(inner.state.clone()),
                 Err(phase) => Err(format!("cannot disconnect while {phase:?}")),
             }
-            // Guard dropped BEFORE emitting (the `update` discipline).
+            // Guard dropped BEFORE publishing (the `update` discipline).
         };
         match outcome {
             Ok(state) => {
-                let _ = app.emit("vpn-state", &state);
+                self.publish(state);
                 Ok(())
             }
             Err(error) => Err(error),
         }
     }
 
-    pub fn connect_failed(&self, app: &AppHandle, error: String) {
-        self.update(app, |inner| {
+    pub fn connect_failed(&self, error: String) {
+        self.update(|inner| {
             inner.state.phase = Phase::Error;
             inner.state.last_error = Some(error);
             inner.worker_started = false;
@@ -212,8 +240,8 @@ impl VpnController {
     /// The privileged teardown failed: surface the failure instead of a
     /// stuck "Disconnecting". The poller then reports the truth from the lock
     /// file (still connected → Connected again).
-    pub fn disconnect_failed(&self, app: &AppHandle, error: String) {
-        self.update(app, |inner| {
+    pub fn disconnect_failed(&self, error: String) {
+        self.update(|inner| {
             inner.state.phase = Phase::Error;
             inner.state.last_error = Some(error);
         });
@@ -222,8 +250,8 @@ impl VpnController {
     // -- observations from the poller -------------------------------------------
 
     /// Apply filesystem evidence (lock file present/absent, PID alive/dead).
-    pub fn observe_lock(&self, app: &AppHandle, lock: Option<LockObservation>) {
-        self.update(app, |inner| apply_lock(inner, lock));
+    pub fn observe_lock(&self, lock: Option<LockObservation>) {
+        self.update(|inner| apply_lock(inner, lock));
     }
 
     /// Whether the poller may attribute a missing lock file to a dead worker:
@@ -238,11 +266,11 @@ impl VpnController {
     }
 
     /// A parsed gateway name from the JSON log stream.
-    pub fn observe_gateway(&self, app: &AppHandle, gateway: Option<String>) {
+    pub fn observe_gateway(&self, gateway: Option<String>) {
         if gateway.is_none() {
             return;
         }
-        self.update(app, |inner| {
+        self.update(|inner| {
             inner.state.gateway = gateway;
         });
     }
@@ -257,8 +285,8 @@ impl VpnController {
     /// while idle: during Connecting/Connected/Disconnecting `portal`
     /// describes the in-flight operation and must not be rewritten by a
     /// selection change.
-    pub fn note_selected_portal(&self, app: &AppHandle, portal: Option<String>) {
-        self.update(app, |inner| apply_selected_portal(inner, portal));
+    pub fn note_selected_portal(&self, portal: Option<String>) {
+        self.update(|inner| apply_selected_portal(inner, portal));
     }
 
     /// Record what a fresh connect would currently target (the resolved
@@ -266,10 +294,10 @@ impl VpnController {
     /// ever reading the config: called after every config save that touches
     /// the resolution (see `sync_reconnect_target` in main.rs) and seeded
     /// once at startup. While Connected, a target differing from the live
-    /// gateway arms the flag in the very same update — the vpn-state event
+    /// gateway arms the flag in the very same update — the published state
     /// carries it to the panel and the tray together.
-    pub fn note_reconnect_target(&self, app: &AppHandle, target: Option<String>) {
-        self.update(app, |inner| {
+    pub fn note_reconnect_target(&self, target: Option<String>) {
+        self.update(|inner| {
             inner.reconnect_target = target;
         });
     }
@@ -492,8 +520,9 @@ fn process_is_gpclient(_pid: Pid) -> bool {
 
 // -- background tasks ---------------------------------------------------------
 
-/// Poll the PID lock file and push state transitions to the frontend.
-pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
+/// Poll the PID lock file and push state transitions to the publisher
+/// (the controller's watch channel — no `AppHandle` needed here).
+pub fn spawn_status_poller(controller: Arc<VpnController>) {
     tauri::async_runtime::spawn(async move {
         loop {
             let observation = read_lock_observation();
@@ -514,7 +543,6 @@ pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
                     // and exited before the tunnel came up (wrong SSO, closed
                     // browser, gateway error, crash).
                     controller.connect_failed(
-                        &app,
                         "The VPN worker exited before the tunnel came up".to_string(),
                     );
                 }
@@ -523,7 +551,7 @@ pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
                 // `run_admin("start")` reports its own failure, and
                 // cancel/stop set their own phases.
             }
-            controller.observe_lock(&app, observation);
+            controller.observe_lock(observation);
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
@@ -693,7 +721,7 @@ async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) 
             if let Some(address) = address {
                 learn_gateway_host(app, &address, &name).await;
             }
-            controller.observe_gateway(app, Some(name.clone()));
+            controller.observe_gateway(Some(name.clone()));
             harvest_gateway(app, &name).await;
         }
         // A getconfig POST: the cached-cookie path emits only this. Translate
@@ -701,7 +729,7 @@ async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) 
         // unknown, but harvest only a known NAME (never the FQDN).
         Some(GatewayMention::Host(host)) => {
             let name = gateway_display_name(app, &host);
-            controller.observe_gateway(app, Some(name.clone().unwrap_or(host)));
+            controller.observe_gateway(Some(name.clone().unwrap_or(host)));
             if let Some(name) = name {
                 harvest_gateway(app, &name).await;
             }
@@ -1558,6 +1586,61 @@ mod tests {
         }
         apply_lock(&mut controller.inner.lock().unwrap(), None);
         assert!(!controller.connecting_worker_started());
+    }
+
+    /// Publishing goes through the watch channel: every real transition
+    /// reaches the subscribers, no-op mutations and refused gates publish
+    /// nothing, and a late subscriber still sees the latest state first.
+    /// Uses only the sync receiver APIs (`has_changed`,
+    /// `borrow_and_update`) — no async runtime in unit tests.
+    #[test]
+    fn state_changes_publish_over_the_watch_channel() {
+        let controller = VpnController::new();
+        let mut rx = controller.subscribe();
+        // The seed value is the current one: nothing has changed yet.
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().phase, Phase::Disconnected);
+
+        // A poll observation that changes nothing publishes nothing.
+        controller.observe_lock(None);
+        assert!(!rx.has_changed().unwrap());
+
+        // A real transition publishes the new state...
+        controller.connect_failed("boom".to_string());
+        assert!(rx.has_changed().unwrap());
+        let state = rx.borrow_and_update();
+        assert_eq!(state.phase, Phase::Error);
+        assert_eq!(state.last_error.as_deref(), Some("boom"));
+        drop(state);
+
+        // ...and a subscriber that joins later renders absolutely from
+        // the latest value.
+        let mut late = controller.subscribe();
+        assert_eq!(late.borrow_and_update().phase, Phase::Error);
+
+        // The gate messages are unchanged, and refusals publish nothing.
+        controller.try_begin_connect("vpn.example.com").unwrap();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().phase, Phase::Connecting);
+        assert_eq!(
+            controller.try_begin_connect("other.example").unwrap_err(),
+            "cannot connect while Connecting"
+        );
+        assert_eq!(
+            controller.try_begin_disconnect().unwrap_err(),
+            "cannot disconnect while Connecting"
+        );
+        assert!(!rx.has_changed().unwrap());
+
+        // The poller's adoption observation publishes the graduation.
+        controller.observe_lock(Some(LockObservation {
+            pid: Pid(std::num::NonZeroI32::new(4242).unwrap()),
+            connected_since_epoch_secs: 1_700_000_000,
+        }));
+        assert!(rx.has_changed().unwrap());
+        let state = rx.borrow_and_update();
+        assert_eq!(state.phase, Phase::Connected);
+        assert_eq!(state.pid, Some(4242));
     }
 
     #[test]

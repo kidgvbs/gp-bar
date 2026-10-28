@@ -205,9 +205,7 @@ async fn add_portal(
     .await
     .map_err(|error| error.to_string())??;
     // Emit outside the config lock — update_config has dropped it.
-    state
-        .controller
-        .note_selected_portal(&app, cfg.selected.clone());
+    state.controller.note_selected_portal(cfg.selected.clone());
     Ok(())
 }
 
@@ -229,9 +227,7 @@ async fn remove_portal(
     })
     .await
     .map_err(|error| error.to_string())??;
-    state
-        .controller
-        .note_selected_portal(&app, cfg.selected.clone());
+    state.controller.note_selected_portal(cfg.selected.clone());
     Ok(())
 }
 
@@ -254,9 +250,7 @@ async fn select_portal(
     })
     .await
     .map_err(|error| error.to_string())??;
-    state
-        .controller
-        .note_selected_portal(&app, cfg.selected.clone());
+    state.controller.note_selected_portal(cfg.selected.clone());
     Ok(())
 }
 
@@ -328,7 +322,7 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Stri
             vpn::admin_error_hint(&vpn::setup_script_path(&app), error)
         );
     }
-    controller.connect_failed(&app, "Connection canceled".to_string());
+    controller.connect_failed("Connection canceled".to_string());
     Ok(())
 }
 
@@ -365,10 +359,10 @@ fn connect_target_from_config(cfg: &Config) -> (String, bool, Option<String>) {
 /// resolution (the gateway picker, the preferred star, the list itself)
 /// re-notes after its save, and setup seeds once at startup. `cfg` is the
 /// post-update config, lock-free by contract.
-fn sync_reconnect_target(app: &AppHandle, controller: &VpnController, cfg: &Config) {
+fn sync_reconnect_target(controller: &VpnController, cfg: &Config) {
     let target =
         resolve_connect_gateway(cfg.selected_gateway.clone(), cfg.preferred_gateway.clone());
-    controller.note_reconnect_target(app, target);
+    controller.note_reconnect_target(target);
 }
 
 fn broadcast_config(app: &AppHandle, cfg: &Config) {
@@ -410,7 +404,7 @@ async fn select_gateway(
     broadcast_config(&app, &cfg);
     // The picker changed the resolution: re-note the target so the armed
     // flag (vpn-state → panel and tray) reflects the switch while Connected.
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -442,7 +436,7 @@ async fn set_preferred_gateway(
     .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
     // The star changes what "Automatic" resolves to: re-note the target.
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -469,7 +463,7 @@ async fn remove_gateway(
     .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
     // A removal can zero the preferred/selected picks: re-note the target.
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -507,7 +501,7 @@ async fn add_gateway(
     broadcast_config(&app, &cfg);
     // Uniform with the other gateway commands: re-note the target (an add
     // cannot change the resolution, but one rule for one family of paths).
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -601,7 +595,7 @@ async fn do_connect(
     // click, panel + tray menu) must be refused BEFORE it can launch another
     // `admin start` and unload-kill the first worker mid-SSO.
     controller
-        .try_begin_connect(&app, portal)
+        .try_begin_connect(portal)
         .map_err(ActionError::Message)?;
     let _ = app.emit("vpn-log-cleared", ());
 
@@ -619,7 +613,7 @@ async fn do_connect(
         }
         Err(error) => {
             let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
-            controller.connect_failed(&app, error.to_string());
+            controller.connect_failed(error.to_string());
             Err(error.into())
         }
     }
@@ -631,7 +625,7 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     // connect that lands between a `snapshot()` check and the transition must
     // not be torn down by a second disconnect.
     controller
-        .try_begin_disconnect(&app)
+        .try_begin_disconnect()
         .map_err(ActionError::Message)?;
     // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
     // helper never raises a dialog, so hide-on-blur stays in effect.
@@ -643,7 +637,7 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
         // killed worker skips the vpnc-script teardown, leaving macOS DNS
         // settings pointing at VPN resolvers. The poller reports the
         // still-connected truth from the lock file.
-        controller.disconnect_failed(&app, format!("disconnect failed: {error}"));
+        controller.disconnect_failed(format!("disconnect failed: {error}"));
     }
     Ok(())
 }
@@ -915,9 +909,33 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     );
 }
 
+/// The one subscriber of the controller's watch channel: every state
+/// change goes to the tray first, then to the frontend — the same
+/// relative order the old direct emit produced (the Rust tray listener
+/// ran synchronously before the JS listener could see the event). The
+/// frontend renders absolutely (from the state, never from a diff), so
+/// the extra hop only relaxes vpn-state's ordering against unrelated
+/// events (vpn-log-cleared, a command's rejection), which nothing
+/// depends on; watch coalescing may likewise drop transient intermediates
+/// between two reads.
+fn spawn_state_publisher(app: AppHandle, controller: Arc<VpnController>) {
+    // Subscribe BEFORE spawning: `subscribe` marks the current value seen
+    // (the setup seed is not re-published), and no change between this
+    // line and the task's first `changed().await` can be missed — watch
+    // keeps the latest value for whoever reads next.
+    let mut receiver = controller.subscribe();
+    tauri::async_runtime::spawn(async move {
+        while receiver.changed().await.is_ok() {
+            let state = receiver.borrow_and_update().clone();
+            sync_tray_with_state(&app, &state);
+            let _ = app.emit("vpn-state", &state);
+        }
+    });
+}
+
 fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
-    // State events are emitted from the status poller's worker task, but
-    // tauri's TrayIcon hops to the main thread itself (run_item_main_thread).
+    // Called from setup and the state publisher's task; tauri's TrayIcon
+    // hops to the main thread itself (run_item_main_thread).
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let connected = state.phase == Phase::Connected;
         let tooltip = match state.phase {
@@ -1020,6 +1038,7 @@ fn log_targets() -> Vec<tauri_plugin_log::Target> {
 
 fn main() {
     let controller = VpnController::new();
+    let publisher_controller = controller.clone();
     let poller_controller = controller.clone();
     let tailer_controller = controller.clone();
 
@@ -1106,8 +1125,8 @@ fn main() {
             // outside-started tunnel as Connected at any moment — before
             // any gateway command has re-noted it.
             let cfg = app.state::<AppContext>().config.lock().unwrap().clone();
-            controller.note_selected_portal(app.handle(), cfg.selected.clone());
-            sync_reconnect_target(app.handle(), &controller, &cfg);
+            controller.note_selected_portal(cfg.selected.clone());
+            sync_reconnect_target(&controller, &cfg);
 
             // Tray through tauri's own API, NOT a raw tray-icon one: tauri claims
             // the global TrayIconEvent handler (an OnceLock: first setter wins,
@@ -1219,29 +1238,23 @@ fn main() {
             {
                 log::warn!("tray menu: TRAY_MENU already set — built twice?");
             }
-            // Match the items to the current phase before any vpn-state event
-            // fires. Safe lock: setup runs on the main thread and the status
-            // poller has not started yet.
+            // Match the items to the current phase before any state change
+            // can fire. Safe lock: setup runs on the main thread and the
+            // status poller has not started yet.
             sync_tray_with_state(app.handle(), &controller.snapshot());
 
-            vpn::spawn_status_poller(app.handle().clone(), poller_controller);
+            // The publisher is spawned AFTER the seeding above (its
+            // `subscribe` marks the current value seen, so the seed is not
+            // re-published) and BEFORE the poller (no transition can then
+            // race past a missing subscriber).
+            spawn_state_publisher(app.handle().clone(), publisher_controller);
+            vpn::spawn_status_poller(poller_controller);
             vpn::spawn_log_tailer(app.handle().clone(), tailer_controller);
 
-            // Reflect state transitions onto the tray icon and tooltip. Read the
-            // phase from the event payload instead of calling `snapshot()`:
-            // listeners run synchronously on the emitting thread, and re-locking
-            // the controller here deadlocked the poller (see vpn::update).
-            let icon_handle = app.handle().clone();
-            app.listen_any("vpn-state", move |event| {
-                if let Ok(state) = serde_json::from_str::<VpnState>(event.payload()) {
-                    sync_tray_with_state(&icon_handle, &state);
-                }
-            });
-
             // Defense-in-depth for the menu enablement: the armed flag now
-            // travels in vpn-state (noted on every gateway save, see
-            // `sync_reconnect_target`), so the vpn-state listener above is
-            // the primary sync path — this one re-syncs the menu on every
+            // travels in the published state (noted on every gateway save,
+            // see `sync_reconnect_target`), so the state publisher is the
+            // primary sync path — this one re-syncs the menu on every
             // config-updated in case a future config path ever misses the
             // re-note. Safe snapshot: the config lock is always dropped
             // before that event is emitted (see `broadcast_config` and
