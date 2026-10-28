@@ -21,18 +21,22 @@
 #   * granted: running the fixed operations above, which toggle the VPN
 #     and touch root-owned files (/Library/Logs/gp-bar, the job plist,
 #     network DNS settings while repairing)
-#   * closed: the wrapper and the gpclient binaries it executes are
-#     root-owned copies outside Homebrew and the app bundles; the connect
+#   * closed: the wrapper and the gpclient binaries it executes — their
+#     own @executable_path dylibs included — are root-owned copies outside
+#     Homebrew and the app bundles; the connect
 #     log lives in a root-owned directory (no symlinked truncation of
 #     user-chosen system files); sudoers is written atomically after
 #     validation (see setup-admin.sh)
+#   * vpnc-script, precisely: the connect path this wrapper generates
+#     runs the script EMBEDDED in the root-owned gpclient binary,
+#     in-process — no external script is searched, and GP_VPNC_SCRIPT /
+#     --script / --script-tun are never set or passed. Enabling any of
+#     them would re-open root execution from a file; selftest refuses.
 #   * residual: `repair` clears manual DNS on network services (that is
 #     its job); anything running as this user can toggle the VPN on/off.
-#     The copied binaries' own @executable_path dylibs are copied and
-#     root-owned too, so the exec chain is closed on this machine; if a
-#     future gpclient build links user-writable dylibs absolutely, that
-#     would re-open the hole (setup-admin copies only what otool shows
-#     today — re-run it after every brew/app upgrade).
+#     If a future gpclient build links user-writable dylibs absolutely,
+#     that would re-open the hole (setup-admin copies only what otool
+#     shows today — re-run it after every brew/app upgrade).
 
 set -eu
 
@@ -176,6 +180,25 @@ require_gpclient() {
   require_root_owned "$GPCLIENT"
 }
 
+# The worker's launchd job, emitted to stdout from validated values only
+# (`start` redirects it into $PLIST). The XML below is the complete job
+# description; selftest asserts its invariants (see the guard there).
+emit_job_plist() {
+  cat <<JOB
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.gpbar.worker</string>
+<key>ProgramArguments</key><array><string>$GPCLIENT</string><string>--log-format</string><string>json</string><string>connect</string><string>$portal</string><string>--browser</string>$gateway_args$cookie</array>
+<key>EnvironmentVariables</key><dict><key>HOME</key><string>/var/root</string><key>PATH</key><string>$PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>SUDO_UID</key><string>$uid</string><key>SUDO_USER</key><string>$user</string></dict>
+<key>StandardOutPath</key><string>$LOG_PATH</string>
+<key>StandardErrorPath</key><string>$LOG_PATH</string>
+<key>RunAtLoad</key><true/>
+<key>ExitTimeOut</key><integer>60</integer>
+</dict></plist>
+JOB
+}
+
 op="${1:-}"
 
 case "$op" in
@@ -192,6 +215,31 @@ selftest)
   require_root_owned "$GPLOGIN_APP"
   mkdir -p "$DAEMON_DIR" 2>/dev/null || die "cannot create $DAEMON_DIR"
   install -d -m 0755 -o root -g wheel "$LOG_DIR"
+
+  # The connect path needs NO vpnc-script file: gpclient runs the script
+  # EMBEDDED in its own binary, in-process. Assert the job plist this
+  # wrapper generates stays on that path — a GP_VPNC_SCRIPT key in the
+  # environment or --script/--script-tun in the arguments would switch
+  # the ROOT worker to executing an external script file, re-opening the
+  # hole the root-owned prefix closed. Checked on the generator itself
+  # (with sample values, nothing written), so the guard holds before the
+  # first start ever creates a plist.
+  portal=selftest
+  uid=0
+  user=root
+  cookie=''
+  gateway_args='<string>--auto-gateway</string>'
+  plist_xml=$(emit_job_plist)
+  case "$plist_xml" in
+    *GP_VPNC_SCRIPT*)
+      die "generated job plist sets GP_VPNC_SCRIPT — the external-script override would re-open root execution from a file"
+      ;;
+  esac
+  case "$plist_xml" in
+    *--script*)
+      die "generated job plist passes --script/--script-tun — the external-script override would re-open root execution from a file"
+      ;;
+  esac
   echo ok
   ;;
 
@@ -291,19 +339,7 @@ start)
   # (The worker is invoked by absolute path anyway; the PATH is for the
   # tools gpclient and vpnc-script spawn.)
   umask 022
-  cat > "$PLIST" <<JOB
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>dev.gpbar.worker</string>
-<key>ProgramArguments</key><array><string>$GPCLIENT</string><string>--log-format</string><string>json</string><string>connect</string><string>$portal</string><string>--browser</string>$gateway_args$cookie</array>
-<key>EnvironmentVariables</key><dict><key>HOME</key><string>/var/root</string><key>PATH</key><string>$PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>SUDO_UID</key><string>$uid</string><key>SUDO_USER</key><string>$user</string></dict>
-<key>StandardOutPath</key><string>$LOG_PATH</string>
-<key>StandardErrorPath</key><string>$LOG_PATH</string>
-<key>RunAtLoad</key><true/>
-<key>ExitTimeOut</key><integer>60</integer>
-</dict></plist>
-JOB
+  emit_job_plist > "$PLIST"
   chown root:wheel "$PLIST"
   chmod 0644 "$PLIST"
 
