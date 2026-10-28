@@ -29,7 +29,14 @@ DEST="$DEST_DIR/admin"
 OLD_DEST_DIR=/usr/local/lib/gp-bar
 LOG_DIR=/Library/Logs/gp-bar
 
-# S3: the sudoers grant is only as sound as EVERY directory along the wrapper
+# The Team ID that signs the GP Connect worker sources (gpclient and the
+# "GP Connect Login.app"). Both are verified against it before anything
+# is copied: an unsigned or differently-signed source must never become
+# a root-owned "trusted" binary. Discover or refresh it with
+# `codesign -dv <binary>` (prints TeamIdentifier=… on stderr).
+EXPECTED_TEAM_ID="2V53V62NSV"
+
+# The sudoers grant is only as sound as EVERY directory along the wrapper
 # path. On Intel Macs Homebrew chowns /usr/local (and its lib) to the user,
 # which is exactly why the install moved to the system-owned
 # /Library/PrivilegedHelperTools. Fail loudly if any parent is not
@@ -50,7 +57,7 @@ done
 install -d -m 0755 "$DEST_DIR"
 install -m 0755 -o root -g wheel "$SRC/gp-admin" "$DEST"
 
-# S2: close the Homebrew hole. The root exec chain must never touch a
+# Close the Homebrew hole. The root exec chain must never touch a
 # user-writable executable: /opt/homebrew/bin is the user's, and today's
 # gpclient there is a symlink into the GP Connect.app bundle (user-writable
 # too). Copy gpclient and the @executable_path Frameworks dylibs it links
@@ -68,6 +75,39 @@ done
 REAL_GPCLIENT=$(realpath "$SRC_GPCLIENT")
 REAL_DIR=$(dirname "$REAL_GPCLIENT")
 
+LOGIN_APP_DST="$DEST_DIR/GP Connect Login.app"
+LOGIN_APP_SRC="$REAL_DIR/GP Connect Login.app"
+if [ ! -d "$LOGIN_APP_SRC" ]; then
+  echo "setup-admin: $LOGIN_APP_SRC not found (SAML browser auth needs the GP Connect Login bundle)" >&2
+  exit 1
+fi
+
+# Verify the SOURCES before copying anything: the copies become the
+# root-owned binaries the wrapper executes as root, so a tampered or
+# unsigned source must die here, at setup time. Both artifacts must carry
+# a valid signature AND the GP Connect developer's Team ID. The bare
+# gpclient binary verifies outside its bundle context with plain
+# `codesign -v`; the Login app needs the strict deep bundle walk.
+# (codesign -dv prints its info on stderr — that is where the team is.)
+if ! codesign -v "$REAL_GPCLIENT"; then
+  echo "setup-admin: gpclient at $REAL_GPCLIENT has an invalid code signature" >&2
+  exit 1
+fi
+team=$(codesign -dv "$REAL_GPCLIENT" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+[ "$team" = "$EXPECTED_TEAM_ID" ] || {
+  echo "setup-admin: gpclient is signed by team '${team:-none}', expected '$EXPECTED_TEAM_ID'" >&2
+  exit 1
+}
+if ! codesign --verify --strict --deep "$LOGIN_APP_SRC"; then
+  echo "setup-admin: GP Connect Login.app has an invalid code signature" >&2
+  exit 1
+fi
+team=$(codesign -dv "$LOGIN_APP_SRC" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+[ "$team" = "$EXPECTED_TEAM_ID" ] || {
+  echo "setup-admin: GP Connect Login.app is signed by team '${team:-none}', expected '$EXPECTED_TEAM_ID'" >&2
+  exit 1
+}
+
 install -d -m 0755 "$DEST_DIR/bin"
 install -m 0755 -o root -g wheel "$REAL_GPCLIENT" "$DEST_DIR/bin/gpclient"
 # The SAML drop-in helper (gpauth) is Hardened Runtime: its code signature
@@ -79,12 +119,6 @@ install -m 0755 -o root -g wheel "$REAL_GPCLIENT" "$DEST_DIR/bin/gpclient"
 # RELATIVE symlink into it: gpclient resolves gpauth as a sibling of its
 # own realpath'd executable, and the symlink keeps that discovery working
 # while the kernel execs the binary in its bundle context.
-LOGIN_APP_DST="$DEST_DIR/GP Connect Login.app"
-LOGIN_APP_SRC="$REAL_DIR/GP Connect Login.app"
-if [ ! -d "$LOGIN_APP_SRC" ]; then
-  echo "setup-admin: $LOGIN_APP_SRC not found (SAML browser auth needs the GP Connect Login bundle)" >&2
-  exit 1
-fi
 rm -rf "$LOGIN_APP_DST"
 ditto "$LOGIN_APP_SRC" "$LOGIN_APP_DST"
 chown -R root:wheel "$LOGIN_APP_DST"
@@ -109,11 +143,11 @@ if [ -d "$FW_SRC" ]; then
   done
 fi
 
-# S1: the connect log lives in a root-owned, world-readable directory; the
+# The connect log lives in a root-owned, world-readable directory; the
 # wrapper creates the file per attempt (0644). Never under ~/Library.
 install -d -m 0755 -o root -g wheel "$LOG_DIR"
 
-# S7: write the sudoers file atomically. A dotted temp name is inert (sudo
+# Write the sudoers file atomically. A dotted temp name is inert (sudo
 # ignores files containing a dot in sudoers.d), so a malformed file can never
 # be live; validate THE FILE ALONE with visudo -cf, then rename into place.
 SUDOERS_DIR=/etc/sudoers.d
@@ -129,9 +163,9 @@ if ! visudo -cf "$tmp"; then
 fi
 mv -f "$tmp" "$SUDOERS_DIR/gp-bar"
 
-# Migration from the pre-v1.1 install (S3): the old wrapper lived under
-# /usr/local/lib, whose parents Homebrew may chown to the user on Intel
-# Macs. Remove it so no stale, potentially user-replaceable copy remains.
+# Remove any pre-v1.1 install at /usr/local/lib/gp-bar: Homebrew may chown
+# /usr/local (and its parents) to the user on Intel Macs, so a stale copy
+# there must not survive.
 if [ "$OLD_DEST_DIR" != "$DEST_DIR" ] && [ -d "$OLD_DEST_DIR" ]; then
   rm -rf "$OLD_DEST_DIR"
   echo "setup-admin: removed the old install at $OLD_DEST_DIR"

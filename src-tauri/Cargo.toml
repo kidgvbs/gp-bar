@@ -16,8 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "fs"] }
 dirs = "5"
-# Only kill(pid, 0) for worker liveness (no fork/exec like the old `ps -p`),
-# no other libc use. tauri already links libc transitively.
+# Only kill(pid, 0) for worker liveness (no subprocess probes), no other
+# libc use. tauri already links libc transitively.
 libc = "0.2"
 # Logging: tauri-plugin-log installs itself as the global `log` logger and
 # owns the targets (stderr + the rotating ~/Library/Logs/gp-bar/panel.log),
@@ -28,17 +28,15 @@ tauri-plugin-log = "2"
 # Native liquid-glass panel backdrop (macOS 26+), behind the webview.
 window-vibrancy = "0.8.1"
 
+# No gateway-list fetching pre-connect: the portal's getconfig wants the
+# user's password (never handled here by design) and failed attempts risk
+# session invalidation. Gateways come from connect logs and manual entry.
+
 # Liquid glass: the panel's own WKWebView, handed to window-vibrancy via
 # LiquidGlassOptions::content_view so the crate reparents it into the glass
 # view (its fix for the focus-edge breakage, issue #198). Version unified
 # with the one window-vibrancy 0.8.1 builds against (same maintainer tree).
 # objc2-foundation supplies NSProcessInfo for the runtime OS-version check.
-
-# No gateway-list fetching pre-connect: the real portal is password-auth and
-# rejects every unauthenticated getconfig request (and the failed attempts
-# risk portal-side session invalidations). Gateways are harvested from
-# connect logs and added manually.
-
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc2-app-kit", "WKWebView"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSProcessInfo"] }

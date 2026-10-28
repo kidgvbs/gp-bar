@@ -88,10 +88,12 @@ Creating the tunnel requires root. GP Bar never handles a password itself:
   manual DNS of network services — but only from the pre-VPN snapshot the
   wrapper records at connect time (same service only; no snapshot or a
   service mismatch = loud refusal, never a guess). IPv6 manual DNS is
-  snapshotted and restored too. The root exec chain itself is closed
-  on this machine: wrapper, binaries and their `@executable_path` dylibs
-  are all root-owned copies outside Homebrew. If a future gpclient build
-  were to link user-writable dylibs by absolute path, that residual would
+  snapshotted and restored too. The root exec chain: wrapper, binaries
+  and their `@executable_path` dylibs are root-owned copies outside
+  Homebrew, and the vpnc-script that rewrites DNS and routes as root is
+  the one EMBEDDED in the gpclient binary — run in-process, no external
+  script file searched or enabled. If a future gpclient build were to
+  link user-writable dylibs by absolute path, that residual would
   re-open — re-running the setup script after every `brew upgrade`
   refreshes the copies, and the wrapper's ownership checks fail loudly if
   anything drifts.

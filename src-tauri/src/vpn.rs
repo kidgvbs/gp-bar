@@ -233,13 +233,13 @@ impl VpnController {
     /// Apply a portal selection from the config to the idle state.
     ///
     /// `state.portal` is the only hint the panel has that a Connect target
-    /// exists: the Connect button stays disabled while it is null. The old
-    /// native tray menu seeded it implicitly by connecting straight from
-    /// `config.selected`; with the menu gone, a fresh session (or an app
-    /// restart while a terminal-started worker holds the lock) left the
-    /// button dead after the first disconnect. Only applies while idle:
-    /// during Connecting/Connected/Disconnecting `portal` describes the
-    /// in-flight operation and must not be rewritten by a selection change.
+    /// exists: the Connect button stays disabled while it is null, so the
+    /// selection must be seeded into the idle state or a fresh session (or
+    /// an app restart while a terminal-started worker holds the lock)
+    /// leaves the button dead after the first disconnect. Only applies
+    /// while idle: during Connecting/Connected/Disconnecting `portal`
+    /// describes the in-flight operation and must not be rewritten by a
+    /// selection change.
     pub fn note_selected_portal(&self, app: &AppHandle, portal: Option<String>) {
         self.update(app, |inner| apply_selected_portal(inner, portal));
     }
@@ -327,7 +327,7 @@ pub fn read_lock_observation() -> Option<LockObservation> {
         return None;
     }
     // kill(pid, 0) == EPERM only says "a process with this PID exists"; after
-    // a crash without cleanup the PID may be ANY process's (C6). Require the
+    // a crash without cleanup the PID may be ANY process's. Require the
     // process to actually be gpclient, else treat the lock as stale.
     if !process_is_gpclient(pid) {
         log::warn!("lock file PID {pid} is not a gpclient process — treating the lock as stale");
@@ -350,7 +350,7 @@ pub fn read_lock_observation() -> Option<LockObservation> {
 /// PID from the lock file (`gpclient` writes its own `std::process::id()`).
 /// Parse into a u32 FIRST and bound it to the positive i32 range: a `u32`
 /// cast straight to `libc::pid_t` would wrap negative above `i32::MAX`, and
-/// `kill(-1, 0)` means "every process" — a phantom-alive lock (C6).
+/// `kill(-1, 0)` means "every process" — a phantom-alive lock.
 /// Empty or garbage content is treated like a missing PID.
 fn parse_lock_pid(raw: &str) -> Option<u32> {
     let pid = raw.trim().parse::<u32>().ok()?;
@@ -372,7 +372,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 /// Whether the process behind `pid` is actually a `gpclient` binary — the
-/// best identity check available without privileges (C6). `kill(pid, 0)`
+/// best identity check available without privileges. `kill(pid, 0)`
 /// returning EPERM only proves that SOME process owns the PID; after a
 /// crash without cleanup the PID may have been reused by anything, and the
 /// app would show Connected forever. `proc_pidpath` (libproc, unprivileged)
@@ -482,7 +482,7 @@ pub fn spawn_log_tailer(app: AppHandle, controller: Arc<VpnController>) {
         let path = Config::connect_log_path();
         let mut offset: u64 = 0;
         // BYTE buffer, never a String: a multibyte UTF-8 character split
-        // across two reads must not become two U+FFFD (R3). Only complete
+        // across two reads must not become two U+FFFD. Only complete
         // lines are decoded, inside `drain_complete_lines`.
         let mut buffer: Vec<u8> = Vec::new();
         loop {
@@ -710,7 +710,7 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
     let Some(ctx) = app.try_state::<crate::AppContext>() else {
         return;
     };
-    // Same charset the wrapper and `select_gateway` enforce (R4): a name
+    // Same charset the wrapper and `select_gateway` enforce: a name
     // harvested straight from the log must not reach the picker if the
     // wrapper would refuse it (the picker would offer a dead entry).
     if !crate::config::valid_name(gateway) {
@@ -895,26 +895,25 @@ pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
 /// the displayed version matches what the worker really runs.
 pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpclient";
 
-/// Run one admin operation (`selftest`, `start`, `stop`, `cancel`).
-///
-/// `sudo -n` never prompts: without the sudoers rule it fails fast, and
-/// `admin_error_hint` turns that failure into the one-time setup
-/// instructions. No credentials are ever seen or handled by GP Bar — the
-/// whole point of the wrapper design (Touch ID in a sudo-askpass context
-/// turned out to be impossible: `pam_tid` falls back to the password for
-/// any process that is not an interactive terminal, verified empirically
-/// — see RECAP.md).
 /// How long to wait for one privileged helper operation before giving up
-/// and reporting a timeout (R2). 30 s is far above every healthy op (start
+/// and reporting a timeout. 30 s is far above every healthy op (start
 /// ≈1 s, stop waits on the worker's 60 s SIGTERM grace — a stop that long
 /// means a stuck `gpclient disconnect`, exactly what must not hang the UI
 /// forever); short enough that the "Disconnecting…" state resolves within
 /// half a minute instead of never.
 const ADMIN_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Run one admin operation (`selftest`, `start`, `stop`, `cancel`).
+///
+/// `sudo -n` never prompts: without the sudoers rule it fails fast, and
+/// `admin_error_hint` turns that failure into the one-time setup
+/// instructions. No credentials are ever seen or handled by GP Bar — the
+/// whole point of the wrapper design (`pam_tid` falls back to the password
+/// for any process that is not an interactive terminal, so Touch ID
+/// cannot gate the helper).
 pub async fn run_admin(op: &str, args: &[&str]) -> Result<String, String> {
     // LC_ALL/LANG=C: sudo and the wrapper run with stable, non-localized
-    // error strings, which `admin_error_hint` matches on (R5).
+    // error strings, which `admin_error_hint` matches on.
     let fut = Command::new("/usr/bin/sudo")
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -958,7 +957,7 @@ pub fn admin_error_hint(setup_script: &Path, error: &str) -> String {
 }
 
 /// Pure core of [`admin_error_hint`]: `wrapper_installed` is the caller's
-/// locale-independent existence check (R5) so tests are environment-free.
+/// locale-independent existence check so tests are environment-free.
 pub fn admin_error_hint_for(wrapper_installed: bool, setup_script: &Path, error: &str) -> String {
     // No wrapper file means the setup is missing, whatever the exact
     // sudo/OS error string says. sudo's stderr is forced to LC_ALL=C by
@@ -1198,8 +1197,8 @@ mod tests {
 
     #[test]
     fn poller_exit_gate_requires_a_confirmed_start() {
-        // The C2 scenario: Connecting but `run_admin("start")` not back yet.
-        // The poller must NOT blame the stale launchd job for the exit.
+        // Connecting but `run_admin("start")` not back yet: the poller
+        // must NOT blame the stale launchd job for the exit.
         let mut inner = Inner::default();
         inner.state.phase = Phase::Connecting;
         apply_lock(&mut inner, None);
@@ -1239,7 +1238,7 @@ mod tests {
 
     #[test]
     fn splits_lines_on_bytes_without_breaking_utf8_across_reads() {
-        // R3: the two halves of a multibyte character arrive in separate
+        // The two halves of a multibyte character arrive in separate
         // reads. The byte buffer must hold the first half and reassemble
         // the character, not emit two U+FFFD.
         let mut buffer = Vec::new();
@@ -1287,7 +1286,7 @@ mod tests {
 
     #[test]
     fn parses_lock_pids_within_the_positive_i32_range() {
-        // C6: values above i32::MAX must not wrap negative through `as`
+        // Values above i32::MAX must not wrap negative through `as`
         // (kill(-1, 0) = "every process" = phantom alive).
         assert_eq!(parse_lock_pid("4242\n"), Some(4242));
         assert_eq!(parse_lock_pid("  4242  "), Some(4242));
@@ -1303,8 +1302,8 @@ mod tests {
 
     #[test]
     fn admin_timeout_errors_reach_the_setup_hint_unchanged() {
-        // R2/R5: the timeout string is an operational failure, not a setup
-        // one — it must pass through and be surfaced by the caller.
+        // The timeout string is an operational failure, not a setup one —
+        // it must pass through and be surfaced by the caller.
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
         let error = "admin op 'stop' timed out";
         assert_eq!(admin_error_hint_for(true, setup, error), error);

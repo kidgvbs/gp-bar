@@ -12,44 +12,69 @@ concurrency:
 jobs:
   rust:
     name: Rust (fmt, clippy, test)
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest (all Linux jobs): the runner images
+    # are rolling to Ubuntu 26, and a pinned image keeps the apt
+    # dependency set (webkit2gtk, appindicator) deterministic.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: src-tauri
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
       # Linux GUI deps for tauri / tray-icon (libappindicator) builds.
       - run: sudo apt-get update && sudo apt-get install -y
           libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
           libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # --locked: build and test exactly the committed Cargo.lock, never a
+      # silently regenerated one.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  rust-macos:
+    # The only job that compiles the cfg(target_os = "macos") code
+    # (proc_pidpath FFI, glass, set_activation_policy) — the platform the
+    # shipped app actually runs on. macOS runners need no GUI deps.
+    name: Rust on macOS (clippy, test)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
 
   shell:
     name: Shell scripts (shellcheck)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck src-tauri/scripts/gp-admin src-tauri/scripts/setup-admin.sh
 
   web:
     name: Web (tsc, build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # npm's update-notifier spawn kills the process ("Exit handler never
       # called") on sandboxed runners — disable it.
       NPM_CONFIG_UPDATE_NOTIFIER: "false"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           # Node 22's bundled npm dies with "Exit handler never called"
           # on current runners; Node 24 LTS (npm 11) is clean.

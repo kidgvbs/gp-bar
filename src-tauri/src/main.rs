@@ -1,7 +1,7 @@
 //! GP Bar — a menu bar client for the GlobalProtect VPN.
 //!
 //! It orchestrates the free, open-source `gpclient` CLI (GPL-3.0, from
-//! https://github.com/yuezk/GlobalProtect-openconnect) and deliberately ships
+//! <https://github.com/yuezk/GlobalProtect-openconnect>) and deliberately ships
 //! none of the proprietary GUI licensing machinery: connections last as long
 //! as the portal allows, with no client-side time limit.
 
@@ -110,7 +110,7 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
         );
     }
     // Mutate a clone, save the clone, and commit to the live config only on
-    // success: a failed save must not leave memory diverged from disk (R4).
+    // success: a failed save must not leave memory diverged from disk.
     let selected = {
         let mut cfg = state.config.lock().unwrap();
         let mut next = cfg.clone();
@@ -223,9 +223,9 @@ fn quit(app: AppHandle) {
 
 // -- gateway selection -----------------------------------------------------------
 
-/// The C4 contract: the panel's explicit pick (what the tray menu now
-/// forwards as `selected_gateway`) wins over the preferred gateway, and
-/// None + None defers to gpclient's own auto-gateway order.
+/// Gateway precedence for a connect: the panel's explicit pick (forwarded
+/// by the tray menu as `selected_gateway`) wins over the preferred
+/// gateway, and None + None defers to gpclient's own auto-gateway order.
 fn resolve_connect_gateway(explicit: Option<String>, preferred: Option<String>) -> Option<String> {
     explicit.or(preferred)
 }
@@ -561,12 +561,13 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     //     the menu-bar/dock insets to it) is TOP-LEFT origin, y down: the
     //     monitor table below is already canonical, no flip needed.
     //
-    // The mixed-DPI bug this replaced: an earlier table flipped tao's
-    // positions with the main height, mirroring every NON-primary monitor
-    // across the primary (a display above the laptop was recorded below),
-    // so anchors on the external menu bar never matched. The single-monitor
-    // case still worked because the primary's origin (0,0) is invariant
-    // under that flip.
+    // Invariant: never flip tao's raw positions with the main screen's
+    // height. The flip is correct only for the primary (its origin (0,0)
+    // is invariant under it); for every other monitor it mirrors the
+    // rectangle across the primary — a display above the laptop would be
+    // recorded below, and anchors on the external menu bar would never
+    // match. The monitor table below is built in the canonical space
+    // directly instead.
 
     // Tray payload, or the cursor fallback recovered to pure logical points
     // (tao converts the cursor with the PRIMARY scale — its cross-monitor
@@ -887,10 +888,10 @@ fn main() {
                 }
             }
 
-            // Seed the idle state with the selected portal so the Connect button
-            // is reachable in a fresh session. The removed native tray menu used
-            // to be the implicit seeding path (it connected straight from
-            // `config.selected`); without this a restart left the button dead.
+            // Seed the idle state with the selected portal so the Connect
+            // button is reachable in a fresh session: `state.portal` is what
+            // enables it, and only a selection change or this seed ever sets
+            // it (see `note_selected_portal`).
             let selected = app
                 .state::<AppContext>()
                 .config
@@ -1158,9 +1159,8 @@ mod tests {
     use super::{resolve_connect_gateway, tray_reconnect_armed};
     // `valid_name` (the wrapper charset) is tested in config::tests.
 
-    /// The C4 contract: the panel's explicit pick (what the tray menu now
-    /// forwards as `selected_gateway`) wins over the preferred gateway, and
-    /// None + None defers to gpclient's auto-gateway order.
+    /// Gateway precedence: the explicit pick wins over the preferred
+    /// gateway, and None + None defers to gpclient's auto-gateway order.
     #[test]
     fn explicit_gateway_picks_win_over_preferred() {
         assert_eq!(
