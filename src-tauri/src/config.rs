@@ -82,6 +82,50 @@ impl Default for Config {
     }
 }
 
+/// Which branch the config load took. The type makes "do not overwrite
+/// what you did not read" checkable instead of hoped-for: `Unreadable`
+/// tells `AppContext` (see its `persist` gate) that the in-memory config
+/// is NOT the user's data and every save must be a no-op.
+#[derive(Debug)]
+pub enum Loaded {
+    /// Nothing usable is on disk — first run, or a corrupt file that was
+    /// just renamed aside. The defaults are ours to persist: writing them
+    /// cannot destroy anything (a corrupt original survives beside them).
+    Fresh(Config),
+    /// Read and parsed from disk.
+    FromDisk(Config),
+    /// The file exists but could not be READ (permissions, I/O): the
+    /// defaults are served for this session only, and saves are no-ops.
+    Unreadable(Config, std::io::Error),
+}
+
+/// `YYYYMMDD-HHMMSS` in the local timezone — the suffix for a corrupt
+/// config renamed aside. Local, not UTC, because the user matches it
+/// against "when it happened on my machine"; second precision so two
+/// corruptions never share a name.
+fn corrupt_timestamp() -> String {
+    let secs: libc::time_t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r writes only into `tm` and reads only the
+    // `time_t` passed by pointer; both are ours. `tm` is zeroed first
+    // because only some of its fields are guaranteed written.
+    if unsafe { libc::localtime_r(&secs, &mut tm).is_null() } {
+        return format!("{secs}");
+    }
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
 impl Config {
     pub fn config_dir() -> PathBuf {
         dirs::config_dir()
@@ -103,41 +147,51 @@ impl Config {
         PathBuf::from("/Library/Logs/gp-bar/gpclient-connect.log")
     }
 
-    pub fn load() -> Config {
+    pub fn load() -> Loaded {
         Self::load_from(&Self::config_dir())
     }
 
-    /// A missing config (first run) is the normal default; anything else —
-    /// permissions, I/O — is reported but must never panic a menu-bar app.
-    /// A parse error means the file is corrupt (e.g. a crash mid-write): it
-    /// is renamed aside so the next `save()` cannot silently overwrite the
-    /// user's portals and gateways with the defaults.
+    /// A missing config (first run) is the normal default; anything else
+    /// is reported but must never panic a menu-bar app. A parse error
+    /// means the file is corrupt (e.g. a crash mid-write): it is renamed
+    /// aside so the next `save()` cannot silently overwrite the user's
+    /// portals and gateways with the defaults.
     ///
     /// eprintln, not `log::`: `Config::load` runs in `main` before the
     /// tauri-plugin-log logger is attached, so the `log` facade would
-    /// silently drop these lines — stderr is the only sink this early.
-    fn load_from(dir: &Path) -> Config {
+    /// silently drop these lines — stderr is the only sink this early
+    /// (`setup` logs the branch again once the logger exists).
+    fn load_from(dir: &Path) -> Loaded {
         let path = dir.join("config.json");
         match fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
-                let corrupt = path.with_extension("json.corrupt");
-                match fs::rename(&path, &corrupt) {
-                    Ok(()) => eprintln!(
-                        "gp-bar: config {} is not valid JSON ({error}); kept as {}",
-                        path.display(),
-                        corrupt.display()
-                    ),
-                    Err(rename_error) => eprintln!(
-                        "gp-bar: config {} is not valid JSON ({error}); cannot keep it aside: {rename_error}",
-                        path.display()
-                    ),
+            Ok(raw) => match serde_json::from_str::<Config>(&raw) {
+                Ok(config) => Loaded::FromDisk(config),
+                Err(error) => {
+                    // Corrupt, not unreadable: the file WAS read, its
+                    // content just is not JSON. Kept aside, timestamped,
+                    // so a second corruption (a crash loop) cannot
+                    // overwrite the first evidence.
+                    let corrupt = dir.join(format!("config.json.corrupt-{}", corrupt_timestamp()));
+                    match fs::rename(&path, &corrupt) {
+                        Ok(()) => eprintln!(
+                            "gp-bar: config {} is not valid JSON ({error}); kept as {}",
+                            path.display(),
+                            corrupt.display()
+                        ),
+                        Err(rename_error) => eprintln!(
+                            "gp-bar: config {} is not valid JSON ({error}); cannot keep it aside: {rename_error}",
+                            path.display()
+                        ),
+                    }
+                    Loaded::Fresh(Config::default())
                 }
-                Config::default()
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Loaded::Fresh(Config::default())
+            }
             Err(error) => {
                 eprintln!("gp-bar: cannot read config {}: {error}", path.display());
-                Config::default()
+                Loaded::Unreadable(Config::default(), error)
             }
         }
     }
@@ -211,7 +265,9 @@ mod tests {
         cfg.gateways.push("gw-1".to_string());
         cfg.selected_gateway = Some("gw-1".to_string());
         cfg.save_to(&dir).unwrap();
-        let loaded = Config::load_from(&dir);
+        let Loaded::FromDisk(loaded) = Config::load_from(&dir) else {
+            panic!("a config written by save_to must load as FromDisk");
+        };
         assert_eq!(loaded.portals, cfg.portals);
         assert_eq!(loaded.gateways, cfg.gateways);
         assert_eq!(loaded.selected_gateway, Some("gw-1".to_string()));
@@ -224,20 +280,89 @@ mod tests {
     fn a_corrupt_config_is_kept_aside_and_defaults_are_served() {
         let dir = temp_dir("corrupt");
         fs::write(dir.join("config.json"), r#"{"portals": ["trunc"#).unwrap();
-        let cfg = Config::load_from(&dir);
+        // Corrupt is the FRESH branch, not Unreadable: the file WAS read,
+        // only parsed wrong, and it has been renamed aside — persisting
+        // the defaults cannot destroy the user's data.
+        let Loaded::Fresh(cfg) = Config::load_from(&dir) else {
+            panic!("a corrupt config must load as Fresh (renamed aside)");
+        };
         assert_eq!(cfg, Config::default());
-        // The user's data is not lost: it survives beside the fresh defaults.
-        assert!(dir.join("config.json.corrupt").exists());
+        // The user's data is not lost: it survives beside the fresh
+        // defaults, timestamped.
+        let kept = corrupt_files(&dir);
+        assert_eq!(kept.len(), 1, "exactly one kept-aside file: {kept:?}");
+        assert!(
+            kept[0].len() > "config.json.corrupt-".len(),
+            "the name carries a timestamp suffix"
+        );
         assert!(!dir.join("config.json").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_corruption_does_not_overwrite_the_first() {
+        let dir = temp_dir("corrupt-twice");
+        fs::write(dir.join("config.json"), r#"{"portals": ["trunc"#).unwrap();
+        assert!(matches!(Config::load_from(&dir), Loaded::Fresh(_)));
+        // The timestamp has second precision: force the next name apart.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(dir.join("config.json"), r#"{"gateways": [}"#).unwrap();
+        assert!(matches!(Config::load_from(&dir), Loaded::Fresh(_)));
+        let kept = corrupt_files(&dir);
+        assert_eq!(kept.len(), 2, "both corruptions survive: {kept:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_missing_config_is_the_plain_default() {
         let dir = temp_dir("missing");
-        let cfg = Config::load_from(&dir);
+        let Loaded::Fresh(cfg) = Config::load_from(&dir) else {
+            panic!("a missing config must load as Fresh");
+        };
         assert_eq!(cfg, Config::default());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_config_serves_defaults_without_touching_the_file() {
+        let dir = temp_dir("unreadable");
+        // A DIRECTORY named config.json: read_to_string fails with EISDIR
+        // — a read error other than NotFound, without chmod tricks that
+        // would break under a root CI.
+        fs::create_dir_all(dir.join("config.json")).unwrap();
+        let Loaded::Unreadable(cfg, error) = &Config::load_from(&dir) else {
+            panic!("an unreadable config must load as Unreadable");
+        };
+        assert_eq!(cfg, &Config::default());
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        // The unreadable file is still there, untouched: no rename, no
+        // overwrite — it is the user's data and the app cannot read it.
+        assert!(dir.join("config.json").is_dir());
+        assert!(corrupt_files(&dir).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_timestamps_are_civil_and_second_precise() {
+        let stamp = corrupt_timestamp();
+        // YYYYMMDD-HHMMSS: digits only, one dash between date and time.
+        let Some((date, time)) = stamp.split_once('-') else {
+            panic!("no date/time dash in {stamp:?}");
+        };
+        assert_eq!(date.len(), 8);
+        assert_eq!(time.len(), 6);
+        assert!(date.chars().all(|c| c.is_ascii_digit()), "{stamp:?}");
+        assert!(time.chars().all(|c| c.is_ascii_digit()), "{stamp:?}");
+    }
+
+    /// The kept-aside corrupt config files in `dir`, by name.
+    fn corrupt_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("config.json.corrupt-"))
+            .collect()
     }
 
     #[test]

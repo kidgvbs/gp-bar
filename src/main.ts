@@ -11,6 +11,10 @@ interface VpnState {
   gateway: string | null;
   connected_since_epoch_secs: number | null;
   pid: number | null;
+  // While Connected: a fresh connect would go through a named gateway other
+  // than the live one. Backend-owned (see apply_reconnect_armed in
+  // src-tauri/src/vpn.rs) — this side only renders it.
+  reconnect_armed: boolean;
   last_error: string | null;
 }
 
@@ -124,13 +128,6 @@ let currentPhase: Phase = "Disconnected";
 let connectedSince: number | null = null;
 let logLines: string[] = [];
 
-// Gateway switch while connected: the gateway the tunnel is actually on
-// (mirrors state.gateway) and whether a different pick is armed for a
-// Reconnect. The picker stays editable while Connected; a pick that differs
-// from the live tunnel turns the action button into an orange Reconnect.
-let connectedGateway: string | null = null;
-let reconnectArmed = false;
-
 // Gateway picker: mirror of the last-rendered config fields, kept so the
 // star / remove controls can update without re-reading the config.
 let preferredGateway: string | null = null;
@@ -166,6 +163,25 @@ function showCmdError(message: string) {
 function clearCmdError() {
   clearTimeout(cmdErrorTimer);
   cmdError.classList.add("hidden");
+}
+
+// -- config persistence ---------------------------------------------------------
+// get_config_read_error(): the startup config file could not be READ
+// (permissions, I/O). Saves are then no-ops for the whole session — the
+// backend must not overwrite a file it could not read — so the user has
+// to know their changes are not sticking. Shown once, in the shared error
+// row, the first time the panel is actually looked at: the panel window
+// is created hidden at startup, so showing it at load would expire
+// unseen behind the 6 s auto-hide.
+const configReadError = await invoke<string | null>("get_config_read_error");
+let configErrorShown = false;
+if (configReadError !== null) {
+  await win.onFocusChanged(({ payload: focused }) => {
+    if (focused && !configErrorShown) {
+      configErrorShown = true;
+      showCmdError(`Config could not be read (${configReadError}) — changes are NOT saved`);
+    }
+  });
 }
 
 // -- action button in-flight guard ----------------------------------------------
@@ -211,7 +227,6 @@ function render(state: VpnState) {
   currentPhase = state.phase;
   lastState = state;
   connectedSince = state.connected_since_epoch_secs;
-  connectedGateway = state.gateway ?? null;
   statusDot.className = "status-dot " + state.phase.toLowerCase();
   stateBlock.dataset.phase = state.phase;
 
@@ -219,10 +234,10 @@ function render(state: VpnState) {
     case "Connected":
       stateLabel.textContent = "Connected";
       stateDetail.textContent = state.portal + (state.gateway ? ` · ${state.gateway}` : "");
-      // A pending gateway switch survives state refreshes (timer tick,
-      // log events): keep the Reconnect button until it fires or the
-      // pick matches the tunnel again.
-      if (reconnectArmed) {
+      // The backend owns the armed flag (reconnect_armed): it survives
+      // state refreshes (timer tick, log events) until the switch fires
+      // or the pick matches the tunnel again.
+      if (state.reconnect_armed) {
         actionBtn.textContent = "Reconnect";
       } else {
         actionBtn.textContent = "Disconnect";
@@ -255,10 +270,7 @@ function render(state: VpnState) {
       break;
   }
   tickDuration();
-  // The armed Reconnect survives only while Connected: any teardown or
-  // error state disarms it (the click handler chains the connect itself).
-  if (currentPhase !== "Connected") reconnectArmed = false;
-  updateActionReconnect();
+  updateActionReconnect(state.reconnect_armed);
   // Both the gateway row (frozen while a connection is active) and the
   // residual-DNS banner (only meaningful while the VPN is down) track the
   // phase on every state event.
@@ -266,8 +278,8 @@ function render(state: VpnState) {
   updateDnsBanner();
 }
 
-function updateActionReconnect() {
-  actionBtn.classList.toggle("reconnect", reconnectArmed);
+function updateActionReconnect(armed: boolean) {
+  actionBtn.classList.toggle("reconnect", armed);
 }
 
 function renderPortals(config: PortalsConfig) {
@@ -473,23 +485,12 @@ actionBtn.addEventListener("click", async () => {
   setActionDisabled(true);
   clearCmdError();
   try {
-    if (currentPhase === "Connected" && reconnectArmed) {
-      // Gateway switch: tear the tunnel down, then bring it back up through
-      // the newly picked gateway. The disconnect invoke resolves once the
-      // worker is gone, but the backend's phase still flips to Disconnected
-      // via its poller — wait that out before connecting, or do_connect
-      // refuses ("cannot connect while Disconnecting").
-      const gateway = gatewaySelect.value || null;
-      const portal = portalSelect.value;
-      const reuseCookie = cookieCache.checked;
-      await invoke("disconnect");
-      const deadline = Date.now() + 15000;
-      while (Date.now() < deadline) {
-        const state = await invoke<VpnState>("get_state");
-        if (state.phase !== "Disconnecting") break;
-        await new Promise((r) => setTimeout(r, 250));
-      }
-      await invoke("connect", { portal, reuseCookie, gateway });
+    if (currentPhase === "Connected" && lastState?.reconnect_armed) {
+      // Gateway switch: the backend owns the whole chain now — it tears
+      // the tunnel down, waits out its own Disconnecting observation,
+      // and connects through the target the armed flag was computed
+      // against (nothing to forward from here).
+      await invoke("reconnect");
     } else if (currentPhase === "Connected" || currentPhase === "Disconnecting") {
       await invoke("disconnect");
     } else if (currentPhase === "Connecting") {
@@ -533,25 +534,11 @@ gatewaySelect.addEventListener("change", async () => {
     showCmdError(String(error));
     return;
   }
-  // While connected, a pick that differs from the live tunnel arms a
-  // Reconnect ("Automatic" resolves to the preferred gateway here, per
-  // the backend's connect resolution). Re-picking the live gateway
-  // disarms it and restores the plain Disconnect.
-  // The right-click tray menu mirrors this condition backend-side
-  // (`tray_reconnect_armed` in src-tauri/src/main.rs): resolved target
-  // (pick > preferred) differs from connectedGateway, else not armed.
-  // They can drift in one timing corner: the tray re-arms on ANY
-  // config-updated or vpn-state event (it recomputes), while this
-  // button arms ONLY here — a ★ preferred change that crosses the
-  // live gateway shows in the tray immediately but in the panel only
-  // after the next state event. Update both if this condition changes.
-  if (currentPhase === "Connected") {
-    const target = gatewaySelect.value || preferredGateway;
-    reconnectArmed =
-      connectedGateway !== null ? target !== connectedGateway : target !== null;
-    actionBtn.textContent = reconnectArmed ? "Reconnect" : "Disconnect";
-    updateActionReconnect();
-  }
+  // While Connected, a pick that differs from the live tunnel arms the
+  // amber Reconnect — backend-side now: select_gateway re-notes the
+  // reconnect target and the next vpn-state event carries the armed
+  // flag to this button and the tray menu together. No recompute here,
+  // so the two can no longer drift.
   updateGatewayControls();
 });
 

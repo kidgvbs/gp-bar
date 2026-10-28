@@ -56,6 +56,11 @@ pub struct VpnState {
     pub gateway: Option<String>,
     pub connected_since_epoch_secs: Option<i64>,
     pub pid: Option<u32>,
+    /// While Connected: a fresh connect would go through a named gateway
+    /// other than the live one (a gateway switch waiting to happen). The
+    /// panel renders the amber Reconnect off it, the tray menu arms its
+    /// Reconnect item off it — backend-owned, so the two can never drift.
+    pub reconnect_armed: bool,
     pub last_error: Option<String>,
 }
 
@@ -67,6 +72,7 @@ impl Default for VpnState {
             gateway: None,
             connected_since_epoch_secs: None,
             pid: None,
+            reconnect_armed: false,
             last_error: None,
         }
     }
@@ -83,6 +89,13 @@ struct Inner {
     /// previous attempt's (stale, no pid) and would be reported as a false
     /// "worker exited" through the whole SSO login.
     worker_started: bool,
+    /// What a fresh connect would target right now (the resolved gateway:
+    /// explicit pick, else preferred — noted by `note_reconnect_target`
+    /// after every config change that touches the resolution, seeded once
+    /// at startup). `state.reconnect_armed` is derived from it on every
+    /// update (`apply_reconnect_armed`); the controller never reads the
+    /// config itself.
+    reconnect_target: Option<String>,
 }
 
 pub struct VpnController {
@@ -105,6 +118,10 @@ impl VpnController {
             let mut inner = self.inner.lock().unwrap();
             let before = inner.state.clone();
             mutate(&mut inner);
+            // The armed flag is derived state, never a second source of
+            // truth: recompute it after every mutation so every emitted
+            // state satisfies the formula (see `apply_reconnect_armed`).
+            apply_reconnect_armed(&mut inner);
             if inner.state == before {
                 // Nothing observable changed (e.g. a poll tick with the same
                 // phase): skip the event instead of waking every listener.
@@ -243,6 +260,33 @@ impl VpnController {
     pub fn note_selected_portal(&self, app: &AppHandle, portal: Option<String>) {
         self.update(app, |inner| apply_selected_portal(inner, portal));
     }
+
+    /// Record what a fresh connect would currently target (the resolved
+    /// gateway), so `reconnect_armed` stays truthful without the controller
+    /// ever reading the config: called after every config save that touches
+    /// the resolution (see `sync_reconnect_target` in main.rs) and seeded
+    /// once at startup. While Connected, a target differing from the live
+    /// gateway arms the flag in the very same update — the vpn-state event
+    /// carries it to the panel and the tray together.
+    pub fn note_reconnect_target(&self, app: &AppHandle, target: Option<String>) {
+        self.update(app, |inner| {
+            inner.reconnect_target = target;
+        });
+    }
+}
+
+/// Pure half of the armed flag: `reconnect_armed` is true exactly while
+/// Connected AND the fresh-connect target names a gateway other than the
+/// live one. `None` target = gpclient auto-gateway: nothing to switch to.
+/// A `None` live gateway (the tunnel came up before the log tailer parsed
+/// its name, or an outside-started worker never wrote our log) counts as a
+/// switch for any explicit target — same semantics the frontend condition
+/// this replaces had. Recomputed by `update` after every mutation.
+fn apply_reconnect_armed(inner: &mut Inner) {
+    let armed = inner.state.phase == Phase::Connected
+        && inner.reconnect_target.is_some()
+        && inner.reconnect_target != inner.state.gateway;
+    inner.state.reconnect_armed = armed;
 }
 
 /// Pure half of `VpnController::note_selected_portal`, so the state machine
@@ -267,6 +311,9 @@ fn enter_connecting(inner: &mut Inner, portal: &str) -> Result<(), Phase> {
     inner.state.connected_since_epoch_secs = None;
     // New attempt: its start is not confirmed yet (see `worker_started`).
     inner.worker_started = false;
+    // Leaving Connected clears the armed flag in the state this transition
+    // emits (it is Connected-only, see `apply_reconnect_armed`).
+    apply_reconnect_armed(inner);
     Ok(())
 }
 
@@ -276,6 +323,9 @@ fn enter_disconnecting(inner: &mut Inner) -> Result<(), Phase> {
     match inner.state.phase.clone() {
         Phase::Connected => {
             inner.state.phase = Phase::Disconnecting;
+            // The armed flag must not go stale through the Disconnecting
+            // window: clear it in the state this transition emits.
+            apply_reconnect_armed(inner);
             Ok(())
         }
         Phase::Disconnecting => Ok(()),
@@ -293,12 +343,12 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
             // session (e.g. started from a terminal, or the app restarted).
             inner.state.phase = Phase::Connected;
             inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-            inner.state.pid = Some(obs.pid);
+            inner.state.pid = Some(obs.pid.get());
         }
         (Some(obs), Phase::Connecting) => {
             inner.state.phase = Phase::Connected;
             inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-            inner.state.pid = Some(obs.pid);
+            inner.state.pid = Some(obs.pid.get());
         }
         (Some(_), Phase::Connected | Phase::Disconnecting) => {}
         (None, Phase::Connected | Phase::Disconnecting) => {
@@ -313,9 +363,49 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
     }
 }
 
+/// A PID as kill(2)/proc_pidpath may legally receive it: positive and
+/// within the i32 range, so never 0 (a process group) and never the
+/// wrap-around `kill(-1, 0)` ("every process") a plain `u32 as
+/// libc::pid_t` produces above `i32::MAX`. The invariant is the type:
+/// parsing is the single validation point, and `raw()` is the only
+/// `libc::pid_t` conversion in the crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pid(std::num::NonZeroI32);
+
+impl std::str::FromStr for Pid {
+    type Err = ();
+    /// Rejects 0, negatives, anything above `i32::MAX` and garbage: such
+    /// lock content counts as having no PID at all.
+    fn from_str(raw: &str) -> Result<Self, ()> {
+        let n: i32 = raw.trim().parse().map_err(|_| ())?;
+        std::num::NonZeroI32::new(n)
+            .filter(|n| n.get() > 0)
+            .map(Pid)
+            .ok_or(())
+    }
+}
+
+impl std::fmt::Display for Pid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.get().fmt(f)
+    }
+}
+
+impl Pid {
+    /// The `libc::pid_t` every probe (kill, proc_pidpath) receives.
+    fn raw(self) -> libc::pid_t {
+        self.0.get()
+    }
+
+    /// The wire payload: `VpnState.pid` is a plain JSON number.
+    fn get(self) -> u32 {
+        self.0.get().unsigned_abs()
+    }
+}
+
 /// What the PID lock file tells us right now.
 pub struct LockObservation {
-    pub pid: u32,
+    pub pid: Pid,
     /// Lock file mtime; when gpclient wrote it, i.e. when the tunnel went up.
     pub connected_since_epoch_secs: i64,
 }
@@ -347,27 +437,25 @@ pub fn read_lock_observation() -> Option<LockObservation> {
     })
 }
 
-/// PID from the lock file (`gpclient` writes its own `std::process::id()`).
-/// Parse into a u32 FIRST and bound it to the positive i32 range: a `u32`
-/// cast straight to `libc::pid_t` would wrap negative above `i32::MAX`, and
-/// `kill(-1, 0)` means "every process" — a phantom-alive lock.
-/// Empty or garbage content is treated like a missing PID.
-fn parse_lock_pid(raw: &str) -> Option<u32> {
-    let pid = raw.trim().parse::<u32>().ok()?;
-    (pid > 0 && pid <= i32::MAX as u32).then_some(pid)
+/// PID from the lock file (`gpclient` writes its own
+/// `std::process::id()`). Parsing IS the validation: `Pid` exists only
+/// for positive in-range values, so the probes can neither target a
+/// process group nor wrap into `kill(-1, 0)`, and no `as libc::pid_t`
+/// cast survives anywhere. Empty or garbage content is treated like a
+/// missing PID.
+fn parse_lock_pid(raw: &str) -> Option<Pid> {
+    raw.trim().parse::<Pid>().ok()
 }
 
 /// `kill(pid, 0)` sends no signal: it only probes existence, and needs no
 /// fork/exec (a `ps -p` probe would spawn a subprocess every poll tick).
 /// When the probe fails with EPERM the process exists but belongs to root —
-/// our worker.
-fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
+/// our worker. `Pid` is positive by construction, so this can never
+/// address a process group.
+fn process_alive(pid: Pid) -> bool {
     // SAFETY: kill(2) with signal 0 only performs the permission/existence
     // check; it never delivers a signal.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let ret = unsafe { libc::kill(pid.raw(), 0) };
     ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -380,14 +468,12 @@ fn process_alive(pid: u32) -> bool {
 /// the worker's binary name (setup-admin.sh copies gpclient to
 /// `$PREFIX/bin/gpclient`, so the name is stable regardless of install).
 #[cfg(target_os = "macos")]
-fn process_is_gpclient(pid: u32) -> bool {
+fn process_is_gpclient(pid: Pid) -> bool {
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: proc_pidpath writes at most `buffersize` bytes into `buffer`
     // and only reads the integer `pid`; both come from here.
-    unsafe extern "C" {
-        fn proc_pidpath(pid: libc::pid_t, buffer: *mut u8, buffersize: u32) -> i32;
-    }
-    let mut buffer = [0u8; 4096];
-    let len = unsafe { proc_pidpath(pid as libc::pid_t, buffer.as_mut_ptr(), buffer.len() as u32) };
+    let len =
+        unsafe { libc::proc_pidpath(pid.raw(), buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     if len <= 0 {
         // Dead PID, or not permitted: cannot confirm, do not trust.
         return false;
@@ -399,7 +485,7 @@ fn process_is_gpclient(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn process_is_gpclient(_pid: u32) -> bool {
+fn process_is_gpclient(_pid: Pid) -> bool {
     // No proc_pidpath off macOS: keep the kill(pid, 0) semantics only.
     true
 }
@@ -553,7 +639,7 @@ async fn tail_chunk(
     buffer.extend_from_slice(&chunk);
 
     for line in drain_complete_lines(buffer) {
-        emit_log_line(app, controller, &line);
+        emit_log_line(app, controller, &line).await;
     }
     // Guard: never grow the buffer unboundedly if gpclient never prints a newline.
     if buffer.len() > 1 << 20 {
@@ -573,7 +659,7 @@ struct LogEvent {
     message: String,
 }
 
-fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
+async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
     let event = match serde_json::from_str::<serde_json::Value>(line) {
         Ok(value) => LogEvent {
             level: value
@@ -605,10 +691,10 @@ fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
         // harvest the NAME (never the address — the picker stores names).
         Some(GatewayMention::Selected { name, address }) => {
             if let Some(address) = address {
-                learn_gateway_host(app, &address, &name);
+                learn_gateway_host(app, &address, &name).await;
             }
             controller.observe_gateway(app, Some(name.clone()));
-            harvest_gateway(app, &name);
+            harvest_gateway(app, &name).await;
         }
         // A getconfig POST: the cached-cookie path emits only this. Translate
         // to the picker name via the config map; display the raw FQDN when
@@ -617,7 +703,7 @@ fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
             let name = gateway_display_name(app, &host);
             controller.observe_gateway(app, Some(name.clone().unwrap_or(host)));
             if let Some(name) = name {
-                harvest_gateway(app, &name);
+                harvest_gateway(app, &name).await;
             }
         }
         None => {}
@@ -670,27 +756,40 @@ fn parse_gateway(message: &str) -> Option<GatewayMention> {
 
 /// Remember a gateway FQDN → name pair in the config, so the cached-cookie
 /// re-auth path (which logs only the FQDN) can still display the name.
-fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
-    use tauri::Manager;
-    let Some(ctx) = app.try_state::<crate::AppContext>() else {
-        return;
-    };
-    let (cfg, changed) = {
-        let mut cfg = ctx.config.lock().unwrap();
-        if cfg.gateway_hosts.get(address).map(String::as_str) == Some(name) {
-            (cfg.clone(), false)
-        } else {
-            cfg.gateway_hosts
-                .insert(address.to_string(), name.to_string());
-            if let Err(error) = cfg.save() {
-                log::warn!("cannot save the gateway host map: {error}");
+///
+/// Runs on the log tailer's async task, but the config save is blocking I/O
+/// behind a mutex: the whole `update_config` goes to the blocking pool
+/// (N13), and the emit happens back on the async side with every guard
+/// already dropped.
+async fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
+    let app_for_save = app.clone();
+    let address = address.to_string();
+    let name = name.to_string();
+    // The Option layer is "no AppContext managed" (None); the inner Result
+    // is the save outcome.
+    let outcome = tokio::task::spawn_blocking(move || {
+        use tauri::Manager;
+        // No AppContext managed (?): None — the event was not ours to save.
+        let ctx = app_for_save.try_state::<crate::AppContext>()?;
+        // update_config: mutate a clone, save, commit only on success — this
+        // used to mutate the live config before saving (see AppContext).
+        Some(ctx.update_config(move |cfg| {
+            if cfg.gateway_hosts.get(&address).map(String::as_str) == Some(name.as_str()) {
+                return Ok(false);
             }
-            (cfg.clone(), true)
+            cfg.gateway_hosts.insert(address, name);
+            Ok(true)
+        }))
+    })
+    .await;
+    match outcome {
+        Ok(Some(Ok((true, cfg)))) => {
+            // Guard dropped BEFORE emitting (see `update`).
+            let _ = app.emit("config-updated", &cfg);
         }
-        // Guard dropped BEFORE emitting (see `update`).
-    };
-    if changed {
-        let _ = app.emit("config-updated", &cfg);
+        Ok(Some(Ok((false, _)))) | Ok(None) => {}
+        Ok(Some(Err(error))) => log::warn!("cannot save the gateway host map: {error}"),
+        Err(error) => log::warn!("gateway host map save task failed: {error}"),
     }
 }
 
@@ -705,11 +804,12 @@ fn gateway_display_name(app: &AppHandle, address: &str) -> Option<String> {
 /// A gateway name parsed from the live connect log: keep it in the config so
 /// the picker can offer it next time (`gpclient` lists gateways only while
 /// connecting; there is no query command).
-fn harvest_gateway(app: &AppHandle, gateway: &str) {
-    use tauri::Manager;
-    let Some(ctx) = app.try_state::<crate::AppContext>() else {
-        return;
-    };
+///
+/// Runs on the log tailer's async task, but the config save is blocking I/O
+/// behind a mutex: the whole `update_config` goes to the blocking pool
+/// (N13), and the emit happens back on the async side with every guard
+/// already dropped.
+async fn harvest_gateway(app: &AppHandle, gateway: &str) {
     // Same charset the wrapper and `select_gateway` enforce: a name
     // harvested straight from the log must not reach the picker if the
     // wrapper would refuse it (the picker would offer a dead entry).
@@ -717,20 +817,33 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
         log::warn!("skipping harvested gateway {gateway:?}: invalid name");
         return;
     }
-    let (cfg, changed) = {
-        let mut cfg = ctx.config.lock().unwrap();
-        let changed = !cfg.gateways.iter().any(|g| g == gateway);
-        if changed {
-            cfg.gateways.push(gateway.to_string());
-            if let Err(error) = cfg.save() {
-                log::warn!("cannot save the harvested gateway: {error}");
+    let app_for_save = app.clone();
+    let gateway = gateway.to_string();
+    // The Option layer is "no AppContext managed" (None); the inner Result
+    // is the save outcome.
+    let outcome = tokio::task::spawn_blocking(move || {
+        use tauri::Manager;
+        // No AppContext managed (?): None — the event was not ours to save.
+        let ctx = app_for_save.try_state::<crate::AppContext>()?;
+        // update_config: mutate a clone, save, commit only on success (see
+        // AppContext) — the unchanged case skips the disk write too.
+        Some(ctx.update_config(move |cfg| {
+            if cfg.gateways.iter().any(|g| g == &gateway) {
+                return Ok(false);
             }
+            cfg.gateways.push(gateway);
+            Ok(true)
+        }))
+    })
+    .await;
+    match outcome {
+        Ok(Some(Ok((true, cfg)))) => {
+            // Guard dropped BEFORE emitting (see `update`).
+            let _ = app.emit("config-updated", &cfg);
         }
-        (cfg.clone(), changed)
-        // Guard dropped BEFORE emitting (see `update`).
-    };
-    if changed {
-        let _ = app.emit("config-updated", &cfg);
+        Ok(Some(Ok((false, _)))) | Ok(None) => {}
+        Ok(Some(Err(error))) => log::warn!("cannot save the harvested gateway: {error}"),
+        Err(error) => log::warn!("harvested gateway save task failed: {error}"),
     }
 }
 
@@ -1084,7 +1197,7 @@ mod tests {
     #[test]
     fn apply_lock_transitions() {
         let obs = || LockObservation {
-            pid: 4242,
+            pid: Pid(std::num::NonZeroI32::new(4242).unwrap()),
             connected_since_epoch_secs: 1_700_000_000,
         };
         let inner_at = |phase: Phase| {
@@ -1195,6 +1308,64 @@ mod tests {
         }
     }
 
+    /// The armed condition, moved here from main.rs's `tray_reconnect_armed`
+    /// with the flag itself: armed exactly when a fresh connect would go
+    /// through a named gateway other than the live tunnel's.
+    #[test]
+    fn reconnect_arms_only_on_a_real_gateway_switch() {
+        let g = |s: &str| Some(s.to_string());
+        let armed_at = |target: Option<String>, live: Option<String>| {
+            let mut inner = Inner::default();
+            inner.state.phase = Phase::Connected;
+            inner.state.gateway = live;
+            inner.reconnect_target = target;
+            apply_reconnect_armed(&mut inner);
+            inner.state.reconnect_armed
+        };
+        // Target equal to the live gateway: no switch.
+        assert!(!armed_at(g("gw-1"), g("gw-1")));
+        // Target differing from the live gateway: switch.
+        assert!(armed_at(g("gw-1"), g("gw-2")));
+        // No target (gpclient auto-gateway): nothing to switch to.
+        assert!(!armed_at(None, g("gw-1")));
+        assert!(!armed_at(None, None));
+        // Live gateway unknown (tunnel up before the tailer parsed its
+        // name): any explicit target counts as a switch.
+        assert!(armed_at(g("gw-1"), None));
+    }
+
+    /// The armed flag is a Connected-only affordance: every other phase
+    /// keeps it false, and the transitions leaving Connected clear it in
+    /// the state they emit instead of letting it go stale through the
+    /// Disconnecting window.
+    #[test]
+    fn reconnect_arms_only_while_connected() {
+        let g = |s: &str| Some(s.to_string());
+        for phase in [
+            Phase::Disconnected,
+            Phase::Connecting,
+            Phase::Disconnecting,
+            Phase::Error,
+        ] {
+            let mut inner = Inner::default();
+            inner.state.phase = phase;
+            inner.state.gateway = g("gw-2");
+            inner.reconnect_target = g("gw-1");
+            apply_reconnect_armed(&mut inner);
+            assert!(!inner.state.reconnect_armed);
+        }
+
+        // Armed while Connected, cleared by the teardown transition.
+        let mut inner = Inner::default();
+        inner.state.phase = Phase::Connected;
+        inner.state.gateway = g("gw-2");
+        inner.reconnect_target = g("gw-1");
+        apply_reconnect_armed(&mut inner);
+        assert!(inner.state.reconnect_armed);
+        enter_disconnecting(&mut inner).unwrap();
+        assert!(!inner.state.reconnect_armed);
+    }
+
     #[test]
     fn poller_exit_gate_requires_a_confirmed_start() {
         // Connecting but `run_admin("start")` not back yet: the poller
@@ -1286,10 +1457,13 @@ mod tests {
 
     #[test]
     fn parses_lock_pids_within_the_positive_i32_range() {
-        // Values above i32::MAX must not wrap negative through `as`
-        // (kill(-1, 0) = "every process" = phantom alive).
-        assert_eq!(parse_lock_pid("4242\n"), Some(4242));
-        assert_eq!(parse_lock_pid("  4242  "), Some(4242));
+        let pid = |n: i32| Pid(std::num::NonZeroI32::new(n).unwrap());
+        // Values above i32::MAX are rejected at parse — the bounds are
+        // the Pid type now, not a check callers must remember (a `u32`
+        // `as libc::pid_t` would wrap negative: kill(-1, 0) = "every
+        // process" = phantom alive).
+        assert_eq!(parse_lock_pid("4242\n"), Some(pid(4242)));
+        assert_eq!(parse_lock_pid("  4242  "), Some(pid(4242)));
         assert_eq!(parse_lock_pid("0"), None);
         assert_eq!(parse_lock_pid("2147483648"), None);
         assert_eq!(parse_lock_pid("4294967295"), None);
@@ -1298,6 +1472,35 @@ mod tests {
         assert_eq!(parse_lock_pid(""), None);
         assert_eq!(parse_lock_pid("not a pid"), None);
         assert_eq!(parse_lock_pid("-1"), None);
+    }
+
+    #[test]
+    fn pids_are_positive_i32s_by_construction() {
+        let pid = |n: i32| Pid(std::num::NonZeroI32::new(n).unwrap());
+        // The wire payload is the plain number, never a wrapped negative.
+        assert_eq!(pid(4242).get(), 4242);
+        assert_eq!(pid(4242).raw(), 4242);
+        // Display keeps the stale-lock warning's "PID 4242" shape.
+        assert_eq!(pid(4242).to_string(), "4242");
+        assert_eq!(pid(1).to_string(), "1");
+        // FromStr rejects everything outside the positive i32 range.
+        assert!("1".parse::<Pid>().is_ok());
+        assert!("2147483647".parse::<Pid>().is_ok());
+        for bad in [
+            "0",
+            "-1",
+            "-2147483648",
+            "2147483648",
+            "",
+            "  ",
+            "x",
+            "42x",
+            "1.5",
+        ] {
+            assert!(bad.parse::<Pid>().is_err(), "{bad:?} must not be a Pid");
+        }
+        // The same trim the lock parse relies on.
+        assert_eq!(" 42\n".parse::<Pid>().ok(), Some(pid(42)));
     }
 
     #[test]

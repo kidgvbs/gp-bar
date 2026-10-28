@@ -60,9 +60,77 @@ pub(crate) struct AppContext {
     /// Which panel backdrop (native liquid glass vs CSS vibrancy) was
     /// resolved at startup; reported to the frontend via `get_panel_effect`.
     panel_effect: PanelEffect,
+
+    /// The `config::Loaded` branch the startup load took ("fresh", "from
+    /// disk", "unreadable"), logged once in `setup`: `Config::load` runs
+    /// before the log plugin is attached, so its failure branches can
+    /// only eprintln (they do).
+    config_load: &'static str,
+    /// `Some(error)` only when the startup config file could not be READ
+    /// (permissions, I/O — a corrupt file is a different branch: renamed
+    /// aside, counts as fresh). The in-memory config is then NOT the
+    /// user's data: every save is a no-op (`save_config`), and the panel
+    /// shows the error once (`get_config_read_error`).
+    config_read_error: Option<String>,
+}
+
+impl AppContext {
+    /// The one way the config mutates: clone the live config, apply `f`,
+    /// save the clone, and commit it to the live copy only when the save
+    /// succeeded — a failed save must not leave memory diverged from
+    /// disk, and `f` bailing with Err must touch neither. An unchanged
+    /// result skips the disk write entirely.
+    ///
+    /// The config mutex is taken and released inside; anything that emits
+    /// (`broadcast_config`, `note_selected_portal`) may only run AFTER
+    /// this returns — the guard-dropped-before-emitting discipline, see
+    /// `vpn::update`.
+    pub(crate) fn update_config<T>(
+        &self,
+        f: impl FnOnce(&mut Config) -> Result<T, String>,
+    ) -> Result<(T, Config), String> {
+        let mut cfg = self.config.lock().unwrap();
+        let mut next = cfg.clone();
+        let out = f(&mut next)?;
+        if next != *cfg {
+            self.save_config(&next)?;
+            *cfg = next;
+        }
+        Ok((out, cfg.clone()))
+    }
+
+    /// Whether saves may write to disk: false only while the startup load
+    /// found the config file unreadable — writing the in-memory defaults
+    /// would then destroy the very file the app could not read. This is
+    /// the `persist` flag of the config load (see `config::Loaded`).
+    fn persist(&self) -> bool {
+        self.config_read_error.is_none()
+    }
+
+    /// Save `cfg` to disk unless the startup load was unreadable (see
+    /// `persist`): a no-op, logged on every attempt, never a hard error —
+    /// the config still mutates in memory for this session.
+    fn save_config(&self, cfg: &Config) -> Result<(), String> {
+        if !self.persist() {
+            log::warn!(
+                "config: not saving — the file was unreadable at startup, writing would destroy it"
+            );
+            return Ok(());
+        }
+        cfg.save()
+    }
 }
 
 // -- commands -----------------------------------------------------------------
+//
+// The mutating commands are `async` and run their whole `update_config`
+// in `tokio::task::spawn_blocking`: non-async commands execute on the
+// MAIN thread — the AppKit run loop — and every save fsyncs (tens of
+// milliseconds of UI freeze per portal/gateway click); async ones run
+// on tokio workers, where a blocking save silently stalls the runtime's
+// capacity. Either way the file I/O belongs on the blocking pool. The
+// config mutex is taken and released inside the closure, so the guard
+// never crosses an `.await`.
 
 #[tauri::command]
 fn get_state(state: State<'_, AppContext>) -> VpnState {
@@ -79,6 +147,15 @@ fn get_panel_effect(state: State<'_, AppContext>) -> &'static str {
 #[tauri::command]
 fn get_config(state: State<'_, AppContext>) -> Config {
     state.config.lock().unwrap().clone()
+}
+
+/// Why config changes cannot be saved, when the startup load hit an
+/// unreadable file (permissions, I/O — a corrupt file is a different
+/// branch and keeps saving). `None` while the config persists normally;
+/// the panel shows the error once (see src/main.ts).
+#[tauri::command]
+fn get_config_read_error(state: State<'_, AppContext>) -> Option<String> {
+    state.config_read_error.clone()
 }
 
 #[tauri::command]
@@ -101,7 +178,11 @@ struct VersionInfo {
 }
 
 #[tauri::command]
-fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
+async fn add_portal(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+    portal: String,
+) -> Result<(), String> {
     let portal = portal.trim().to_string();
     if !valid_name(&portal) {
         return Err(
@@ -109,78 +190,87 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
                 .to_string(),
         );
     }
-    // Mutate a clone, save the clone, and commit to the live config only on
-    // success: a failed save must not leave memory diverged from disk.
-    let selected = {
-        let mut cfg = state.config.lock().unwrap();
-        let mut next = cfg.clone();
-        if !next.portals.contains(&portal) {
-            next.portals.push(portal.clone());
-        }
-        if next.selected.is_none() {
-            next.selected = Some(portal);
-        }
-        next.save()?;
-        *cfg = next;
-        cfg.selected.clone()
-    };
-    state.controller.note_selected_portal(&app, selected);
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            if !cfg.portals.contains(&portal) {
+                cfg.portals.push(portal.clone());
+            }
+            if cfg.selected.is_none() {
+                cfg.selected = Some(portal);
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    // Emit outside the config lock — update_config has dropped it.
+    state
+        .controller
+        .note_selected_portal(&app, cfg.selected.clone());
     Ok(())
 }
 
 #[tauri::command]
-fn remove_portal(
+async fn remove_portal(
     app: AppHandle,
     state: State<'_, AppContext>,
     portal: String,
 ) -> Result<(), String> {
-    let selected = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        next.portals.retain(|p| p != &portal);
-        if next.selected.as_deref() == Some(portal.as_str()) {
-            next.selected = next.portals.first().cloned();
-        }
-        next.save()?;
-        *cfg = next;
-        cfg.selected.clone()
-    };
-    state.controller.note_selected_portal(&app, selected);
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            cfg.portals.retain(|p| p != &portal);
+            if cfg.selected.as_deref() == Some(portal.as_str()) {
+                cfg.selected = cfg.portals.first().cloned();
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    state
+        .controller
+        .note_selected_portal(&app, cfg.selected.clone());
     Ok(())
 }
 
 #[tauri::command]
-fn select_portal(
+async fn select_portal(
     app: AppHandle,
     state: State<'_, AppContext>,
     portal: String,
 ) -> Result<(), String> {
-    let selected = {
-        let mut cfg = state.config.lock().unwrap();
-        // An unknown portal must fail loud — not silently re-save and Ok.
-        if !cfg.portals.contains(&portal) {
-            return Err(format!("unknown portal: {portal}"));
-        }
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        next.selected = Some(portal);
-        next.save()?;
-        *cfg = next;
-        cfg.selected.clone()
-    };
-    state.controller.note_selected_portal(&app, selected);
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            // An unknown portal must fail loud — not silently re-save and Ok.
+            if !cfg.portals.contains(&portal) {
+                return Err(format!("unknown portal: {portal}"));
+            }
+            cfg.selected = Some(portal);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    state
+        .controller
+        .note_selected_portal(&app, cfg.selected.clone());
     Ok(())
 }
 
 #[tauri::command]
-fn set_reuse_cookie(state: State<'_, AppContext>, value: bool) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    // Clone-save-commit (see add_portal): no divergence on save failure.
-    let mut next = cfg.clone();
-    next.reuse_cookie = value;
-    next.save()?;
-    *cfg = next;
+async fn set_reuse_cookie(app: AppHandle, value: bool) -> Result<(), String> {
+    // An unchanged value skips the disk write (see update_config).
+    tokio::task::spawn_blocking(move || {
+        app.state::<AppContext>().update_config(|cfg| {
+            cfg.reuse_cookie = value;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     Ok(())
 }
 
@@ -198,6 +288,16 @@ async fn connect(
 #[tauri::command]
 async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
     do_disconnect(app, &state).await
+}
+
+/// The armed gateway switch, from the panel's amber Reconnect button: the
+/// backend owns the whole chain (`do_reconnect`), reading the connect
+/// target from the config. Unlike `connect` — which still takes the
+/// panel's parameters — there is nothing to forward from the frontend:
+/// the armed flag and the target agree by construction.
+#[tauri::command]
+async fn reconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
+    do_reconnect(app, &state, "reconnect").await
 }
 
 #[tauri::command]
@@ -230,21 +330,29 @@ fn resolve_connect_gateway(explicit: Option<String>, preferred: Option<String>) 
     explicit.or(preferred)
 }
 
-/// Whether the tray's Reconnect item is armed: a Connected tunnel whose
-/// live gateway differs from what a fresh connect would resolve to
-/// (`resolve_connect_gateway`: explicit `selected_gateway`, else the
-/// preferred, else gpclient auto). This mirrors the frontend's amber-button
-/// condition in src/main.ts (target !== connectedGateway) — keep the two in
-/// step when either changes. `live` is `state.gateway`, which may be None
-/// while the tunnel gateway is still unknown: any non-auto resolution then
-/// counts as a switch (Some != None).
-fn tray_reconnect_armed(
-    selected: Option<String>,
-    preferred: Option<String>,
-    live: Option<String>,
-) -> bool {
-    let resolved = resolve_connect_gateway(selected, preferred);
-    resolved.is_some() && resolved != live
+/// What a panel-equivalent Connect would use right now: the selected portal
+/// (falling back to the first), the cookie-reuse setting, and the explicit
+/// gateway pick. The tray menu and `do_reconnect` share it — the reconnect
+/// chain must connect through exactly what the panel would.
+fn connect_target_from_config(cfg: &Config) -> (String, bool, Option<String>) {
+    let portal = cfg
+        .selected
+        .clone()
+        .or_else(|| cfg.portals.first().cloned())
+        .unwrap_or_default();
+    (portal, cfg.reuse_cookie, cfg.selected_gateway.clone())
+}
+
+/// Keep the controller's notion of what a fresh connect would target, so
+/// `reconnect_armed` (vpn::apply_reconnect_armed) stays truthful without the
+/// controller ever reading the config: every command that changes the
+/// resolution (the gateway picker, the preferred star, the list itself)
+/// re-notes after its save, and setup seeds once at startup. `cfg` is the
+/// post-update config, lock-free by contract.
+fn sync_reconnect_target(app: &AppHandle, controller: &VpnController, cfg: &Config) {
+    let target =
+        resolve_connect_gateway(cfg.selected_gateway.clone(), cfg.preferred_gateway.clone());
+    controller.note_reconnect_target(app, target);
 }
 
 fn broadcast_config(app: &AppHandle, cfg: &Config) {
@@ -253,92 +361,99 @@ fn broadcast_config(app: &AppHandle, cfg: &Config) {
 }
 
 #[tauri::command]
-fn select_gateway(
+async fn select_gateway(
     app: AppHandle,
     state: State<'_, AppContext>,
     gateway: Option<String>,
 ) -> Result<(), String> {
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        match gateway.as_deref() {
-            // null = "Auto": back to auto-gateway (preferred still applies).
-            None => next.selected_gateway = None,
-            Some(name) => {
-                if !valid_name(name) {
-                    return Err(
-                        "Gateway may only contain letters, digits, dots, dashes and underscores"
-                            .to_string(),
-                    );
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            match gateway.as_deref() {
+                // null = "Auto": back to auto-gateway (preferred still applies).
+                None => cfg.selected_gateway = None,
+                Some(name) => {
+                    if !valid_name(name) {
+                        return Err(
+                            "Gateway may only contain letters, digits, dots, dashes and underscores"
+                                .to_string(),
+                        );
+                    }
+                    if !cfg.gateways.iter().any(|g| g == name) {
+                        return Err("Unknown gateway".to_string());
+                    }
+                    cfg.selected_gateway = Some(name.to_string());
                 }
-                if !next.gateways.iter().any(|g| g == name) {
-                    return Err("Unknown gateway".to_string());
-                }
-                next.selected_gateway = Some(name.to_string());
             }
-        }
-        next.save()?;
-        *cfg = next;
-        cfg.clone()
-        // Guard dropped before emitting (deadlock discipline, see vpn::update).
-    };
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    // Guard dropped before emitting (deadlock discipline, see vpn::update).
     broadcast_config(&app, &cfg);
+    // The picker changed the resolution: re-note the target so the armed
+    // flag (vpn-state → panel and tray) reflects the switch while Connected.
+    sync_reconnect_target(&app, &state.controller, &cfg);
     Ok(())
 }
 
 #[tauri::command]
-fn set_preferred_gateway(
+async fn set_preferred_gateway(
     app: AppHandle,
     state: State<'_, AppContext>,
     gateway: Option<String>,
 ) -> Result<(), String> {
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        match gateway.as_deref() {
-            None => next.preferred_gateway = None,
-            Some(name) => {
-                if !valid_name(name) {
-                    return Err("Invalid gateway name".to_string());
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            match gateway.as_deref() {
+                None => cfg.preferred_gateway = None,
+                Some(name) => {
+                    if !valid_name(name) {
+                        return Err("Invalid gateway name".to_string());
+                    }
+                    if !cfg.gateways.iter().any(|g| g == name) {
+                        return Err("Unknown gateway".to_string());
+                    }
+                    cfg.preferred_gateway = Some(name.to_string());
                 }
-                if !next.gateways.iter().any(|g| g == name) {
-                    return Err("Unknown gateway".to_string());
-                }
-                next.preferred_gateway = Some(name.to_string());
             }
-        }
-        next.save()?;
-        *cfg = next;
-        cfg.clone()
-    };
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
+    // The star changes what "Automatic" resolves to: re-note the target.
+    sync_reconnect_target(&app, &state.controller, &cfg);
     Ok(())
 }
 
 #[tauri::command]
-fn remove_gateway(
+async fn remove_gateway(
     app: AppHandle,
     state: State<'_, AppContext>,
     name: String,
 ) -> Result<(), String> {
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        next.gateways.retain(|g| g != &name);
-        if next.preferred_gateway.as_deref() == Some(name.as_str()) {
-            next.preferred_gateway = None;
-        }
-        if next.selected_gateway.as_deref() == Some(name.as_str()) {
-            next.selected_gateway = None;
-        }
-        next.save()?;
-        *cfg = next;
-        cfg.clone()
-    };
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            cfg.gateways.retain(|g| g != &name);
+            if cfg.preferred_gateway.as_deref() == Some(name.as_str()) {
+                cfg.preferred_gateway = None;
+            }
+            if cfg.selected_gateway.as_deref() == Some(name.as_str()) {
+                cfg.selected_gateway = None;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
+    // A removal can zero the preferred/selected picks: re-note the target.
+    sync_reconnect_target(&app, &state.controller, &cfg);
     Ok(())
 }
 
@@ -350,26 +465,33 @@ fn remove_gateway(
 /// invalidations during connects — no gateway-list fetching, ever.
 /// Gateways are harvested from connect logs and added manually.
 #[tauri::command]
-fn add_gateway(app: AppHandle, state: State<'_, AppContext>, name: String) -> Result<(), String> {
+async fn add_gateway(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+    name: String,
+) -> Result<(), String> {
     let name = name.trim().to_string();
     if !valid_name(&name) {
         return Err(
             "Gateway may only contain letters, digits, dots, dashes and underscores".to_string(),
         );
     }
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        if !next.gateways.iter().any(|g| g == &name) {
-            next.gateways.push(name.clone());
-            next.save()?;
-        }
-        *cfg = next;
-        cfg.clone()
-        // Guard dropped before emitting (deadlock discipline, see vpn::update).
-    };
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            if !cfg.gateways.iter().any(|g| g == &name) {
+                cfg.gateways.push(name.clone());
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    // Guard dropped before emitting (deadlock discipline, see vpn::update).
     broadcast_config(&app, &cfg);
+    // Uniform with the other gateway commands: re-note the target (an add
+    // cannot change the resolution, but one rule for one family of paths).
+    sync_reconnect_target(&app, &state.controller, &cfg);
     Ok(())
 }
 
@@ -499,6 +621,55 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
         // settings pointing at VPN resolvers. The poller reports the
         // still-connected truth from the lock file.
         controller.disconnect_failed(&app, format!("disconnect failed: {error}"));
+    }
+    Ok(())
+}
+
+/// Wait for the backend to observe its own disconnect: `gp-admin stop`
+/// returns once the worker is gone, but the phase flips to Disconnected
+/// via the status poller — a connect sent straight away is refused
+/// ("cannot connect while Disconnecting"). Bounded: 15 s in 250 ms steps,
+/// the same budget the frontend-chained implementation used.
+async fn wait_out_disconnecting(controller: &VpnController, context: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if controller.snapshot().phase != Phase::Disconnecting {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            log::warn!("{context}: timed out waiting for Disconnecting");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The armed gateway switch: tear the tunnel down, wait out the
+/// Disconnecting observation, then connect through what a fresh connect
+/// would target right now (`connect_target_from_config`; `do_connect`
+/// itself resolves the fallback chain). The target is read BEFORE the
+/// teardown: it is what `reconnect_armed` was computed against, and
+/// re-reading after would chase a picker change made mid-operation.
+/// `context` ("reconnect" / "tray reconnect") prefixes the log lines,
+/// which are stable grep targets — keep the formats byte-identical.
+async fn do_reconnect(
+    app: AppHandle,
+    state: &State<'_, AppContext>,
+    context: &str,
+) -> Result<(), String> {
+    let (portal, reuse_cookie, gateway) = {
+        let cfg = state.config.lock().unwrap();
+        connect_target_from_config(&cfg)
+        // Guard dropped before the disconnect work.
+    };
+    if let Err(error) = do_disconnect(app.clone(), state).await {
+        log::warn!("{context}: disconnect failed: {error}");
+        return Err(error);
+    }
+    wait_out_disconnecting(&state.controller, context).await;
+    if let Err(error) = do_connect(app.clone(), state, &portal, reuse_cookie, gateway).await {
+        log::warn!("{context}: connect failed: {error}");
+        return Err(error);
     }
     Ok(())
 }
@@ -741,32 +912,24 @@ fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
         let _ = tray.set_icon_with_as_template(Some(image), true);
         let _ = tray.set_tooltip(Some(tooltip));
     }
-    sync_tray_menu(app, state);
+    sync_tray_menu(state);
 }
 
-/// Keep the right-click menu items consistent with the phase AND the config:
-/// Connect where the panel would offer it; while Connected, either the armed
-/// Reconnect (a gateway switch: `tray_reconnect_armed`) or the plain
+/// Keep the right-click menu items consistent with the phase and the armed
+/// flag: Connect where the panel would offer it; while Connected, either
+/// the armed Reconnect (a gateway switch: `reconnect_armed` in VpnState,
+/// computed backend-side — see `vpn::apply_reconnect_armed`) or the plain
 /// Disconnect — never both; during the in-flight phases all stay dimmed
 /// (do_connect/do_disconnect guard the transitions, this just prevents the
-/// misleading click). Re-run on BOTH the vpn-state and config-updated paths:
-/// the armed condition depends on `selected_gateway`/`preferred_gateway`, and
-/// a picker/star change from the panel must reach the tray menu immediately.
-///
-/// Reads only the config lock (never the controller's): the vpn-state
-/// listener may run on the poller's thread, and both locks together would
-/// re-introduce the cross-lock coupling the `update()` discipline avoids.
-fn sync_tray_menu(app: &AppHandle, state: &VpnState) {
+/// misleading click). The flag travels in every vpn-state event and is
+/// re-derived on every relevant change, so this reads the state alone: no
+/// config lock, no controller lock, nothing that could re-introduce the
+/// cross-lock coupling the `update()` discipline avoids.
+fn sync_tray_menu(state: &VpnState) {
     let Some(handles) = TRAY_MENU.get() else {
         return;
     };
-    let (selected, preferred) = {
-        let state = app.state::<AppContext>();
-        let cfg = state.config.lock().unwrap();
-        (cfg.selected_gateway.clone(), cfg.preferred_gateway.clone())
-        // Guard dropped before any menu call that could emit.
-    };
-    let armed = tray_reconnect_armed(selected, preferred, state.gateway.clone());
+    let armed = state.reconnect_armed;
     let _ = handles
         .connect
         .set_enabled(matches!(state.phase, Phase::Disconnected | Phase::Error));
@@ -837,7 +1000,16 @@ fn main() {
     let poller_controller = controller.clone();
     let tailer_controller = controller.clone();
 
-    let config = Config::load();
+    // Which load branch happened decides whether saves may write (see
+    // `AppContext::persist`): Fresh/FromDisk persist; Unreadable serves
+    // the defaults for the session and gates every save to a no-op.
+    let (config, config_load, config_read_error) = match Config::load() {
+        config::Loaded::Fresh(config) => (config, "fresh", None),
+        config::Loaded::FromDisk(config) => (config, "from disk", None),
+        config::Loaded::Unreadable(config, error) => {
+            (config, "unreadable", Some(error.to_string()))
+        }
+    };
     // Auto: liquid glass on macOS 26+ unless the user forces the CSS
     // fallback (see Config::liquid_glass and glass::resolve_effect).
     let panel_effect = glass::resolve_effect(config.liquid_glass);
@@ -858,6 +1030,8 @@ fn main() {
             config: Mutex::new(config),
             panel_hidden_at: Mutex::new(None),
             panel_effect,
+            config_load,
+            config_read_error,
         })
         .on_window_event(|window, event| {
             // Popover behaviour: dismiss the panel when it loses focus. The
@@ -874,6 +1048,19 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // Which config-load branch won at startup: `Config::load` runs
+            // before the log plugin exists (its failure branches
+            // eprintln), so it is recorded here, once, where the targets
+            // are already attached.
+            let ctx = app.state::<AppContext>();
+            if let Some(error) = &ctx.config_read_error {
+                log::warn!(
+                    "config: unreadable at startup ({error}) — serving the defaults, saves are no-ops this session"
+                );
+            } else {
+                log::debug!("config load: {}", ctx.config_load);
+            }
+
             // Panel backdrop: native liquid glass where the OS (26+) and the
             // config allow it, CSS vibrancy otherwise (see `glass`). Applied
             // at window creation so the first `show` already looks right;
@@ -889,17 +1076,15 @@ fn main() {
             }
 
             // Seed the idle state with the selected portal so the Connect
-            // button is reachable in a fresh session: `state.portal` is what
-            // enables it, and only a selection change or this seed ever sets
-            // it (see `note_selected_portal`).
-            let selected = app
-                .state::<AppContext>()
-                .config
-                .lock()
-                .unwrap()
-                .selected
-                .clone();
-            controller.note_selected_portal(app.handle(), selected);
+            // button is reachable in a fresh session (`state.portal` is what
+            // enables it, see `note_selected_portal`), and the same snapshot
+            // seeds the reconnect target: `reconnect_armed` is derived from
+            // it on every state update, and the poller can adopt an
+            // outside-started tunnel as Connected at any moment — before
+            // any gateway command has re-noted it.
+            let cfg = app.state::<AppContext>().config.lock().unwrap().clone();
+            controller.note_selected_portal(app.handle(), cfg.selected.clone());
+            sync_reconnect_target(app.handle(), &controller, &cfg);
 
             // Tray through tauri's own API, NOT a raw tray-icon one: tauri claims
             // the global TrayIconEvent handler (an OnceLock: first setter wins,
@@ -987,8 +1172,9 @@ fn main() {
             // gateway pick (`selected_gateway`) — do_connect itself resolves
             // the fallback chain (preferred, then gpclient auto-gateway).
             // Reconnect replaces a plain Disconnect while the panel's amber
-            // button would show (a Connected gateway switch, see
-            // `tray_reconnect_armed`); enablement lives in `sync_tray_menu`.
+            // button would show (a Connected gateway switch, the
+            // backend-owned `reconnect_armed` in VpnState); enablement lives
+            // in `sync_tray_menu`.
             let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
             let reconnect_item =
                 MenuItem::with_id(app, "reconnect", "Reconnect", false, None::<&str>)?;
@@ -1029,18 +1215,17 @@ fn main() {
                 }
             });
 
-            // Gateway picks/stars change the config without a vpn-state event
-            // (`select_gateway`, `set_preferred_gateway`, the harvested map):
-            // re-sync the Reconnect/Disconnect enablement on every
-            // config-updated too. Safe snapshot: the config lock is always
-            // dropped before that event is emitted (see `broadcast_config`
-            // and vpn::learn_gateway_host/harvest_gateway).
+            // Defense-in-depth for the menu enablement: the armed flag now
+            // travels in vpn-state (noted on every gateway save, see
+            // `sync_reconnect_target`), so the vpn-state listener above is
+            // the primary sync path — this one re-syncs the menu on every
+            // config-updated in case a future config path ever misses the
+            // re-note. Safe snapshot: the config lock is always dropped
+            // before that event is emitted (see `broadcast_config` and
+            // vpn::learn_gateway_host/harvest_gateway).
             let menu_handle = app.handle().clone();
             app.listen_any("config-updated", move |_| {
-                sync_tray_menu(
-                    &menu_handle,
-                    &menu_handle.state::<AppContext>().controller.snapshot(),
-                );
+                sync_tray_menu(&menu_handle.state::<AppContext>().controller.snapshot());
             });
 
             Ok(())
@@ -1054,12 +1239,8 @@ fn main() {
                 let state = app.state::<AppContext>();
                 let (portal, reuse_cookie, gateway) = {
                     let cfg = state.config.lock().unwrap();
-                    let portal = cfg
-                        .selected
-                        .clone()
-                        .or_else(|| cfg.portals.first().cloned())
-                        .unwrap_or_default();
-                    (portal, cfg.reuse_cookie, cfg.selected_gateway.clone())
+                    connect_target_from_config(&cfg)
+                    // Guard dropped before the async work.
                 };
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -1072,50 +1253,16 @@ fn main() {
                 });
             }
             "reconnect" => {
-                // The armed gateway switch: same chain as the panel's amber
-                // Reconnect button — tear the tunnel down, then connect with
-                // the resolved gateway (do_connect itself resolves
-                // selected_gateway > preferred > gpclient auto).
-                let state = app.state::<AppContext>();
-                let (portal, reuse_cookie, gateway) = {
-                    let cfg = state.config.lock().unwrap();
-                    let portal = cfg
-                        .selected
-                        .clone()
-                        .or_else(|| cfg.portals.first().cloned())
-                        .unwrap_or_default();
-                    (portal, cfg.reuse_cookie, cfg.selected_gateway.clone())
-                    // Guard dropped before the async work.
-                };
+                // The armed gateway switch: the same chain as the panel's
+                // amber Reconnect button, now backend-owned — do_reconnect
+                // reads the target from the config, tears the tunnel down,
+                // waits out the Disconnecting observation and connects
+                // through it. Its warnings carry the "tray reconnect"
+                // prefix, byte-identical to the old inline chain.
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppContext>();
-                    if let Err(error) = do_disconnect(app.clone(), &state).await {
-                        log::warn!("tray reconnect: disconnect failed: {error}");
-                        return;
-                    }
-                    // `gp-admin stop` returns once the worker is gone, but the
-                    // backend phase flips to Disconnected via its poller — a
-                    // connect sent straight away is refused ("cannot connect
-                    // while Disconnecting"). Wait the observation out (same
-                    // pattern as the frontend's Reconnect), then connect.
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-                    loop {
-                        let phase = state.controller.snapshot().phase;
-                        if phase != Phase::Disconnecting {
-                            break;
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            log::warn!("tray reconnect: timed out waiting for Disconnecting");
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                    if let Err(error) =
-                        do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
-                    {
-                        log::warn!("tray reconnect: connect failed: {error}");
-                    }
+                    let _ = do_reconnect(app.clone(), &state, "tray reconnect").await;
                 });
             }
             "disconnect" => {
@@ -1134,6 +1281,7 @@ fn main() {
             get_state,
             get_panel_effect,
             get_config,
+            get_config_read_error,
             get_versions,
             add_portal,
             remove_portal,
@@ -1147,6 +1295,7 @@ fn main() {
             repair_network,
             connect,
             disconnect,
+            reconnect,
             cancel,
             quit
         ])
@@ -1156,8 +1305,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_connect_gateway, tray_reconnect_armed};
+    use super::resolve_connect_gateway;
     // `valid_name` (the wrapper charset) is tested in config::tests.
+    // The armed-condition test moved to vpn.rs with the condition itself
+    // (`reconnect_arms_only_on_a_real_gateway_switch`); the resolution it
+    // feeds on stays here, tested below.
 
     /// Gateway precedence: the explicit pick wins over the preferred
     /// gateway, and None + None defers to gpclient's auto-gateway order.
@@ -1177,31 +1329,5 @@ mod tests {
             resolve_connect_gateway(Some("-".into()), None),
             Some("-".to_string())
         );
-    }
-
-    /// The tray Reconnect enablement: armed exactly when a fresh connect
-    /// would resolve to a gateway other than the live tunnel's.
-    #[test]
-    fn tray_reconnect_arms_only_on_a_real_gateway_switch() {
-        let g = |s: &str| Some(s.to_string());
-        // Explicit pick equal to the live gateway: no switch.
-        assert!(!tray_reconnect_armed(g("gw-1"), None, g("gw-1")));
-        // Explicit pick differing from the live gateway: switch.
-        assert!(tray_reconnect_armed(g("gw-1"), None, g("gw-2")));
-        // Automatic + preferred == live: no switch.
-        assert!(!tray_reconnect_armed(None, g("gw-1"), g("gw-1")));
-        // Automatic + preferred != live: armed on the preferred.
-        assert!(tray_reconnect_armed(None, g("gw-1"), g("gw-2")));
-        // Automatic with no preferred: gpclient auto-order, nothing to arm.
-        assert!(!tray_reconnect_armed(None, None, g("gw-1")));
-        assert!(!tray_reconnect_armed(None, None, None));
-        // Live gateway unknown (tunnel up before the tailer parsed it): any
-        // non-auto resolution counts as a switch.
-        assert!(tray_reconnect_armed(g("gw-1"), None, None));
-        assert!(tray_reconnect_armed(None, g("gw-1"), None));
-        assert!(!tray_reconnect_armed(None, None, None));
-        // The explicit pick wins over the preferred, so it decides.
-        assert!(!tray_reconnect_armed(g("gw-1"), g("gw-2"), g("gw-1")));
-        assert!(tray_reconnect_armed(g("gw-2"), g("gw-1"), g("gw-1")));
     }
 }
