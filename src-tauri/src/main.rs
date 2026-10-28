@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tauri::{
     AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent, Wry,
     menu::{ContextMenu, Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
 
 use config::{Config, valid_name};
@@ -27,13 +27,13 @@ use vpn::{Phase, VpnController, VpnState};
 const TRAY_ID: &str = "gp-bar";
 
 /// Handles for the right-click tray menu. The menu is NEVER attached to the
-/// tray (see the tray comment in `main`): on this macOS beta a natively
-/// attached status-item menu makes the system swallow left clicks before
-/// the app ever sees them, killing the panel toggle. It is popped up BY
-/// HAND on right-click instead — muda's position-less context-menu path
-/// anchors at `NSEvent::mouseLocation` (the icon the user just
-/// right-clicked) in screen coordinates, so the hidden panel window's
-/// geometry never enters into it.
+/// tray (see `build_tray`): on this macOS beta a natively attached
+/// status-item menu makes the system swallow left clicks before the app
+/// ever sees them, killing the panel toggle. It is popped up BY HAND on
+/// right-click instead — muda's position-less context-menu path anchors
+/// at `NSEvent::mouseLocation` (the icon the user just right-clicked) in
+/// screen coordinates, so the hidden panel window's geometry never
+/// enters into it.
 static TRAY_MENU: OnceLock<TrayMenuHandles> = OnceLock::new();
 
 // Per-phase tray icons, rendered once and shared (the supersampled padlock
@@ -768,19 +768,17 @@ fn toggle_panel(app: &AppHandle, anchor: Option<panel::Anchor>) {
     // Tray payload, or the cursor fallback recovered to pure logical
     // points (tao converts the cursor with the PRIMARY scale — its
     // cross-monitor quirk — so undo that before hit-testing).
-    let anchor = match anchor {
-        Some(payload) => Some(payload),
-        None => {
-            let cursor = window.cursor_position().ok();
-            log::debug!("toggle: no tray payload; cursor_position={cursor:?}");
-            let primary_scale = app
-                .primary_monitor()
-                .ok()
-                .flatten()
-                .map(|m| m.scale_factor())
-                .unwrap_or(1.0);
-            cursor.map(|c| panel::Anchor::Logical(c.x / primary_scale, c.y / primary_scale + 18.0))
-        }
+    let anchor = if let Some(payload) = anchor {
+        Some(payload)
+    } else {
+        let cursor = window.cursor_position().ok();
+        log::debug!("toggle: no tray payload; cursor_position={cursor:?}");
+        let primary_scale = app
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .map_or(1.0, |m| m.scale_factor());
+        cursor.map(|c| panel::Anchor::Logical(c.x / primary_scale, c.y / primary_scale + 18.0))
     };
 
     // Every monitor in canonical logical points, with its visibleFrame
@@ -813,8 +811,8 @@ fn toggle_panel(app: &AppHandle, anchor: Option<panel::Anchor>) {
 
     match panel {
         Err(error) => log::warn!("positioning: outer_size error: {error}"),
-        Ok(panel) => match panel::place_panel(anchor, &layouts, panel) {
-            Some(placement) => {
+        Ok(panel) => {
+            if let Some(placement) = panel::place_panel(anchor, &layouts, panel) {
                 let mon = &layouts[placement.monitor];
                 let (wx, wy, ww, wh) = mon.work;
                 let (panel_w, panel_h) = panel;
@@ -830,8 +828,7 @@ fn toggle_panel(app: &AppHandle, anchor: Option<panel::Anchor>) {
                 if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
                     log::warn!("set_position failed: {error}");
                 }
-            }
-            None => {
+            } else {
                 // Never seen on a real desk; degrade to the primary screen's
                 // top-right corner instead of leaving the panel at its
                 // creation-default mid-screen position.
@@ -846,7 +843,7 @@ fn toggle_panel(app: &AppHandle, anchor: Option<panel::Anchor>) {
                     }
                 }
             }
-        },
+        }
     }
 
     let _ = window.show();
@@ -952,6 +949,179 @@ fn show_tray_menu(app: &AppHandle) {
     match handles.menu.popup(panel.as_ref().window()) {
         Ok(()) => log::info!("tray menu: popup at mouse location"),
         Err(error) => log::warn!("tray menu: popup failed: {error}"),
+    }
+}
+
+/// Build the tray icon and its (never-attached) right-click menu, and
+/// install the menu handles in [`TRAY_MENU`] for `show_tray_menu`.
+///
+/// The tray goes through tauri's own API, NOT a raw tray-icon one: tauri
+/// claims the global TrayIconEvent handler (an OnceLock: first setter
+/// wins, `build()` runs before `setup`) and drops events for trays it
+/// does not manage, so a raw tray never sees a single click here.
+/// Through tauri's builder the clicks flow to `on_tray_icon_event`.
+///
+/// NO menu is ATTACHED on purpose: on this macOS beta the status-item
+/// button opens a natively attached menu itself on left click and the
+/// click never reaches our event handler (only enter/leave/move/right
+/// events arrive — see the debug log). The right-click menu lives in
+/// [`TRAY_MENU`] and is popped up BY HAND instead: nothing for the
+/// button to open, so clicks flow to us and the panel keeps taking over.
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let _tray = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(OPEN_ICON.clone())
+        .icon_as_template(true)
+        .tooltip("GP Bar")
+        .on_tray_icon_event(on_tray_icon_event)
+        .build(app)?;
+
+    // The right-click tray menu: built once here, popped up by hand in
+    // the tray handler (never attached — see above). Connect mirrors the
+    // panel's action button exactly: the selected portal and the
+    // cookie-reuse setting from config, plus the panel's explicit
+    // gateway pick (`selected_gateway`) — do_connect itself resolves the
+    // fallback chain (preferred, then gpclient auto-gateway). Reconnect
+    // replaces a plain Disconnect while the panel's amber button would
+    // show (a Connected gateway switch, the backend-owned
+    // `reconnect_armed` in VpnState); enablement lives in
+    // `sync_tray_menu`.
+    let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
+    let reconnect_item = MenuItem::with_id(app, "reconnect", "Reconnect", false, None::<&str>)?;
+    let disconnect_item = MenuItem::with_id(app, "disconnect", "Disconnect", false, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit GP Bar", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(
+        app,
+        &[&connect_item, &reconnect_item, &disconnect_item, &quit_item],
+    )?;
+    if TRAY_MENU
+        .set(TrayMenuHandles {
+            menu: tray_menu,
+            connect: connect_item,
+            reconnect: reconnect_item,
+            disconnect: disconnect_item,
+        })
+        .is_err()
+    {
+        log::warn!("tray menu: TRAY_MENU already set — built twice?");
+    }
+    Ok(())
+}
+
+/// Tray clicks: right opens the hand-popped menu, left toggles the panel
+/// anchored under the click (or the icon rect, when they agree).
+fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: TrayIconEvent) {
+    // Right click opens the tray menu (TRAY_MENU, popped up by hand —
+    // never attached, see `build_tray`). tray-icon delivers
+    // Click{Right, Down} from rightMouseDown whether or not a menu is
+    // attached, so this works on the beta as well.
+    if let TrayIconEvent::Click {
+        button: MouseButton::Right,
+        button_state: MouseButtonState::Down,
+        ..
+    } = event
+    {
+        show_tray_menu(tray.app_handle());
+    }
+    // Left click toggles the panel. React on mouse-DOWN: it arrives
+    // within milliseconds of the focus-loss hide, keeping the race guard
+    // in toggle_panel reliable.
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Down,
+        position,
+        rect,
+        ..
+    } = event
+    {
+        let (px, py) = (position.x, position.y);
+        let (rx, ry) = match rect.position {
+            tauri::Position::Physical(p) => (f64::from(p.x), f64::from(p.y)),
+            tauri::Position::Logical(l) => (l.x, l.y),
+        };
+        let (rw, rh) = match rect.size {
+            tauri::Size::Physical(s) => (f64::from(s.width), f64::from(s.height)),
+            tauri::Size::Logical(s) => (s.width, s.height),
+        };
+        // The click is the robust anchor (evidence: GP Connect anchors
+        // its popover on the cursor too): it always lives in the
+        // coordinates of the display the user is actually looking at.
+        // Trust the icon rect only when the click falls inside it — some
+        // macOS builds report the status-item rect in a different space,
+        // and a bad rect would drag the panel onto the wrong screen.
+        let rect_valid =
+            (px >= rx - 2.0 && px <= rx + rw + 2.0) && (py >= ry - 2.0 && py <= ry + rh + 2.0);
+        let anchor = if rect_valid {
+            // Centered on the icon, right under it.
+            (rx + rw / 2.0, ry + rh)
+        } else {
+            (px, py)
+        };
+        // Tray payload diagnostics: the tray-icon crate's coordinate
+        // space is the recurring suspect (see the module doc in
+        // panel.rs).
+        log::debug!(
+            "tray click: position=({px:.1},{py:.1}) rect=({rx:.1},{ry:.1} \
+             {rw:.1}x{rh:.1}) valid={rect_valid} anchor=({:.1},{:.1})",
+            anchor.0,
+            anchor.1
+        );
+        toggle_panel(
+            tray.app_handle(),
+            Some(panel::Anchor::TrayPayload(anchor.0, anchor.1)),
+        );
+    }
+}
+
+/// The tray menu actions. Same contracts as the panel's buttons, run on
+/// the async runtime like the commands; the connect target is read from
+/// the config under its own lock, dropped before the spawned work.
+fn on_menu_event(app: &AppHandle, id: &str) {
+    match id {
+        "connect" => {
+            // Same contract as the panel's Connect button: selected portal,
+            // configured cookie reuse, and the panel's explicit gateway
+            // pick (`selected_gateway`) — None only means Automatic when
+            // the user never picked one.
+            let state = app.state::<AppContext>();
+            let (portal, reuse_cookie, gateway) = {
+                let cfg = state.config.lock().unwrap();
+                connect_target_from_config(&cfg)
+                // Guard dropped before the async work.
+            };
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppContext>();
+                if let Err(error) =
+                    do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
+                {
+                    log::warn!("tray menu connect failed: {error}");
+                }
+            });
+        }
+        "reconnect" => {
+            // The armed gateway switch: the same chain as the panel's
+            // amber Reconnect button, now backend-owned — do_reconnect
+            // reads the target from the config, tears the tunnel down,
+            // waits out the Disconnecting observation and connects
+            // through it. Its warnings carry the "tray reconnect"
+            // prefix, byte-identical to the old inline chain.
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppContext>();
+                let _ = do_reconnect(app.clone(), &state, "tray reconnect").await;
+            });
+        }
+        "disconnect" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppContext>();
+                if let Err(error) = do_disconnect(app.clone(), &state).await {
+                    log::warn!("tray menu disconnect failed: {error}");
+                }
+            });
+        }
+        "quit" => app.exit(0),
+        _ => {}
     }
 }
 
@@ -1082,119 +1252,9 @@ fn main() {
             controller.note_selected_portal(cfg.selected.clone());
             sync_reconnect_target(&controller, &cfg);
 
-            // Tray through tauri's own API, NOT a raw tray-icon one: tauri claims
-            // the global TrayIconEvent handler (an OnceLock: first setter wins,
-            // `build()` runs before `setup`) and drops events for trays it does
-            // not manage, so a raw tray never sees a single click here. Through
-            // tauri's builder the clicks flow through on_tray_icon_event instead.
-            //
-            // NO menu is ATTACHED on purpose: on this macOS beta the status-item
-            // button opens a natively attached menu itself on left click and the
-            // click never reaches our event handler (only enter/leave/move/right
-            // events arrive — see the debug log). The right-click menu lives in
-            // TRAY_MENU (built below) and is popped up BY HAND instead: nothing
-            // for the button to open, so clicks flow to us and the panel keeps
-            // taking over.
-            let _tray = TrayIconBuilder::with_id(TRAY_ID)
-                .icon(OPEN_ICON.clone())
-                .icon_as_template(true)
-                .tooltip("GP Bar")
-                .on_tray_icon_event(|tray, event| {
-                    // Right click opens the tray menu (TRAY_MENU, popped up by
-                    // hand — never attached, see above). tray-icon delivers
-                    // Click{Right, Down} from rightMouseDown whether or not a
-                    // menu is attached, so this works on the beta as well.
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Right,
-                        button_state: MouseButtonState::Down,
-                        ..
-                    } = event
-                    {
-                        show_tray_menu(tray.app_handle());
-                    }
-                    // Left click toggles the panel. React on mouse-DOWN: it
-                    // arrives within milliseconds of the focus-loss hide,
-                    // keeping the race guard in toggle_panel reliable.
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Down,
-                        position,
-                        rect,
-                        ..
-                    } = event
-                    {
-                        let (px, py) = (position.x, position.y);
-                        let (rx, ry) = match rect.position {
-                            tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
-                            tauri::Position::Logical(l) => (l.x, l.y),
-                        };
-                        let (rw, rh) = match rect.size {
-                            tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
-                            tauri::Size::Logical(s) => (s.width, s.height),
-                        };
-                        // The click is the robust anchor (evidence: GP Connect
-                        // anchors its popover on the cursor too): it always
-                        // lives in the coordinates of the display the user is
-                        // actually looking at. Trust the icon rect only when
-                        // the click falls inside it — some macOS builds report
-                        // the status-item rect in a different space, and a bad
-                        // rect would drag the panel onto the wrong screen.
-                        let rect_valid = (px >= rx - 2.0 && px <= rx + rw + 2.0)
-                            && (py >= ry - 2.0 && py <= ry + rh + 2.0);
-                        let anchor = if rect_valid {
-                            // Centered on the icon, right under it.
-                            (rx + rw / 2.0, ry + rh)
-                        } else {
-                            (px, py)
-                        };
-                        // Tray payload diagnostics: the tray-icon crate's
-                        // coordinate space is the recurring suspect (see
-                        // the positioning comments in toggle_panel).
-                        log::debug!(
-                            "tray click: position=({px:.1},{py:.1}) rect=({rx:.1},{ry:.1} \
-                             {rw:.1}x{rh:.1}) valid={rect_valid} anchor=({:.1},{:.1})",
-                            anchor.0,
-                            anchor.1
-                        );
-                        toggle_panel(
-                            tray.app_handle(),
-                            Some(panel::Anchor::TrayPayload(anchor.0, anchor.1)),
-                        );
-                    }
-                })
-                .build(app)?;
-
-            // The right-click tray menu: built once here, popped up by hand in
-            // the tray handler (never attached — see above). Connect mirrors the
-            // panel's action button exactly: the selected portal and the
-            // cookie-reuse setting from config, plus the panel's explicit
-            // gateway pick (`selected_gateway`) — do_connect itself resolves
-            // the fallback chain (preferred, then gpclient auto-gateway).
-            // Reconnect replaces a plain Disconnect while the panel's amber
-            // button would show (a Connected gateway switch, the
-            // backend-owned `reconnect_armed` in VpnState); enablement lives
-            // in `sync_tray_menu`.
-            let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
-            let reconnect_item =
-                MenuItem::with_id(app, "reconnect", "Reconnect", false, None::<&str>)?;
-            let disconnect_item =
-                MenuItem::with_id(app, "disconnect", "Disconnect", false, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit GP Bar", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(
-                app,
-                &[&connect_item, &reconnect_item, &disconnect_item, &quit_item],
-            )?;
-            if TRAY_MENU
-                .set(TrayMenuHandles {
-                    menu: tray_menu,
-                    connect: connect_item,
-                    reconnect: reconnect_item,
-                    disconnect: disconnect_item,
-                })
-                .is_err()
-            {
-                log::warn!("tray menu: TRAY_MENU already set — built twice?");
-            }
+            // Tray, its click handler and its right-click menu (the WHY of
+            // the never-attached design lives on `build_tray`).
+            build_tray(app.handle())?;
             // Match the items to the current phase before any state change
             // can fire. Safe lock: setup runs on the main thread and the
             // status poller has not started yet.
@@ -1223,53 +1283,7 @@ fn main() {
 
             Ok(())
         })
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "connect" => {
-                // Same contract as the panel's Connect button: selected portal,
-                // configured cookie reuse, and the panel's explicit gateway
-                // pick (`selected_gateway`) — None only means Automatic when
-                // the user never picked one.
-                let state = app.state::<AppContext>();
-                let (portal, reuse_cookie, gateway) = {
-                    let cfg = state.config.lock().unwrap();
-                    connect_target_from_config(&cfg)
-                    // Guard dropped before the async work.
-                };
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<AppContext>();
-                    if let Err(error) =
-                        do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
-                    {
-                        log::warn!("tray menu connect failed: {error}");
-                    }
-                });
-            }
-            "reconnect" => {
-                // The armed gateway switch: the same chain as the panel's
-                // amber Reconnect button, now backend-owned — do_reconnect
-                // reads the target from the config, tears the tunnel down,
-                // waits out the Disconnecting observation and connects
-                // through it. Its warnings carry the "tray reconnect"
-                // prefix, byte-identical to the old inline chain.
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<AppContext>();
-                    let _ = do_reconnect(app.clone(), &state, "tray reconnect").await;
-                });
-            }
-            "disconnect" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<AppContext>();
-                    if let Err(error) = do_disconnect(app.clone(), &state).await {
-                        log::warn!("tray menu disconnect failed: {error}");
-                    }
-                });
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        })
+        .on_menu_event(|app, event| on_menu_event(app, event.id().as_ref()))
         .invoke_handler(tauri::generate_handler![
             get_state,
             get_panel_effect,
