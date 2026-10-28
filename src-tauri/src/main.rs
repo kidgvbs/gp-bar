@@ -60,6 +60,18 @@ pub(crate) struct AppContext {
     /// Which panel backdrop (native liquid glass vs CSS vibrancy) was
     /// resolved at startup; reported to the frontend via `get_panel_effect`.
     panel_effect: PanelEffect,
+
+    /// The `config::Loaded` branch the startup load took ("fresh", "from
+    /// disk", "unreadable"), logged once in `setup`: `Config::load` runs
+    /// before the log plugin is attached, so its failure branches can
+    /// only eprintln (they do).
+    config_load: &'static str,
+    /// `Some(error)` only when the startup config file could not be READ
+    /// (permissions, I/O — a corrupt file is a different branch: renamed
+    /// aside, counts as fresh). The in-memory config is then NOT the
+    /// user's data: every save is a no-op (`save_config`), and the panel
+    /// shows the error once (`get_config_read_error`).
+    config_read_error: Option<String>,
 }
 
 impl AppContext {
@@ -81,10 +93,31 @@ impl AppContext {
         let mut next = cfg.clone();
         let out = f(&mut next)?;
         if next != *cfg {
-            next.save()?;
+            self.save_config(&next)?;
             *cfg = next;
         }
         Ok((out, cfg.clone()))
+    }
+
+    /// Whether saves may write to disk: false only while the startup load
+    /// found the config file unreadable — writing the in-memory defaults
+    /// would then destroy the very file the app could not read. This is
+    /// the `persist` flag of the config load (see `config::Loaded`).
+    fn persist(&self) -> bool {
+        self.config_read_error.is_none()
+    }
+
+    /// Save `cfg` to disk unless the startup load was unreadable (see
+    /// `persist`): a no-op, logged on every attempt, never a hard error —
+    /// the config still mutates in memory for this session.
+    fn save_config(&self, cfg: &Config) -> Result<(), String> {
+        if !self.persist() {
+            log::warn!(
+                "config: not saving — the file was unreadable at startup, writing would destroy it"
+            );
+            return Ok(());
+        }
+        cfg.save()
     }
 }
 
@@ -105,6 +138,15 @@ fn get_panel_effect(state: State<'_, AppContext>) -> &'static str {
 #[tauri::command]
 fn get_config(state: State<'_, AppContext>) -> Config {
     state.config.lock().unwrap().clone()
+}
+
+/// Why config changes cannot be saved, when the startup load hit an
+/// unreadable file (permissions, I/O — a corrupt file is a different
+/// branch and keeps saving). `None` while the config persists normally;
+/// the panel shows the error once (see src/main.ts).
+#[tauri::command]
+fn get_config_read_error(state: State<'_, AppContext>) -> Option<String> {
+    state.config_read_error.clone()
 }
 
 #[tauri::command]
@@ -833,7 +875,16 @@ fn main() {
     let poller_controller = controller.clone();
     let tailer_controller = controller.clone();
 
-    let config = Config::load();
+    // Which load branch happened decides whether saves may write (see
+    // `AppContext::persist`): Fresh/FromDisk persist; Unreadable serves
+    // the defaults for the session and gates every save to a no-op.
+    let (config, config_load, config_read_error) = match Config::load() {
+        config::Loaded::Fresh(config) => (config, "fresh", None),
+        config::Loaded::FromDisk(config) => (config, "from disk", None),
+        config::Loaded::Unreadable(config, error) => {
+            (config, "unreadable", Some(error.to_string()))
+        }
+    };
     // Auto: liquid glass on macOS 26+ unless the user forces the CSS
     // fallback (see Config::liquid_glass and glass::resolve_effect).
     let panel_effect = glass::resolve_effect(config.liquid_glass);
@@ -854,6 +905,8 @@ fn main() {
             config: Mutex::new(config),
             panel_hidden_at: Mutex::new(None),
             panel_effect,
+            config_load,
+            config_read_error,
         })
         .on_window_event(|window, event| {
             // Popover behaviour: dismiss the panel when it loses focus. The
@@ -869,6 +922,19 @@ fn main() {
             // Menu bar-only app: no Dock icon, no Cmd+Tab entry.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Which config-load branch won at startup: `Config::load` runs
+            // before the log plugin exists (its failure branches
+            // eprintln), so it is recorded here, once, where the targets
+            // are already attached.
+            let ctx = app.state::<AppContext>();
+            if let Some(error) = &ctx.config_read_error {
+                log::warn!(
+                    "config: unreadable at startup ({error}) — serving the defaults, saves are no-ops this session"
+                );
+            } else {
+                log::debug!("config load: {}", ctx.config_load);
+            }
 
             // Panel backdrop: native liquid glass where the OS (26+) and the
             // config allow it, CSS vibrancy otherwise (see `glass`). Applied
@@ -1130,6 +1196,7 @@ fn main() {
             get_state,
             get_panel_effect,
             get_config,
+            get_config_read_error,
             get_versions,
             add_portal,
             remove_portal,

@@ -168,6 +168,25 @@ function clearCmdError() {
   cmdError.classList.add("hidden");
 }
 
+// -- config persistence ---------------------------------------------------------
+// get_config_read_error(): the startup config file could not be READ
+// (permissions, I/O). Saves are then no-ops for the whole session — the
+// backend must not overwrite a file it could not read — so the user has
+// to know their changes are not sticking. Shown once, in the shared error
+// row, the first time the panel is actually looked at: the panel window
+// is created hidden at startup, so showing it at load would expire
+// unseen behind the 6 s auto-hide.
+const configReadError = await invoke<string | null>("get_config_read_error");
+let configErrorShown = false;
+if (configReadError !== null) {
+  await win.onFocusChanged(({ payload: focused }) => {
+    if (focused && !configErrorShown) {
+      configErrorShown = true;
+      showCmdError(`Config could not be read (${configReadError}) — changes are NOT saved`);
+    }
+  });
+}
+
 // -- action button in-flight guard ----------------------------------------------
 // The action button changes meaning with the phase: a fast double click would
 // send `connect` and then — once the Connecting event arrives — `cancel`.
