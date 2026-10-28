@@ -8,6 +8,7 @@
 mod config;
 mod glass;
 mod icons;
+mod panel;
 mod vpn;
 
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
@@ -725,7 +726,7 @@ async fn do_reconnect(
 // wrong-position reports only reproduce in real GUI usage, so every
 // anchor/monitor/set_position decision leaves its numbers behind.
 
-fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
+fn toggle_panel(app: &AppHandle, anchor: Option<panel::Anchor>) {
     let Some(window) = app.get_webview_window("main") else {
         log::warn!("toggle: no 'main' window found");
         return;
@@ -758,37 +759,17 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     }
 
     // Anchor the panel under the tray icon: the handler passes the click
-    // position (or the icon rect when it agrees with the click). The monitor
-    // holding the anchor is resolved BY HAND in one canonical space — logical
-    // points, top-left origin — never through tauri's monitor_from_point.
-    // macOS really runs TWO screen spaces here, flipped against each other
-    // in y:
-    //
-    //   * AppKit (NSEvent::mouseLocation, NSScreen/NSWindow frames) is
-    //     BOTTOM-LEFT origin, y up. The tray payload is born there and is
-    //     flipped into top-left by tray-icon (and by tao's cursor helper)
-    //     using the MAIN screen's height from CGDisplayPixelsHigh — which
-    //     behaves as POINTS on this OS build (only the logical height fits
-    //     both the single- and the dual-display payloads) — then scaled by
-    //     the tray window's own factor. Pre-scale, the payload IS canonical.
-    //   * Quartz display space (CGDisplayBounds — what tao's
-    //     Monitor::position() passes through RAW; tauri's work_area just adds
-    //     the menu-bar/dock insets to it) is TOP-LEFT origin, y down: the
-    //     monitor table below is already canonical, no flip needed.
-    //
-    // Invariant: never flip tao's raw positions with the main screen's
-    // height. The flip is correct only for the primary (its origin (0,0)
-    // is invariant under it); for every other monitor it mirrors the
-    // rectangle across the primary — a display above the laptop would be
-    // recorded below, and anchors on the external menu bar would never
-    // match. The monitor table below is built in the canonical space
-    // directly instead.
+    // position (or the icon rect when it agrees with the click). The
+    // monitor resolution and the clamping are pure geometry in ONE
+    // canonical space — logical points, top-left origin — never through
+    // tauri's monitor_from_point: the coordinate-space notes live in the
+    // panel module now.
 
-    // Tray payload, or the cursor fallback recovered to pure logical points
-    // (tao converts the cursor with the PRIMARY scale — its cross-monitor
-    // quirk — so undo that before hit-testing).
-    let (payload, logical) = match anchor {
-        Some(payload) => (Some(payload), None),
+    // Tray payload, or the cursor fallback recovered to pure logical
+    // points (tao converts the cursor with the PRIMARY scale — its
+    // cross-monitor quirk — so undo that before hit-testing).
+    let anchor = match anchor {
+        Some(payload) => Some(payload),
         None => {
             let cursor = window.cursor_position().ok();
             log::debug!("toggle: no tray payload; cursor_position={cursor:?}");
@@ -798,52 +779,14 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
                 .flatten()
                 .map(|m| m.scale_factor())
                 .unwrap_or(1.0);
-            (
-                None,
-                cursor.map(|c| (c.x / primary_scale, c.y / primary_scale + 18.0)),
-            )
+            cursor.map(|c| panel::Anchor::Logical(c.x / primary_scale, c.y / primary_scale + 18.0))
         }
     };
 
-    // Every monitor in canonical logical points, top-left origin, with its
-    // visibleFrame work area in the same space (tauri's work_area() is
-    // bottom-left too, so its y is flipped here).
-    struct Mon {
-        name: String,
-        scale: f64,
-        /// Monitor bounds: (x, y_top_left, width, height).
-        bounds: (f64, f64, f64, f64),
-        /// visibleFrame: same shape as `bounds`.
-        work: (f64, f64, f64, f64),
-    }
-    let mons: Vec<Mon> = app
-        .available_monitors()
-        .unwrap_or_default()
-        .iter()
-        .map(|m| {
-            let scale = m.scale_factor();
-            let pos = m.position();
-            let size = m.size();
-            let work = m.work_area();
-            Mon {
-                name: m.name().cloned().unwrap_or_default(),
-                scale,
-                bounds: (
-                    pos.x as f64 / scale,
-                    pos.y as f64 / scale,
-                    size.width as f64 / scale,
-                    size.height as f64 / scale,
-                ),
-                work: (
-                    work.position.x as f64 / scale,
-                    work.position.y as f64 / scale,
-                    work.size.width as f64 / scale,
-                    work.size.height as f64 / scale,
-                ),
-            }
-        })
-        .collect();
-    for mon in &mons {
+    // Every monitor in canonical logical points, with its visibleFrame
+    // work area in the same space (panel::monitor_layouts).
+    let layouts = panel::monitor_layouts(app);
+    for mon in &layouts {
         log::debug!(
             "positioning: monitor {} scale={:.1} bounds={:?} work={:?}",
             mon.name,
@@ -853,73 +796,57 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         );
     }
 
-    // Hit-test the anchor. A payload point is scaled by the tray screen's
-    // OWN factor, so try each monitor's scale and keep the first whose
-    // logical bounds contain the result; on a real desk (no overlapping
-    // mixed-DPI projections) the match is unambiguous.
-    let hit = mons.iter().find_map(|mon| {
-        let (lx, ly) = match (payload, logical) {
-            (Some((ax, ay)), _) => (ax / mon.scale, ay / mon.scale),
-            (_, Some((lx, ly))) => (lx, ly),
-            (None, None) => return None,
-        };
-        let (bx, by, bw, bh) = mon.bounds;
-        (lx >= bx && lx < bx + bw && ly >= by && ly < by + bh).then_some((mon, lx, ly))
+    // The panel's logical size, computed once for both branches below.
+    // The scale_factor error fallback is the first monitor's scale: a
+    // never-observed-on-macOS failure path where only the size conversion
+    // could differ from the per-branch fallbacks this replaces (the
+    // winning, resp. primary, monitor's scale).
+    let panel_scale = window
+        .scale_factor()
+        .unwrap_or_else(|_| layouts.first().map_or(1.0, |mon| mon.scale));
+    let panel = window.outer_size().map(|size| {
+        (
+            f64::from(size.width) / panel_scale,
+            f64::from(size.height) / panel_scale,
+        )
     });
 
-    match (hit, window.outer_size()) {
-        (Some((mon, lx, ly)), Ok(size)) => {
-            // Everything is in logical points and set_position(Logical) is
-            // scale-independent on tao (to_logical is the identity for a
-            // Logical position), so a mixed-DPI desk is plain geometry here.
-            let (wx, wy, ww, wh) = mon.work;
-            let w_scale = window.scale_factor().unwrap_or(mon.scale);
-            let panel_w = size.width as f64 / w_scale;
-            let panel_h = size.height as f64 / w_scale;
-            // `clamp` panics when min exceeds max: a work area smaller than
-            // the panel must degrade to an edge, not take the app down.
-            let x = if ww < panel_w {
-                wx
-            } else {
-                (lx - panel_w / 2.0).clamp(wx, wx + ww - panel_w)
-            };
-            // Right under the tray icon, but never above the work area's top
-            // edge (the menu bar) and never past its bottom.
-            let y = if wh < panel_h {
-                ly.max(wy)
-            } else {
-                ly.max(wy).min(wy + wh - panel_h)
-            };
-            log::debug!(
-                "positioning: anchor logical=({lx:.1},{ly:.1}) monitor={} scale={:.1} \
-                 work=({wx:.1},{wy:.1},{ww:.1},{wh:.1}) panel={panel_w:.1}x{panel_h:.1} \
-                 -> set_position logical=({x:.1},{y:.1})",
-                mon.name,
-                mon.scale
-            );
-            if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
-                log::warn!("set_position failed: {error}");
-            }
-        }
-        (None, Ok(size)) => {
-            // Never seen on a real desk; degrade to the primary screen's
-            // top-right corner instead of leaving the panel at its
-            // creation-default mid-screen position.
-            log::warn!("positioning: NO monitor matched the anchor — primary top-right fallback");
-            if let Some(primary) = app.primary_monitor().ok().flatten() {
-                let scale = primary.scale_factor();
-                let work = primary.work_area();
-                let wx = work.position.x as f64 / scale;
-                let wy = work.position.y as f64 / scale;
-                let w_scale = window.scale_factor().unwrap_or(scale);
-                let panel_w = size.width as f64 / w_scale;
-                let (x, y) = (wx + work.size.width as f64 / scale - panel_w, wy);
+    match panel {
+        Err(error) => log::warn!("positioning: outer_size error: {error}"),
+        Ok(panel) => match panel::place_panel(anchor, &layouts, panel) {
+            Some(placement) => {
+                let mon = &layouts[placement.monitor];
+                let (wx, wy, ww, wh) = mon.work;
+                let (panel_w, panel_h) = panel;
+                let (x, y) = placement.position;
+                let (lx, ly) = placement.anchor;
+                log::debug!(
+                    "positioning: anchor logical=({lx:.1},{ly:.1}) monitor={} scale={:.1} \
+                     work=({wx:.1},{wy:.1},{ww:.1},{wh:.1}) panel={panel_w:.1}x{panel_h:.1} \
+                     -> set_position logical=({x:.1},{y:.1})",
+                    mon.name,
+                    mon.scale
+                );
                 if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
                     log::warn!("set_position failed: {error}");
                 }
             }
-        }
-        (_, Err(error)) => log::warn!("positioning: outer_size error: {error}"),
+            None => {
+                // Never seen on a real desk; degrade to the primary screen's
+                // top-right corner instead of leaving the panel at its
+                // creation-default mid-screen position.
+                log::warn!(
+                    "positioning: NO monitor matched the anchor — primary top-right fallback"
+                );
+                if let Some(primary) = app.primary_monitor().ok().flatten() {
+                    let (x, y) =
+                        panel::fallback_position(panel::monitor_layout(&primary).work, panel.0);
+                    if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
+                        log::warn!("set_position failed: {error}");
+                    }
+                }
+            }
+        },
     }
 
     let _ = window.show();
@@ -1229,7 +1156,10 @@ fn main() {
                             anchor.0,
                             anchor.1
                         );
-                        toggle_panel(tray.app_handle(), Some(anchor));
+                        toggle_panel(
+                            tray.app_handle(),
+                            Some(panel::Anchor::TrayPayload(anchor.0, anchor.1)),
+                        );
                     }
                 })
                 .build(app)?;
