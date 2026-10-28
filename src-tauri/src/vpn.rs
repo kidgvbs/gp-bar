@@ -27,7 +27,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tokio::process::Command;
+use tokio::{process::Command, sync::watch};
 
 use crate::config::Config;
 
@@ -98,44 +98,73 @@ struct Inner {
     reconnect_target: Option<String>,
 }
 
+/// The VPN state machine, with its publishing decoupled: `inner` is the
+/// single source of truth, and every mutation sends the new [`VpnState`]
+/// on the `tx` watch channel instead of emitting a Tauri event itself.
+/// Publishing is structural — `main` owns the ONE subscriber
+/// (`spawn_state_publisher`) that forwards each change to the tray and
+/// then the frontend — so the controller carries no `AppHandle` and has
+/// no opinion about UI. `watch` also coalesces: a subscriber that reads
+/// only the latest value may miss transient intermediates, which the
+/// consumers tolerate by rendering absolutely (from the state, never
+/// from a diff).
 pub struct VpnController {
     inner: Mutex<Inner>,
+    tx: watch::Sender<VpnState>,
 }
 
 impl VpnController {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
+            // The seed is the default state; `subscribe` marks it seen, so
+            // the setup-time notes (portal, reconnect target) are the first
+            // *changes* the publisher forwards — nothing is re-sent at spawn.
+            tx: watch::channel(VpnState::default()).0,
         })
+    }
+
+    /// The live state feed. A late subscriber's `borrow` starts at the
+    /// CURRENT value, then sees every change from there.
+    pub fn subscribe(&self) -> watch::Receiver<VpnState> {
+        self.tx.subscribe()
     }
 
     pub fn snapshot(&self) -> VpnState {
         self.inner.lock().unwrap().state.clone()
     }
 
-    fn update(&self, app: &AppHandle, mutate: impl FnOnce(&mut Inner)) -> VpnState {
+    /// One state → every subscriber. `send` fails only when no receiver
+    /// is alive (the publisher task holds one for the app's lifetime):
+    /// ignored like the old `let _ = app.emit`, same "no one listens"
+    /// semantics.
+    fn publish(&self, state: VpnState) {
+        let _ = self.tx.send(state);
+    }
+
+    fn update(&self, mutate: impl FnOnce(&mut Inner)) -> VpnState {
         let state = {
             let mut inner = self.inner.lock().unwrap();
             let before = inner.state.clone();
             mutate(&mut inner);
             // The armed flag is derived state, never a second source of
-            // truth: recompute it after every mutation so every emitted
+            // truth: recompute it after every mutation so every published
             // state satisfies the formula (see `apply_reconnect_armed`).
             apply_reconnect_armed(&mut inner);
             if inner.state == before {
                 // Nothing observable changed (e.g. a poll tick with the same
-                // phase): skip the event instead of waking every listener.
+                // phase): skip the publish instead of waking every listener.
                 return before;
             }
             inner.state.clone()
-            // The guard is dropped here, BEFORE emitting. `Emitter::emit` runs
-            // Rust listeners synchronously on this thread; emitting while still
-            // holding the guard self-deadlocked the poller the moment any
-            // listener read the state back through `snapshot()`, freezing the
-            // main thread on its next `get_state` and stalling the whole
-            // NSApplication run loop (dead tray, dead window).
+            // The guard is dropped here, before publishing. `watch::send`
+            // runs no listener code on this thread (unlike the old direct
+            // emit, whose synchronous listeners re-reading `snapshot()`
+            // self-deadlocked the poller), but dropping every guard before
+            // any kind of notification stays the crate's uniform rule —
+            // see the lock-order doc on `AppContext` in main.rs.
         };
-        let _ = app.emit("vpn-state", &state);
+        self.publish(state.clone());
         state
     }
 
@@ -148,18 +177,18 @@ impl VpnController {
     /// and the second `admin start` unloads — killing — the first worker
     /// mid-SSO. The check and the transition must be atomic; the refusal
     /// error is the caller's to surface.
-    pub fn try_begin_connect(&self, app: &AppHandle, portal: &str) -> Result<(), String> {
+    pub fn try_begin_connect(&self, portal: &str) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
             match enter_connecting(&mut inner, portal) {
                 Ok(()) => Ok(inner.state.clone()),
                 Err(phase) => Err(format!("cannot connect while {phase:?}")),
             }
-            // Guard dropped BEFORE emitting (the `update` discipline).
+            // Guard dropped BEFORE publishing (the `update` discipline).
         };
         match outcome {
             Ok(state) => {
-                let _ = app.emit("vpn-state", &state);
+                self.publish(state);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -169,26 +198,26 @@ impl VpnController {
     /// Gate + transition for a disconnect attempt, atomic like
     /// `try_begin_connect`. A second disconnect while already Disconnecting
     /// is idempotent (Ok): the stop request is already in flight.
-    pub fn try_begin_disconnect(&self, app: &AppHandle) -> Result<(), String> {
+    pub fn try_begin_disconnect(&self) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
             match enter_disconnecting(&mut inner) {
                 Ok(()) => Ok(inner.state.clone()),
                 Err(phase) => Err(format!("cannot disconnect while {phase:?}")),
             }
-            // Guard dropped BEFORE emitting (the `update` discipline).
+            // Guard dropped BEFORE publishing (the `update` discipline).
         };
         match outcome {
             Ok(state) => {
-                let _ = app.emit("vpn-state", &state);
+                self.publish(state);
                 Ok(())
             }
             Err(error) => Err(error),
         }
     }
 
-    pub fn connect_failed(&self, app: &AppHandle, error: String) {
-        self.update(app, |inner| {
+    pub fn connect_failed(&self, error: String) {
+        self.update(|inner| {
             inner.state.phase = Phase::Error;
             inner.state.last_error = Some(error);
             inner.worker_started = false;
@@ -212,8 +241,8 @@ impl VpnController {
     /// The privileged teardown failed: surface the failure instead of a
     /// stuck "Disconnecting". The poller then reports the truth from the lock
     /// file (still connected → Connected again).
-    pub fn disconnect_failed(&self, app: &AppHandle, error: String) {
-        self.update(app, |inner| {
+    pub fn disconnect_failed(&self, error: String) {
+        self.update(|inner| {
             inner.state.phase = Phase::Error;
             inner.state.last_error = Some(error);
         });
@@ -222,8 +251,8 @@ impl VpnController {
     // -- observations from the poller -------------------------------------------
 
     /// Apply filesystem evidence (lock file present/absent, PID alive/dead).
-    pub fn observe_lock(&self, app: &AppHandle, lock: Option<LockObservation>) {
-        self.update(app, |inner| apply_lock(inner, lock));
+    pub fn observe_lock(&self, lock: Option<LockObservation>) {
+        self.update(|inner| apply_lock(inner, lock));
     }
 
     /// Whether the poller may attribute a missing lock file to a dead worker:
@@ -238,11 +267,11 @@ impl VpnController {
     }
 
     /// A parsed gateway name from the JSON log stream.
-    pub fn observe_gateway(&self, app: &AppHandle, gateway: Option<String>) {
+    pub fn observe_gateway(&self, gateway: Option<String>) {
         if gateway.is_none() {
             return;
         }
-        self.update(app, |inner| {
+        self.update(|inner| {
             inner.state.gateway = gateway;
         });
     }
@@ -257,8 +286,8 @@ impl VpnController {
     /// while idle: during Connecting/Connected/Disconnecting `portal`
     /// describes the in-flight operation and must not be rewritten by a
     /// selection change.
-    pub fn note_selected_portal(&self, app: &AppHandle, portal: Option<String>) {
-        self.update(app, |inner| apply_selected_portal(inner, portal));
+    pub fn note_selected_portal(&self, portal: Option<String>) {
+        self.update(|inner| apply_selected_portal(inner, portal));
     }
 
     /// Record what a fresh connect would currently target (the resolved
@@ -266,10 +295,10 @@ impl VpnController {
     /// ever reading the config: called after every config save that touches
     /// the resolution (see `sync_reconnect_target` in main.rs) and seeded
     /// once at startup. While Connected, a target differing from the live
-    /// gateway arms the flag in the very same update — the vpn-state event
+    /// gateway arms the flag in the very same update — the published state
     /// carries it to the panel and the tray together.
-    pub fn note_reconnect_target(&self, app: &AppHandle, target: Option<String>) {
-        self.update(app, |inner| {
+    pub fn note_reconnect_target(&self, target: Option<String>) {
+        self.update(|inner| {
             inner.reconnect_target = target;
         });
     }
@@ -492,8 +521,9 @@ fn process_is_gpclient(_pid: Pid) -> bool {
 
 // -- background tasks ---------------------------------------------------------
 
-/// Poll the PID lock file and push state transitions to the frontend.
-pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
+/// Poll the PID lock file and push state transitions to the publisher
+/// (the controller's watch channel — no `AppHandle` needed here).
+pub fn spawn_status_poller(controller: Arc<VpnController>) {
     tauri::async_runtime::spawn(async move {
         loop {
             let observation = read_lock_observation();
@@ -514,7 +544,6 @@ pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
                     // and exited before the tunnel came up (wrong SSO, closed
                     // browser, gateway error, crash).
                     controller.connect_failed(
-                        &app,
                         "The VPN worker exited before the tunnel came up".to_string(),
                     );
                 }
@@ -523,7 +552,7 @@ pub fn spawn_status_poller(app: AppHandle, controller: Arc<VpnController>) {
                 // `run_admin("start")` reports its own failure, and
                 // cancel/stop set their own phases.
             }
-            controller.observe_lock(&app, observation);
+            controller.observe_lock(observation);
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
@@ -693,7 +722,7 @@ async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) 
             if let Some(address) = address {
                 learn_gateway_host(app, &address, &name).await;
             }
-            controller.observe_gateway(app, Some(name.clone()));
+            controller.observe_gateway(Some(name.clone()));
             harvest_gateway(app, &name).await;
         }
         // A getconfig POST: the cached-cookie path emits only this. Translate
@@ -701,7 +730,7 @@ async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) 
         // unknown, but harvest only a known NAME (never the FQDN).
         Some(GatewayMention::Host(host)) => {
             let name = gateway_display_name(app, &host);
-            controller.observe_gateway(app, Some(name.clone().unwrap_or(host)));
+            controller.observe_gateway(Some(name.clone().unwrap_or(host)));
             if let Some(name) = name {
                 harvest_gateway(app, &name).await;
             }
@@ -784,7 +813,8 @@ async fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
     .await;
     match outcome {
         Ok(Some(Ok((true, cfg)))) => {
-            // Guard dropped BEFORE emitting (see `update`).
+            // Guard dropped BEFORE emitting (lock-order doc on
+            // `AppContext` in main.rs).
             let _ = app.emit("config-updated", &cfg);
         }
         Ok(Some(Ok((false, _)))) | Ok(None) => {}
@@ -838,7 +868,8 @@ async fn harvest_gateway(app: &AppHandle, gateway: &str) {
     .await;
     match outcome {
         Ok(Some(Ok((true, cfg)))) => {
-            // Guard dropped BEFORE emitting (see `update`).
+            // Guard dropped BEFORE emitting (lock-order doc on
+            // `AppContext` in main.rs).
             let _ = app.emit("config-updated", &cfg);
         }
         Ok(Some(Ok((false, _)))) | Ok(None) => {}
@@ -1016,17 +1047,50 @@ pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpc
 /// half a minute instead of never.
 const ADMIN_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A privileged-helper failure, classified so the consumer can tell the
+/// classes apart: a missing one-time setup needs the user's action, a
+/// timeout can be retried, a `Failed` is whatever the wrapper said.
+///
+/// `Display` is the user-facing text AND a stable grep contract — the
+/// setup-hint especially is byte-identical to what the old string-based
+/// errors carried (panel history and muscle memory match it). The serde
+/// shape `{kind, detail}` is the wire format: Tauri rejects the command's
+/// promise with the serialized value, and the frontend maps it back to
+/// those same strings (see `commandErrorText` in src/main.ts).
+#[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize)]
+#[serde(tag = "kind", content = "detail")]
+pub enum AdminError {
+    /// The wrapper/sudoers setup is missing on this machine.
+    #[error(
+        "The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '{setup_script}'"
+    )]
+    NotInstalled { setup_script: PathBuf },
+    /// The helper op did not finish within `ADMIN_OP_TIMEOUT`.
+    #[error("admin op '{op}' timed out")]
+    Timeout { op: &'static str },
+    /// The op ran and failed. `stderr` is the wrapper's stderr verbatim —
+    /// or, for the rarer shapes (sudo itself could not spawn, a non-zero
+    /// exit with no stderr), the same text the old formatting produced.
+    #[error("{stderr}")]
+    Failed { op: &'static str, stderr: String },
+}
+
 /// Run one admin operation (`selftest`, `start`, `stop`, `cancel`).
 ///
 /// `sudo -n` never prompts: without the sudoers rule it fails fast, and
-/// `admin_error_hint` turns that failure into the one-time setup
+/// `admin_error_hint` classifies that failure into the one-time setup
 /// instructions. No credentials are ever seen or handled by GP Bar — the
 /// whole point of the wrapper design (`pam_tid` falls back to the password
 /// for any process that is not an interactive terminal, so Touch ID
 /// cannot gate the helper).
-pub async fn run_admin(op: &str, args: &[&str]) -> Result<String, String> {
+///
+/// Errors are typed, not formatted: the timeout, a spawn failure and a
+/// non-zero exit are distinct [`AdminError`]s (the last two keep their
+/// old text inside `Failed::stderr`); the caller classifies the raw value
+/// through `admin_error_hint`.
+pub async fn run_admin(op: &'static str, args: &[&str]) -> Result<String, AdminError> {
     // LC_ALL/LANG=C: sudo and the wrapper run with stable, non-localized
-    // error strings, which `admin_error_hint` matches on.
+    // error strings, which the classification matches on.
     let fut = Command::new("/usr/bin/sudo")
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -1041,16 +1105,22 @@ pub async fn run_admin(op: &str, args: &[&str]) -> Result<String, String> {
         .output();
     let output = tokio::time::timeout(ADMIN_OP_TIMEOUT, fut)
         .await
-        .map_err(|_| format!("admin op '{op}' timed out"))?
-        .map_err(|e| format!("sudo failed to run: {e}"))?;
+        .map_err(|_| AdminError::Timeout { op })?
+        .map_err(|e| AdminError::Failed {
+            op,
+            stderr: format!("sudo failed to run: {e}"),
+        })?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.status.success() {
         Ok(stdout)
     } else if stderr.is_empty() {
-        Err(format!("admin op '{op}' failed: exit {}", output.status))
+        Err(AdminError::Failed {
+            op,
+            stderr: format!("admin op '{op}' failed: exit {}", output.status),
+        })
     } else {
-        Err(stderr)
+        Err(AdminError::Failed { op, stderr })
     }
 }
 
@@ -1063,32 +1133,44 @@ pub fn setup_script_path(app: &AppHandle) -> PathBuf {
         .join("scripts/setup-admin.sh")
 }
 
-/// Map sudo/wrapper failures to the one-time setup hint when the helper is
-/// not installed; operational failures pass through unchanged.
-pub fn admin_error_hint(setup_script: &Path, error: &str) -> String {
+/// Classify a raw admin failure from the live system: the only
+/// environment-dependent input is the wrapper's existence check.
+pub fn admin_error_hint(setup_script: &Path, error: AdminError) -> AdminError {
     admin_error_hint_for(Path::new(ADMIN_WRAPPER).exists(), setup_script, error)
 }
 
-/// Pure core of [`admin_error_hint`]: `wrapper_installed` is the caller's
-/// locale-independent existence check so tests are environment-free.
-pub fn admin_error_hint_for(wrapper_installed: bool, setup_script: &Path, error: &str) -> String {
+/// Pure core of [`admin_error_hint`] and the whole classification:
+/// `wrapper_installed` is the caller's locale-independent existence check
+/// so tests are environment-free.
+///
+/// A missing wrapper file, or sudo's password-prompt / command-not-found
+/// stderr, means the one-time setup is missing — whatever the raw failure
+/// said. Every other failure passes through unchanged, with the same
+/// `Display` the raw value already had.
+pub fn admin_error_hint_for(
+    wrapper_installed: bool,
+    setup_script: &Path,
+    error: AdminError,
+) -> AdminError {
     // No wrapper file means the setup is missing, whatever the exact
     // sudo/OS error string says. sudo's stderr is forced to LC_ALL=C by
     // `run_admin`, so the string matches below are stable, but the
     // existence check works even without them.
-    let hint = || {
-        format!(
-            "The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '{}'",
-            setup_script.display()
-        )
-    };
-    if !wrapper_installed
-        || error.contains("a password is required")
-        || error.contains("command not found")
-    {
-        hint()
-    } else {
-        error.to_string()
+    if !wrapper_installed {
+        return AdminError::NotInstalled {
+            setup_script: setup_script.to_path_buf(),
+        };
+    }
+    match error {
+        AdminError::Failed { stderr, .. }
+            if stderr.contains("a password is required")
+                || stderr.contains("command not found") =>
+        {
+            AdminError::NotInstalled {
+                setup_script: setup_script.to_path_buf(),
+            }
+        }
+        other => other,
     }
 }
 
@@ -1110,24 +1192,126 @@ mod tests {
     #[test]
     fn admin_errors_map_to_the_setup_hint() {
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
-        // Missing sudoers rule and missing wrapper both mean "run the setup".
-        assert!(
-            admin_error_hint_for(false, setup, "sudo: some other failure")
-                .contains("setup-admin.sh")
-        );
-        assert!(admin_error_hint(setup, "sudo: a password is required").contains("setup-admin.sh"));
-        assert!(
-            admin_error_hint(
-                setup,
-                "sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found"
-            )
-            .contains("setup-admin.sh")
-        );
+        let not_installed = |error: AdminError| match error {
+            AdminError::NotInstalled { setup_script } => {
+                assert_eq!(setup_script, setup);
+                true
+            }
+            _ => false,
+        };
+        let failed = |stderr: &str| AdminError::Failed {
+            op: "start",
+            stderr: stderr.to_string(),
+        };
+
+        // A missing wrapper beats everything, whatever the raw failure was:
+        // the machine has never run the one-time setup.
+        assert!(not_installed(admin_error_hint_for(
+            false,
+            setup,
+            failed("sudo: some other failure")
+        )));
+        assert!(not_installed(admin_error_hint_for(
+            false,
+            setup,
+            AdminError::Timeout { op: "stop" }
+        )));
+        // Installed, but sudo wants a password (no NOPASSWD rule) or cannot
+        // find the wrapper path: the setup is missing in those shapes too.
+        assert!(not_installed(admin_error_hint_for(
+            true,
+            setup,
+            failed("sudo: a password is required")
+        )));
+        assert!(not_installed(admin_error_hint_for(
+            true,
+            setup,
+            failed("sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found")
+        )));
         // Operational failures pass through untouched.
+        let passthrough = failed("gp-admin: the VPN worker did not stop");
         assert_eq!(
-            admin_error_hint_for(true, setup, "gp-admin: the VPN worker did not stop"),
+            admin_error_hint_for(true, setup, passthrough.clone()),
+            passthrough
+        );
+    }
+
+    /// The user-facing texts are a stable grep contract (RECAP quotes,
+    /// panel history, muscle memory): the typed errors must format to
+    /// byte-identical strings — including the two rare `Failed` shapes
+    /// `run_admin` synthesizes with the old wording.
+    #[test]
+    fn admin_error_texts_are_byte_identical() {
+        let setup =
+            PathBuf::from("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
+        assert_eq!(
+            AdminError::NotInstalled {
+                setup_script: setup.clone()
+            }
+            .to_string(),
+            "The privileged helper is not installed. One-time setup (Terminal):\n  \
+             sudo bash '/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh'"
+        );
+        assert_eq!(
+            AdminError::Timeout { op: "stop" }.to_string(),
+            "admin op 'stop' timed out"
+        );
+        assert_eq!(
+            AdminError::Failed {
+                op: "start",
+                stderr: "sudo failed to run: No such file or directory (os error 2)".to_string(),
+            }
+            .to_string(),
+            "sudo failed to run: No such file or directory (os error 2)"
+        );
+        assert_eq!(
+            AdminError::Failed {
+                op: "stop",
+                stderr: "admin op 'stop' failed: exit exit status: 1".to_string(),
+            }
+            .to_string(),
+            "admin op 'stop' failed: exit exit status: 1"
+        );
+        // A wrapper stderr surfaces verbatim, not wrapped.
+        assert_eq!(
+            AdminError::Failed {
+                op: "stop",
+                stderr: "gp-admin: the VPN worker did not stop".to_string(),
+            }
+            .to_string(),
             "gp-admin: the VPN worker did not stop"
         );
+    }
+
+    /// The wire shape of a rejected command promise: Tauri serializes the
+    /// error value, so the frontend receives `{kind, detail}` and maps it
+    /// back to the same strings (`commandErrorText` in src/main.ts).
+    #[test]
+    fn admin_errors_serialize_to_kind_and_detail() {
+        let setup =
+            PathBuf::from("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
+        let value = serde_json::to_value(AdminError::NotInstalled {
+            setup_script: setup,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "NotInstalled");
+        assert_eq!(
+            value["detail"]["setup_script"],
+            "/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh"
+        );
+
+        let value = serde_json::to_value(AdminError::Timeout { op: "stop" }).unwrap();
+        assert_eq!(value["kind"], "Timeout");
+        assert_eq!(value["detail"]["op"], "stop");
+
+        let value = serde_json::to_value(AdminError::Failed {
+            op: "start",
+            stderr: "boom".to_string(),
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "Failed");
+        assert_eq!(value["detail"]["op"], "start");
+        assert_eq!(value["detail"]["stderr"], "boom");
     }
 
     #[test]
@@ -1407,6 +1591,61 @@ mod tests {
         assert!(!controller.connecting_worker_started());
     }
 
+    /// Publishing goes through the watch channel: every real transition
+    /// reaches the subscribers, no-op mutations and refused gates publish
+    /// nothing, and a late subscriber still sees the latest state first.
+    /// Uses only the sync receiver APIs (`has_changed`,
+    /// `borrow_and_update`) — no async runtime in unit tests.
+    #[test]
+    fn state_changes_publish_over_the_watch_channel() {
+        let controller = VpnController::new();
+        let mut rx = controller.subscribe();
+        // The seed value is the current one: nothing has changed yet.
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().phase, Phase::Disconnected);
+
+        // A poll observation that changes nothing publishes nothing.
+        controller.observe_lock(None);
+        assert!(!rx.has_changed().unwrap());
+
+        // A real transition publishes the new state...
+        controller.connect_failed("boom".to_string());
+        assert!(rx.has_changed().unwrap());
+        let state = rx.borrow_and_update();
+        assert_eq!(state.phase, Phase::Error);
+        assert_eq!(state.last_error.as_deref(), Some("boom"));
+        drop(state);
+
+        // ...and a subscriber that joins later renders absolutely from
+        // the latest value.
+        let mut late = controller.subscribe();
+        assert_eq!(late.borrow_and_update().phase, Phase::Error);
+
+        // The gate messages are unchanged, and refusals publish nothing.
+        controller.try_begin_connect("vpn.example.com").unwrap();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().phase, Phase::Connecting);
+        assert_eq!(
+            controller.try_begin_connect("other.example").unwrap_err(),
+            "cannot connect while Connecting"
+        );
+        assert_eq!(
+            controller.try_begin_disconnect().unwrap_err(),
+            "cannot disconnect while Connecting"
+        );
+        assert!(!rx.has_changed().unwrap());
+
+        // The poller's adoption observation publishes the graduation.
+        controller.observe_lock(Some(LockObservation {
+            pid: Pid(std::num::NonZeroI32::new(4242).unwrap()),
+            connected_since_epoch_secs: 1_700_000_000,
+        }));
+        assert!(rx.has_changed().unwrap());
+        let state = rx.borrow_and_update();
+        assert_eq!(state.phase, Phase::Connected);
+        assert_eq!(state.pid, Some(4242));
+    }
+
     #[test]
     fn splits_lines_on_bytes_without_breaking_utf8_across_reads() {
         // The two halves of a multibyte character arrive in separate
@@ -1505,11 +1744,11 @@ mod tests {
 
     #[test]
     fn admin_timeout_errors_reach_the_setup_hint_unchanged() {
-        // The timeout string is an operational failure, not a setup one —
-        // it must pass through and be surfaced by the caller.
+        // The timeout is an operational failure, not a setup one — it must
+        // pass through and be surfaced by the caller.
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
-        let error = "admin op 'stop' timed out";
-        assert_eq!(admin_error_hint_for(true, setup, error), error);
+        let error = AdminError::Timeout { op: "stop" };
+        assert_eq!(admin_error_hint_for(true, setup, error.clone()), error);
     }
 
     #[test]

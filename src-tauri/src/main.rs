@@ -8,6 +8,7 @@
 mod config;
 mod glass;
 mod icons;
+mod panel;
 mod vpn;
 
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 use tauri::{
     AppHandle, Emitter, Listener, LogicalPosition, Manager, State, WindowEvent, Wry,
     menu::{ContextMenu, Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
 
 use config::{Config, valid_name};
@@ -26,13 +27,13 @@ use vpn::{Phase, VpnController, VpnState};
 const TRAY_ID: &str = "gp-bar";
 
 /// Handles for the right-click tray menu. The menu is NEVER attached to the
-/// tray (see the tray comment in `main`): on this macOS beta a natively
-/// attached status-item menu makes the system swallow left clicks before
-/// the app ever sees them, killing the panel toggle. It is popped up BY
-/// HAND on right-click instead — muda's position-less context-menu path
-/// anchors at `NSEvent::mouseLocation` (the icon the user just
-/// right-clicked) in screen coordinates, so the hidden panel window's
-/// geometry never enters into it.
+/// tray (see `build_tray`): on this macOS beta a natively attached
+/// status-item menu makes the system swallow left clicks before the app
+/// ever sees them, killing the panel toggle. It is popped up BY HAND on
+/// right-click instead — muda's position-less context-menu path anchors
+/// at `NSEvent::mouseLocation` (the icon the user just right-clicked) in
+/// screen coordinates, so the hidden panel window's geometry never
+/// enters into it.
 static TRAY_MENU: OnceLock<TrayMenuHandles> = OnceLock::new();
 
 // Per-phase tray icons, rendered once and shared (the supersampled padlock
@@ -50,6 +51,32 @@ struct TrayMenuHandles {
     disconnect: MenuItem<Wry>,
 }
 
+/// Shared, lock-protected app state.
+///
+/// # Lock order
+///
+/// The crate has exactly three mutexes, and no code path holds two of
+/// them at once — every guard is leaf-scoped, which keeps the couplings
+/// below acyclic by construction:
+///
+/// 1. `config` — the persisted settings. Guard-scoped inside
+///    `update_config` (and the plain reads): taken, cloned/mutated,
+///    released; never held across an `.await` or an emit.
+/// 2. `controller.inner` (vpn.rs) — the VPN state machine. Guard-scoped
+///    inside `vpn::update` and the `try_begin_*` gates: the new state is
+///    computed under the guard, the guard is dropped, and only then is
+///    the state published on the watch channel.
+/// 3. `panel_hidden_at` — a pure leaf: taken and released inline by
+///    `toggle_panel` and the focus-loss handler, never nested with
+///    anything.
+///
+/// If a nesting ever becomes unavoidable, it may only be config →
+/// controller, never the reverse: `config-updated` is still emitted
+/// directly (`broadcast_config`, and the gateway harvest in vpn.rs) and
+/// its listener re-reads the controller (`snapshot`), so a config guard
+/// held across that emit needs exactly this direction to stay
+/// deadlock-free. The vpn-state path is structural — the publisher task
+/// owns the only subscriber, and nothing emits it under any guard.
 pub(crate) struct AppContext {
     controller: Arc<VpnController>,
     pub(crate) config: Mutex<Config>,
@@ -82,9 +109,10 @@ impl AppContext {
     /// result skips the disk write entirely.
     ///
     /// The config mutex is taken and released inside; anything that emits
-    /// (`broadcast_config`, `note_selected_portal`) may only run AFTER
-    /// this returns — the guard-dropped-before-emitting discipline, see
-    /// `vpn::update`.
+    /// (`broadcast_config`) or publishes (`note_selected_portal`,
+    /// `sync_reconnect_target`) may only run AFTER this returns — the
+    /// guard-before-notification discipline, see the lock-order doc on
+    /// `AppContext`.
     pub(crate) fn update_config<T>(
         &self,
         f: impl FnOnce(&mut Config) -> Result<T, String>,
@@ -204,10 +232,8 @@ async fn add_portal(
     })
     .await
     .map_err(|error| error.to_string())??;
-    // Emit outside the config lock — update_config has dropped it.
-    state
-        .controller
-        .note_selected_portal(&app, cfg.selected.clone());
+    // Publish outside the config lock — update_config has dropped it.
+    state.controller.note_selected_portal(cfg.selected.clone());
     Ok(())
 }
 
@@ -229,9 +255,7 @@ async fn remove_portal(
     })
     .await
     .map_err(|error| error.to_string())??;
-    state
-        .controller
-        .note_selected_portal(&app, cfg.selected.clone());
+    state.controller.note_selected_portal(cfg.selected.clone());
     Ok(())
 }
 
@@ -254,9 +278,7 @@ async fn select_portal(
     })
     .await
     .map_err(|error| error.to_string())??;
-    state
-        .controller
-        .note_selected_portal(&app, cfg.selected.clone());
+    state.controller.note_selected_portal(cfg.selected.clone());
     Ok(())
 }
 
@@ -274,6 +296,22 @@ async fn set_reuse_cookie(app: AppHandle, value: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// A failed panel/tray action, typed the same way as [`vpn::AdminError`] so
+/// the frontend can tell the classes apart: `Message` is a plain refusal
+/// (the connect gates, an invalid gateway name), `Admin` wraps the
+/// privileged-helper failure with its own `{kind, detail}` shape inside.
+/// `Display` keeps the exact texts the old `Result<_, String>` carried —
+/// the tray menu's `{error}` log lines and the panel's error row stay
+/// byte-identical.
+#[derive(Debug, thiserror::Error, serde::Serialize)]
+#[serde(tag = "kind", content = "detail")]
+enum ActionError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    Admin(#[from] vpn::AdminError),
+}
+
 #[tauri::command]
 async fn connect(
     app: AppHandle,
@@ -281,12 +319,12 @@ async fn connect(
     portal: String,
     reuse_cookie: bool,
     gateway: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), ActionError> {
     do_connect(app, &state, &portal, reuse_cookie, gateway).await
 }
 
 #[tauri::command]
-async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
+async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), ActionError> {
     do_disconnect(app, &state).await
 }
 
@@ -296,7 +334,7 @@ async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), 
 /// panel's parameters — there is nothing to forward from the frontend:
 /// the armed flag and the target agree by construction.
 #[tauri::command]
-async fn reconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
+async fn reconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), ActionError> {
     do_reconnect(app, &state, "reconnect").await
 }
 
@@ -309,10 +347,10 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Stri
     if let Err(error) = vpn::run_admin("cancel", &[]).await {
         log::warn!(
             "cancel failed: {}",
-            vpn::admin_error_hint(&vpn::setup_script_path(&app), &error)
+            vpn::admin_error_hint(&vpn::setup_script_path(&app), error)
         );
     }
-    controller.connect_failed(&app, "Connection canceled".to_string());
+    controller.connect_failed("Connection canceled".to_string());
     Ok(())
 }
 
@@ -349,14 +387,14 @@ fn connect_target_from_config(cfg: &Config) -> (String, bool, Option<String>) {
 /// resolution (the gateway picker, the preferred star, the list itself)
 /// re-notes after its save, and setup seeds once at startup. `cfg` is the
 /// post-update config, lock-free by contract.
-fn sync_reconnect_target(app: &AppHandle, controller: &VpnController, cfg: &Config) {
+fn sync_reconnect_target(controller: &VpnController, cfg: &Config) {
     let target =
         resolve_connect_gateway(cfg.selected_gateway.clone(), cfg.preferred_gateway.clone());
-    controller.note_reconnect_target(app, target);
+    controller.note_reconnect_target(target);
 }
 
 fn broadcast_config(app: &AppHandle, cfg: &Config) {
-    // See vpn::update: emit outside the config lock.
+    // Emit outside the config lock (lock-order doc on `AppContext`).
     let _ = app.emit("config-updated", cfg);
 }
 
@@ -390,11 +428,11 @@ async fn select_gateway(
     })
     .await
     .map_err(|error| error.to_string())??;
-    // Guard dropped before emitting (deadlock discipline, see vpn::update).
+    // Guard dropped before emitting (lock-order doc on `AppContext`).
     broadcast_config(&app, &cfg);
     // The picker changed the resolution: re-note the target so the armed
     // flag (vpn-state → panel and tray) reflects the switch while Connected.
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -426,7 +464,7 @@ async fn set_preferred_gateway(
     .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
     // The star changes what "Automatic" resolves to: re-note the target.
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -453,7 +491,7 @@ async fn remove_gateway(
     .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
     // A removal can zero the preferred/selected picks: re-note the target.
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -487,11 +525,11 @@ async fn add_gateway(
     })
     .await
     .map_err(|error| error.to_string())??;
-    // Guard dropped before emitting (deadlock discipline, see vpn::update).
+    // Guard dropped before emitting (lock-order doc on `AppContext`).
     broadcast_config(&app, &cfg);
     // Uniform with the other gateway commands: re-note the target (an add
     // cannot change the resolution, but one rule for one family of paths).
-    sync_reconnect_target(&app, &state.controller, &cfg);
+    sync_reconnect_target(&state.controller, &cfg);
     Ok(())
 }
 
@@ -527,12 +565,15 @@ async fn get_network_health(state: State<'_, AppContext>) -> Result<vpn::Network
     })
 }
 
+/// The privileged repair's failure IS the typed admin failure (the setup
+/// hint is folded in server-side): the frontend receives `{kind, detail}`
+/// and maps it back to the Display texts.
 #[tauri::command]
-async fn repair_network(app: AppHandle) -> Result<String, String> {
+async fn repair_network(app: AppHandle) -> Result<String, vpn::AdminError> {
     // Refuses loudly while the VPN is up — see `gp-admin repair`.
     match vpn::run_admin("repair", &[]).await {
         Ok(message) => Ok(message),
-        Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), &error)),
+        Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), error)),
     }
 }
 
@@ -544,7 +585,7 @@ async fn do_connect(
     portal: &str,
     reuse_cookie: bool,
     gateway: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), ActionError> {
     let controller = state.controller.clone();
 
     // Gateway resolution: an explicit pick from the panel or the tray menu
@@ -557,7 +598,7 @@ async fn do_connect(
     );
     if let Some(name) = &resolved_gateway {
         if !valid_name(name) {
-            return Err("Invalid gateway name".to_string());
+            return Err(ActionError::Message("Invalid gateway name".to_string()));
         }
     }
     let gateway_arg = resolved_gateway.clone().unwrap_or_else(|| "-".to_string());
@@ -581,7 +622,9 @@ async fn do_connect(
     // Gate and transition atomically: a second concurrent Connect (double
     // click, panel + tray menu) must be refused BEFORE it can launch another
     // `admin start` and unload-kill the first worker mid-SSO.
-    controller.try_begin_connect(&app, portal)?;
+    controller
+        .try_begin_connect(portal)
+        .map_err(ActionError::Message)?;
     let _ = app.emit("vpn-log-cleared", ());
 
     // No focus bookkeeping around the admin call: the helper is NOPASSWD so
@@ -597,30 +640,32 @@ async fn do_connect(
             Ok(())
         }
         Err(error) => {
-            let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
-            controller.connect_failed(&app, error.clone());
-            Err(error)
+            let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
+            controller.connect_failed(error.to_string());
+            Err(error.into())
         }
     }
 }
 
-async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<(), String> {
+async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<(), ActionError> {
     let controller = state.controller.clone();
     // Gate and transition atomically (see try_begin_disconnect): a concurrent
     // connect that lands between a `snapshot()` check and the transition must
     // not be torn down by a second disconnect.
-    controller.try_begin_disconnect(&app)?;
+    controller
+        .try_begin_disconnect()
+        .map_err(ActionError::Message)?;
     // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
     // helper never raises a dialog, so hide-on-blur stays in effect.
     let result = vpn::run_admin("stop", &[]).await;
     if let Err(error) = result {
         log::warn!("disconnect failed: {error}");
-        let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
+        let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
         // Fail loud, never SIGKILL: the worker may ignore the signal and a
         // killed worker skips the vpnc-script teardown, leaving macOS DNS
         // settings pointing at VPN resolvers. The poller reports the
         // still-connected truth from the lock file.
-        controller.disconnect_failed(&app, format!("disconnect failed: {error}"));
+        controller.disconnect_failed(format!("disconnect failed: {error}"));
     }
     Ok(())
 }
@@ -656,7 +701,7 @@ async fn do_reconnect(
     app: AppHandle,
     state: &State<'_, AppContext>,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), ActionError> {
     let (portal, reuse_cookie, gateway) = {
         let cfg = state.config.lock().unwrap();
         connect_target_from_config(&cfg)
@@ -681,7 +726,7 @@ async fn do_reconnect(
 // wrong-position reports only reproduce in real GUI usage, so every
 // anchor/monitor/set_position decision leaves its numbers behind.
 
-fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
+fn toggle_panel(app: &AppHandle, anchor: Option<panel::Anchor>) {
     let Some(window) = app.get_webview_window("main") else {
         log::warn!("toggle: no 'main' window found");
         return;
@@ -714,92 +759,32 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     }
 
     // Anchor the panel under the tray icon: the handler passes the click
-    // position (or the icon rect when it agrees with the click). The monitor
-    // holding the anchor is resolved BY HAND in one canonical space — logical
-    // points, top-left origin — never through tauri's monitor_from_point.
-    // macOS really runs TWO screen spaces here, flipped against each other
-    // in y:
-    //
-    //   * AppKit (NSEvent::mouseLocation, NSScreen/NSWindow frames) is
-    //     BOTTOM-LEFT origin, y up. The tray payload is born there and is
-    //     flipped into top-left by tray-icon (and by tao's cursor helper)
-    //     using the MAIN screen's height from CGDisplayPixelsHigh — which
-    //     behaves as POINTS on this OS build (only the logical height fits
-    //     both the single- and the dual-display payloads) — then scaled by
-    //     the tray window's own factor. Pre-scale, the payload IS canonical.
-    //   * Quartz display space (CGDisplayBounds — what tao's
-    //     Monitor::position() passes through RAW; tauri's work_area just adds
-    //     the menu-bar/dock insets to it) is TOP-LEFT origin, y down: the
-    //     monitor table below is already canonical, no flip needed.
-    //
-    // Invariant: never flip tao's raw positions with the main screen's
-    // height. The flip is correct only for the primary (its origin (0,0)
-    // is invariant under it); for every other monitor it mirrors the
-    // rectangle across the primary — a display above the laptop would be
-    // recorded below, and anchors on the external menu bar would never
-    // match. The monitor table below is built in the canonical space
-    // directly instead.
+    // position (or the icon rect when it agrees with the click). The
+    // monitor resolution and the clamping are pure geometry in ONE
+    // canonical space — logical points, top-left origin — never through
+    // tauri's monitor_from_point: the coordinate-space notes live in the
+    // panel module now.
 
-    // Tray payload, or the cursor fallback recovered to pure logical points
-    // (tao converts the cursor with the PRIMARY scale — its cross-monitor
-    // quirk — so undo that before hit-testing).
-    let (payload, logical) = match anchor {
-        Some(payload) => (Some(payload), None),
-        None => {
-            let cursor = window.cursor_position().ok();
-            log::debug!("toggle: no tray payload; cursor_position={cursor:?}");
-            let primary_scale = app
-                .primary_monitor()
-                .ok()
-                .flatten()
-                .map(|m| m.scale_factor())
-                .unwrap_or(1.0);
-            (
-                None,
-                cursor.map(|c| (c.x / primary_scale, c.y / primary_scale + 18.0)),
-            )
-        }
+    // Tray payload, or the cursor fallback recovered to pure logical
+    // points (tao converts the cursor with the PRIMARY scale — its
+    // cross-monitor quirk — so undo that before hit-testing).
+    let anchor = if let Some(payload) = anchor {
+        Some(payload)
+    } else {
+        let cursor = window.cursor_position().ok();
+        log::debug!("toggle: no tray payload; cursor_position={cursor:?}");
+        let primary_scale = app
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .map_or(1.0, |m| m.scale_factor());
+        cursor.map(|c| panel::Anchor::Logical(c.x / primary_scale, c.y / primary_scale + 18.0))
     };
 
-    // Every monitor in canonical logical points, top-left origin, with its
-    // visibleFrame work area in the same space (tauri's work_area() is
-    // bottom-left too, so its y is flipped here).
-    struct Mon {
-        name: String,
-        scale: f64,
-        /// Monitor bounds: (x, y_top_left, width, height).
-        bounds: (f64, f64, f64, f64),
-        /// visibleFrame: same shape as `bounds`.
-        work: (f64, f64, f64, f64),
-    }
-    let mons: Vec<Mon> = app
-        .available_monitors()
-        .unwrap_or_default()
-        .iter()
-        .map(|m| {
-            let scale = m.scale_factor();
-            let pos = m.position();
-            let size = m.size();
-            let work = m.work_area();
-            Mon {
-                name: m.name().cloned().unwrap_or_default(),
-                scale,
-                bounds: (
-                    pos.x as f64 / scale,
-                    pos.y as f64 / scale,
-                    size.width as f64 / scale,
-                    size.height as f64 / scale,
-                ),
-                work: (
-                    work.position.x as f64 / scale,
-                    work.position.y as f64 / scale,
-                    work.size.width as f64 / scale,
-                    work.size.height as f64 / scale,
-                ),
-            }
-        })
-        .collect();
-    for mon in &mons {
+    // Every monitor in canonical logical points, with its visibleFrame
+    // work area in the same space (panel::monitor_layouts).
+    let layouts = panel::monitor_layouts(app);
+    for mon in &layouts {
         log::debug!(
             "positioning: monitor {} scale={:.1} bounds={:?} work={:?}",
             mon.name,
@@ -809,73 +794,56 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
         );
     }
 
-    // Hit-test the anchor. A payload point is scaled by the tray screen's
-    // OWN factor, so try each monitor's scale and keep the first whose
-    // logical bounds contain the result; on a real desk (no overlapping
-    // mixed-DPI projections) the match is unambiguous.
-    let hit = mons.iter().find_map(|mon| {
-        let (lx, ly) = match (payload, logical) {
-            (Some((ax, ay)), _) => (ax / mon.scale, ay / mon.scale),
-            (_, Some((lx, ly))) => (lx, ly),
-            (None, None) => return None,
-        };
-        let (bx, by, bw, bh) = mon.bounds;
-        (lx >= bx && lx < bx + bw && ly >= by && ly < by + bh).then_some((mon, lx, ly))
+    // The panel's logical size, computed once for both branches below.
+    // The scale_factor error fallback is the first monitor's scale: a
+    // never-observed-on-macOS failure path where only the size conversion
+    // could differ from the per-branch fallbacks this replaces (the
+    // winning, resp. primary, monitor's scale).
+    let panel_scale = window
+        .scale_factor()
+        .unwrap_or_else(|_| layouts.first().map_or(1.0, |mon| mon.scale));
+    let panel = window.outer_size().map(|size| {
+        (
+            f64::from(size.width) / panel_scale,
+            f64::from(size.height) / panel_scale,
+        )
     });
 
-    match (hit, window.outer_size()) {
-        (Some((mon, lx, ly)), Ok(size)) => {
-            // Everything is in logical points and set_position(Logical) is
-            // scale-independent on tao (to_logical is the identity for a
-            // Logical position), so a mixed-DPI desk is plain geometry here.
-            let (wx, wy, ww, wh) = mon.work;
-            let w_scale = window.scale_factor().unwrap_or(mon.scale);
-            let panel_w = size.width as f64 / w_scale;
-            let panel_h = size.height as f64 / w_scale;
-            // `clamp` panics when min exceeds max: a work area smaller than
-            // the panel must degrade to an edge, not take the app down.
-            let x = if ww < panel_w {
-                wx
-            } else {
-                (lx - panel_w / 2.0).clamp(wx, wx + ww - panel_w)
-            };
-            // Right under the tray icon, but never above the work area's top
-            // edge (the menu bar) and never past its bottom.
-            let y = if wh < panel_h {
-                ly.max(wy)
-            } else {
-                ly.max(wy).min(wy + wh - panel_h)
-            };
-            log::debug!(
-                "positioning: anchor logical=({lx:.1},{ly:.1}) monitor={} scale={:.1} \
-                 work=({wx:.1},{wy:.1},{ww:.1},{wh:.1}) panel={panel_w:.1}x{panel_h:.1} \
-                 -> set_position logical=({x:.1},{y:.1})",
-                mon.name,
-                mon.scale
-            );
-            if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
-                log::warn!("set_position failed: {error}");
-            }
-        }
-        (None, Ok(size)) => {
-            // Never seen on a real desk; degrade to the primary screen's
-            // top-right corner instead of leaving the panel at its
-            // creation-default mid-screen position.
-            log::warn!("positioning: NO monitor matched the anchor — primary top-right fallback");
-            if let Some(primary) = app.primary_monitor().ok().flatten() {
-                let scale = primary.scale_factor();
-                let work = primary.work_area();
-                let wx = work.position.x as f64 / scale;
-                let wy = work.position.y as f64 / scale;
-                let w_scale = window.scale_factor().unwrap_or(scale);
-                let panel_w = size.width as f64 / w_scale;
-                let (x, y) = (wx + work.size.width as f64 / scale - panel_w, wy);
+    match panel {
+        Err(error) => log::warn!("positioning: outer_size error: {error}"),
+        Ok(panel) => {
+            if let Some(placement) = panel::place_panel(anchor, &layouts, panel) {
+                let mon = &layouts[placement.monitor];
+                let (wx, wy, ww, wh) = mon.work;
+                let (panel_w, panel_h) = panel;
+                let (x, y) = placement.position;
+                let (lx, ly) = placement.anchor;
+                log::debug!(
+                    "positioning: anchor logical=({lx:.1},{ly:.1}) monitor={} scale={:.1} \
+                     work=({wx:.1},{wy:.1},{ww:.1},{wh:.1}) panel={panel_w:.1}x{panel_h:.1} \
+                     -> set_position logical=({x:.1},{y:.1})",
+                    mon.name,
+                    mon.scale
+                );
                 if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
                     log::warn!("set_position failed: {error}");
                 }
+            } else {
+                // Never seen on a real desk; degrade to the primary screen's
+                // top-right corner instead of leaving the panel at its
+                // creation-default mid-screen position.
+                log::warn!(
+                    "positioning: NO monitor matched the anchor — primary top-right fallback"
+                );
+                if let Some(primary) = app.primary_monitor().ok().flatten() {
+                    let (x, y) =
+                        panel::fallback_position(panel::monitor_layout(&primary).work, panel.0);
+                    if let Err(error) = window.set_position(LogicalPosition::new(x, y)) {
+                        log::warn!("set_position failed: {error}");
+                    }
+                }
             }
         }
-        (_, Err(error)) => log::warn!("positioning: outer_size error: {error}"),
     }
 
     let _ = window.show();
@@ -892,9 +860,33 @@ fn toggle_panel(app: &AppHandle, anchor: Option<(f64, f64)>) {
     );
 }
 
+/// The one subscriber of the controller's watch channel: every state
+/// change goes to the tray first, then to the frontend — the same
+/// relative order the old direct emit produced (the Rust tray listener
+/// ran synchronously before the JS listener could see the event). The
+/// frontend renders absolutely (from the state, never from a diff), so
+/// the extra hop only relaxes vpn-state's ordering against unrelated
+/// events (vpn-log-cleared, a command's rejection), which nothing
+/// depends on; watch coalescing may likewise drop transient intermediates
+/// between two reads.
+fn spawn_state_publisher(app: AppHandle, controller: Arc<VpnController>) {
+    // Subscribe BEFORE spawning: `subscribe` marks the current value seen
+    // (the setup seed is not re-published), and no change between this
+    // line and the task's first `changed().await` can be missed — watch
+    // keeps the latest value for whoever reads next.
+    let mut receiver = controller.subscribe();
+    tauri::async_runtime::spawn(async move {
+        while receiver.changed().await.is_ok() {
+            let state = receiver.borrow_and_update().clone();
+            sync_tray_with_state(&app, &state);
+            let _ = app.emit("vpn-state", &state);
+        }
+    });
+}
+
 fn sync_tray_with_state(app: &AppHandle, state: &VpnState) {
-    // State events are emitted from the status poller's worker task, but
-    // tauri's TrayIcon hops to the main thread itself (run_item_main_thread).
+    // Called from setup and the state publisher's task; tauri's TrayIcon
+    // hops to the main thread itself (run_item_main_thread).
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let connected = state.phase == Phase::Connected;
         let tooltip = match state.phase {
@@ -960,6 +952,179 @@ fn show_tray_menu(app: &AppHandle) {
     }
 }
 
+/// Build the tray icon and its (never-attached) right-click menu, and
+/// install the menu handles in [`TRAY_MENU`] for `show_tray_menu`.
+///
+/// The tray goes through tauri's own API, NOT a raw tray-icon one: tauri
+/// claims the global TrayIconEvent handler (an OnceLock: first setter
+/// wins, `build()` runs before `setup`) and drops events for trays it
+/// does not manage, so a raw tray never sees a single click here.
+/// Through tauri's builder the clicks flow to `on_tray_icon_event`.
+///
+/// NO menu is ATTACHED on purpose: on this macOS beta the status-item
+/// button opens a natively attached menu itself on left click and the
+/// click never reaches our event handler (only enter/leave/move/right
+/// events arrive — see the debug log). The right-click menu lives in
+/// [`TRAY_MENU`] and is popped up BY HAND instead: nothing for the
+/// button to open, so clicks flow to us and the panel keeps taking over.
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let _tray = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(OPEN_ICON.clone())
+        .icon_as_template(true)
+        .tooltip("GP Bar")
+        .on_tray_icon_event(on_tray_icon_event)
+        .build(app)?;
+
+    // The right-click tray menu: built once here, popped up by hand in
+    // the tray handler (never attached — see above). Connect mirrors the
+    // panel's action button exactly: the selected portal and the
+    // cookie-reuse setting from config, plus the panel's explicit
+    // gateway pick (`selected_gateway`) — do_connect itself resolves the
+    // fallback chain (preferred, then gpclient auto-gateway). Reconnect
+    // replaces a plain Disconnect while the panel's amber button would
+    // show (a Connected gateway switch, the backend-owned
+    // `reconnect_armed` in VpnState); enablement lives in
+    // `sync_tray_menu`.
+    let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
+    let reconnect_item = MenuItem::with_id(app, "reconnect", "Reconnect", false, None::<&str>)?;
+    let disconnect_item = MenuItem::with_id(app, "disconnect", "Disconnect", false, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit GP Bar", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(
+        app,
+        &[&connect_item, &reconnect_item, &disconnect_item, &quit_item],
+    )?;
+    if TRAY_MENU
+        .set(TrayMenuHandles {
+            menu: tray_menu,
+            connect: connect_item,
+            reconnect: reconnect_item,
+            disconnect: disconnect_item,
+        })
+        .is_err()
+    {
+        log::warn!("tray menu: TRAY_MENU already set — built twice?");
+    }
+    Ok(())
+}
+
+/// Tray clicks: right opens the hand-popped menu, left toggles the panel
+/// anchored under the click (or the icon rect, when they agree).
+fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: TrayIconEvent) {
+    // Right click opens the tray menu (TRAY_MENU, popped up by hand —
+    // never attached, see `build_tray`). tray-icon delivers
+    // Click{Right, Down} from rightMouseDown whether or not a menu is
+    // attached, so this works on the beta as well.
+    if let TrayIconEvent::Click {
+        button: MouseButton::Right,
+        button_state: MouseButtonState::Down,
+        ..
+    } = event
+    {
+        show_tray_menu(tray.app_handle());
+    }
+    // Left click toggles the panel. React on mouse-DOWN: it arrives
+    // within milliseconds of the focus-loss hide, keeping the race guard
+    // in toggle_panel reliable.
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Down,
+        position,
+        rect,
+        ..
+    } = event
+    {
+        let (px, py) = (position.x, position.y);
+        let (rx, ry) = match rect.position {
+            tauri::Position::Physical(p) => (f64::from(p.x), f64::from(p.y)),
+            tauri::Position::Logical(l) => (l.x, l.y),
+        };
+        let (rw, rh) = match rect.size {
+            tauri::Size::Physical(s) => (f64::from(s.width), f64::from(s.height)),
+            tauri::Size::Logical(s) => (s.width, s.height),
+        };
+        // The click is the robust anchor (evidence: GP Connect anchors
+        // its popover on the cursor too): it always lives in the
+        // coordinates of the display the user is actually looking at.
+        // Trust the icon rect only when the click falls inside it — some
+        // macOS builds report the status-item rect in a different space,
+        // and a bad rect would drag the panel onto the wrong screen.
+        let rect_valid =
+            (px >= rx - 2.0 && px <= rx + rw + 2.0) && (py >= ry - 2.0 && py <= ry + rh + 2.0);
+        let anchor = if rect_valid {
+            // Centered on the icon, right under it.
+            (rx + rw / 2.0, ry + rh)
+        } else {
+            (px, py)
+        };
+        // Tray payload diagnostics: the tray-icon crate's coordinate
+        // space is the recurring suspect (see the module doc in
+        // panel.rs).
+        log::debug!(
+            "tray click: position=({px:.1},{py:.1}) rect=({rx:.1},{ry:.1} \
+             {rw:.1}x{rh:.1}) valid={rect_valid} anchor=({:.1},{:.1})",
+            anchor.0,
+            anchor.1
+        );
+        toggle_panel(
+            tray.app_handle(),
+            Some(panel::Anchor::TrayPayload(anchor.0, anchor.1)),
+        );
+    }
+}
+
+/// The tray menu actions. Same contracts as the panel's buttons, run on
+/// the async runtime like the commands; the connect target is read from
+/// the config under its own lock, dropped before the spawned work.
+fn on_menu_event(app: &AppHandle, id: &str) {
+    match id {
+        "connect" => {
+            // Same contract as the panel's Connect button: selected portal,
+            // configured cookie reuse, and the panel's explicit gateway
+            // pick (`selected_gateway`) — None only means Automatic when
+            // the user never picked one.
+            let state = app.state::<AppContext>();
+            let (portal, reuse_cookie, gateway) = {
+                let cfg = state.config.lock().unwrap();
+                connect_target_from_config(&cfg)
+                // Guard dropped before the async work.
+            };
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppContext>();
+                if let Err(error) =
+                    do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
+                {
+                    log::warn!("tray menu connect failed: {error}");
+                }
+            });
+        }
+        "reconnect" => {
+            // The armed gateway switch: the same chain as the panel's
+            // amber Reconnect button, now backend-owned — do_reconnect
+            // reads the target from the config, tears the tunnel down,
+            // waits out the Disconnecting observation and connects
+            // through it. Its warnings carry the "tray reconnect"
+            // prefix, byte-identical to the old inline chain.
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppContext>();
+                let _ = do_reconnect(app.clone(), &state, "tray reconnect").await;
+            });
+        }
+        "disconnect" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppContext>();
+                if let Err(error) = do_disconnect(app.clone(), &state).await {
+                    log::warn!("tray menu disconnect failed: {error}");
+                }
+            });
+        }
+        "quit" => app.exit(0),
+        _ => {}
+    }
+}
+
 // -- entry ------------------------------------------------------------------------
 
 // -- logging ---------------------------------------------------------------------
@@ -997,6 +1162,7 @@ fn log_targets() -> Vec<tauri_plugin_log::Target> {
 
 fn main() {
     let controller = VpnController::new();
+    let publisher_controller = controller.clone();
     let poller_controller = controller.clone();
     let tailer_controller = controller.clone();
 
@@ -1083,142 +1249,29 @@ fn main() {
             // outside-started tunnel as Connected at any moment — before
             // any gateway command has re-noted it.
             let cfg = app.state::<AppContext>().config.lock().unwrap().clone();
-            controller.note_selected_portal(app.handle(), cfg.selected.clone());
-            sync_reconnect_target(app.handle(), &controller, &cfg);
+            controller.note_selected_portal(cfg.selected.clone());
+            sync_reconnect_target(&controller, &cfg);
 
-            // Tray through tauri's own API, NOT a raw tray-icon one: tauri claims
-            // the global TrayIconEvent handler (an OnceLock: first setter wins,
-            // `build()` runs before `setup`) and drops events for trays it does
-            // not manage, so a raw tray never sees a single click here. Through
-            // tauri's builder the clicks flow through on_tray_icon_event instead.
-            //
-            // NO menu is ATTACHED on purpose: on this macOS beta the status-item
-            // button opens a natively attached menu itself on left click and the
-            // click never reaches our event handler (only enter/leave/move/right
-            // events arrive — see the debug log). The right-click menu lives in
-            // TRAY_MENU (built below) and is popped up BY HAND instead: nothing
-            // for the button to open, so clicks flow to us and the panel keeps
-            // taking over.
-            let _tray = TrayIconBuilder::with_id(TRAY_ID)
-                .icon(OPEN_ICON.clone())
-                .icon_as_template(true)
-                .tooltip("GP Bar")
-                .on_tray_icon_event(|tray, event| {
-                    // Right click opens the tray menu (TRAY_MENU, popped up by
-                    // hand — never attached, see above). tray-icon delivers
-                    // Click{Right, Down} from rightMouseDown whether or not a
-                    // menu is attached, so this works on the beta as well.
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Right,
-                        button_state: MouseButtonState::Down,
-                        ..
-                    } = event
-                    {
-                        show_tray_menu(tray.app_handle());
-                    }
-                    // Left click toggles the panel. React on mouse-DOWN: it
-                    // arrives within milliseconds of the focus-loss hide,
-                    // keeping the race guard in toggle_panel reliable.
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Down,
-                        position,
-                        rect,
-                        ..
-                    } = event
-                    {
-                        let (px, py) = (position.x, position.y);
-                        let (rx, ry) = match rect.position {
-                            tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
-                            tauri::Position::Logical(l) => (l.x, l.y),
-                        };
-                        let (rw, rh) = match rect.size {
-                            tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
-                            tauri::Size::Logical(s) => (s.width, s.height),
-                        };
-                        // The click is the robust anchor (evidence: GP Connect
-                        // anchors its popover on the cursor too): it always
-                        // lives in the coordinates of the display the user is
-                        // actually looking at. Trust the icon rect only when
-                        // the click falls inside it — some macOS builds report
-                        // the status-item rect in a different space, and a bad
-                        // rect would drag the panel onto the wrong screen.
-                        let rect_valid = (px >= rx - 2.0 && px <= rx + rw + 2.0)
-                            && (py >= ry - 2.0 && py <= ry + rh + 2.0);
-                        let anchor = if rect_valid {
-                            // Centered on the icon, right under it.
-                            (rx + rw / 2.0, ry + rh)
-                        } else {
-                            (px, py)
-                        };
-                        // Tray payload diagnostics: the tray-icon crate's
-                        // coordinate space is the recurring suspect (see
-                        // the positioning comments in toggle_panel).
-                        log::debug!(
-                            "tray click: position=({px:.1},{py:.1}) rect=({rx:.1},{ry:.1} \
-                             {rw:.1}x{rh:.1}) valid={rect_valid} anchor=({:.1},{:.1})",
-                            anchor.0,
-                            anchor.1
-                        );
-                        toggle_panel(tray.app_handle(), Some(anchor));
-                    }
-                })
-                .build(app)?;
-
-            // The right-click tray menu: built once here, popped up by hand in
-            // the tray handler (never attached — see above). Connect mirrors the
-            // panel's action button exactly: the selected portal and the
-            // cookie-reuse setting from config, plus the panel's explicit
-            // gateway pick (`selected_gateway`) — do_connect itself resolves
-            // the fallback chain (preferred, then gpclient auto-gateway).
-            // Reconnect replaces a plain Disconnect while the panel's amber
-            // button would show (a Connected gateway switch, the
-            // backend-owned `reconnect_armed` in VpnState); enablement lives
-            // in `sync_tray_menu`.
-            let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
-            let reconnect_item =
-                MenuItem::with_id(app, "reconnect", "Reconnect", false, None::<&str>)?;
-            let disconnect_item =
-                MenuItem::with_id(app, "disconnect", "Disconnect", false, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit GP Bar", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(
-                app,
-                &[&connect_item, &reconnect_item, &disconnect_item, &quit_item],
-            )?;
-            if TRAY_MENU
-                .set(TrayMenuHandles {
-                    menu: tray_menu,
-                    connect: connect_item,
-                    reconnect: reconnect_item,
-                    disconnect: disconnect_item,
-                })
-                .is_err()
-            {
-                log::warn!("tray menu: TRAY_MENU already set — built twice?");
-            }
-            // Match the items to the current phase before any vpn-state event
-            // fires. Safe lock: setup runs on the main thread and the status
-            // poller has not started yet.
+            // Tray, its click handler and its right-click menu (the WHY of
+            // the never-attached design lives on `build_tray`).
+            build_tray(app.handle())?;
+            // Match the items to the current phase before any state change
+            // can fire. Safe lock: setup runs on the main thread and the
+            // status poller has not started yet.
             sync_tray_with_state(app.handle(), &controller.snapshot());
 
-            vpn::spawn_status_poller(app.handle().clone(), poller_controller);
+            // The publisher is spawned AFTER the seeding above (its
+            // `subscribe` marks the current value seen, so the seed is not
+            // re-published) and BEFORE the poller (no transition can then
+            // race past a missing subscriber).
+            spawn_state_publisher(app.handle().clone(), publisher_controller);
+            vpn::spawn_status_poller(poller_controller);
             vpn::spawn_log_tailer(app.handle().clone(), tailer_controller);
 
-            // Reflect state transitions onto the tray icon and tooltip. Read the
-            // phase from the event payload instead of calling `snapshot()`:
-            // listeners run synchronously on the emitting thread, and re-locking
-            // the controller here deadlocked the poller (see vpn::update).
-            let icon_handle = app.handle().clone();
-            app.listen_any("vpn-state", move |event| {
-                if let Ok(state) = serde_json::from_str::<VpnState>(event.payload()) {
-                    sync_tray_with_state(&icon_handle, &state);
-                }
-            });
-
             // Defense-in-depth for the menu enablement: the armed flag now
-            // travels in vpn-state (noted on every gateway save, see
-            // `sync_reconnect_target`), so the vpn-state listener above is
-            // the primary sync path — this one re-syncs the menu on every
+            // travels in the published state (noted on every gateway save,
+            // see `sync_reconnect_target`), so the state publisher is the
+            // primary sync path — this one re-syncs the menu on every
             // config-updated in case a future config path ever misses the
             // re-note. Safe snapshot: the config lock is always dropped
             // before that event is emitted (see `broadcast_config` and
@@ -1230,53 +1283,7 @@ fn main() {
 
             Ok(())
         })
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "connect" => {
-                // Same contract as the panel's Connect button: selected portal,
-                // configured cookie reuse, and the panel's explicit gateway
-                // pick (`selected_gateway`) — None only means Automatic when
-                // the user never picked one.
-                let state = app.state::<AppContext>();
-                let (portal, reuse_cookie, gateway) = {
-                    let cfg = state.config.lock().unwrap();
-                    connect_target_from_config(&cfg)
-                    // Guard dropped before the async work.
-                };
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<AppContext>();
-                    if let Err(error) =
-                        do_connect(app.clone(), &state, &portal, reuse_cookie, gateway).await
-                    {
-                        log::warn!("tray menu connect failed: {error}");
-                    }
-                });
-            }
-            "reconnect" => {
-                // The armed gateway switch: the same chain as the panel's
-                // amber Reconnect button, now backend-owned — do_reconnect
-                // reads the target from the config, tears the tunnel down,
-                // waits out the Disconnecting observation and connects
-                // through it. Its warnings carry the "tray reconnect"
-                // prefix, byte-identical to the old inline chain.
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<AppContext>();
-                    let _ = do_reconnect(app.clone(), &state, "tray reconnect").await;
-                });
-            }
-            "disconnect" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<AppContext>();
-                    if let Err(error) = do_disconnect(app.clone(), &state).await {
-                        log::warn!("tray menu disconnect failed: {error}");
-                    }
-                });
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        })
+        .on_menu_event(|app, event| on_menu_event(app, event.id().as_ref()))
         .invoke_handler(tauri::generate_handler![
             get_state,
             get_panel_effect,
