@@ -736,11 +736,59 @@ async fn worker_has_active_pid(label: &str) -> Option<bool> {
     )
 }
 
+/// Pure half of the tailer's startup decision: where to begin reading the
+/// connect log. 0 (re-read from the start) only when the bytes on disk
+/// belong to a live session — the phase says a connect is in flight or the
+/// tunnel is up, or the lock file names a running gpclient (the app
+/// restarted while the worker held the tunnel: the poller's adoption lags
+/// this probe by a tick). Otherwise EOF: the root-owned log survives
+/// reboots, and replaying a PREVIOUS session's log at startup would
+/// observe its gateway and save its data as if it were live (N8).
+/// (`log_len` 0 degenerates to 0 either way — an empty log has no lines
+/// to mis-teach, and the next writer truncates before writing.)
+fn initial_tail_offset(phase: Phase, live_worker: bool, log_len: u64) -> u64 {
+    if matches!(phase, Phase::Connecting | Phase::Connected) || live_worker {
+        0
+    } else {
+        log_len
+    }
+}
+
+/// Pure half of the tailer's teaching gate: a gateway mention may teach —
+/// observe into the state, learn the host pair, harvest the name — only
+/// while a connect attempt is in flight or the tunnel is up. `emit_log_line`
+/// ORs it with the tailer's sticky live-session flag: the phase alone
+/// would drop the first lines of an adopted tunnel or a shrink-rewind
+/// (the state lags the log by a tick), the flag alone is the startup
+/// verdict frozen for the session.
+fn gateway_teaching_allowed(phase: Phase) -> bool {
+    matches!(phase, Phase::Connecting | Phase::Connected)
+}
+
 /// Tail the connect log file and stream parsed JSON records to the frontend.
 pub fn spawn_log_tailer(app: AppHandle, controller: Arc<VpnController>) {
     tauri::async_runtime::spawn(async move {
         let path = Config::connect_log_path();
-        let mut offset: u64 = 0;
+        // N8: begin at EOF unless the log on disk belongs to a live
+        // session. The root-owned log survives reboots, and replaying the
+        // previous session's log at startup taught its stale gateway into
+        // the state and the config. The lock probe — not the poller's
+        // adoption — decides the live-worker case: this task may run
+        // before the poller's first observation.
+        let log_len = tokio::fs::metadata(&path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let live_worker = read_lock_observation().is_some();
+        let mut offset = initial_tail_offset(controller.snapshot().phase, live_worker, log_len);
+        // Sticky, never reset: the bytes from offset 0 are a live session's
+        // (see `initial_tail_offset`), and a shrink re-arms it — the wrapper
+        // truncates before every start, so bytes that appear after a shrink
+        // are a fresh attempt's. Between attempts the log only grows while
+        // a worker writes it; the only lines taught without a live attempt
+        // are a dying attempt's own trailing ones, which carry that
+        // attempt's (correct) gateway.
+        let mut attempt_live = offset == 0;
         // BYTE buffer, never a String: a multibyte UTF-8 character split
         // across two reads must not become two U+FFFD. Only complete
         // lines are decoded, inside `drain_complete_lines`.
@@ -752,9 +800,12 @@ pub fn spawn_log_tailer(app: AppHandle, controller: Arc<VpnController>) {
                 if meta.len() < offset {
                     offset = 0;
                     buffer.clear();
+                    attempt_live = true;
                 }
                 if meta.len() > offset {
-                    offset = tail_chunk(&path, offset, &mut buffer, &app, &controller).await;
+                    offset =
+                        tail_chunk(&path, offset, &mut buffer, &app, &controller, attempt_live)
+                            .await;
                 }
             }
             tokio::time::sleep(TAIL_INTERVAL).await;
@@ -788,13 +839,15 @@ fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<String> {
 }
 
 /// Read everything past `offset` that forms complete lines, emit them, and
-/// return the new offset.
+/// return the new offset. `attempt_live` is the tailer's sticky live-session
+/// verdict, passed through to the teaching gate in `emit_log_line`.
 async fn tail_chunk(
     path: &Path,
     offset: u64,
     buffer: &mut Vec<u8>,
     app: &AppHandle,
     controller: &VpnController,
+    attempt_live: bool,
 ) -> u64 {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -813,7 +866,7 @@ async fn tail_chunk(
     buffer.extend_from_slice(&chunk);
 
     for line in drain_complete_lines(buffer) {
-        emit_log_line(app, controller, &line).await;
+        emit_log_line(app, controller, &line, attempt_live).await;
     }
     // Guard: never grow the buffer unboundedly if gpclient never prints a newline.
     if buffer.len() > 1 << 20 {
@@ -833,7 +886,12 @@ struct LogEvent {
     message: String,
 }
 
-async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
+async fn emit_log_line(
+    app: &AppHandle,
+    controller: &VpnController,
+    line: &str,
+    attempt_live: bool,
+) {
     let event = match serde_json::from_str::<serde_json::Value>(line) {
         Ok(value) => LogEvent {
             level: value
@@ -859,11 +917,18 @@ async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) 
         },
     };
 
+    // N8: teach only from a live attempt's log. `attempt_live` is the
+    // tailer's sticky verdict that these bytes belong to a session of
+    // THIS app (startup with a live worker, or a shrink-rewind); the
+    // phase check covers the rest. A replayed previous-session line
+    // still reaches the panel below — only the teaching is gated, never
+    // the display stream.
+    let teach = attempt_live || gateway_teaching_allowed(controller.snapshot().phase);
     // Extract the gateway from the connection log messages.
     match parse_gateway(&event.message) {
         // A selection line: learn the pair if present, then observe and
         // harvest the NAME (never the address — the picker stores names).
-        Some(GatewayMention::Selected { name, address }) => {
+        Some(GatewayMention::Selected { name, address }) if teach => {
             if let Some(address) = address {
                 learn_gateway_host(app, &address, &name).await;
             }
@@ -873,14 +938,14 @@ async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) 
         // A getconfig POST: the cached-cookie path emits only this. Translate
         // to the picker name via the config map; display the raw FQDN when
         // unknown, but harvest only a known NAME (never the FQDN).
-        Some(GatewayMention::Host(host)) => {
+        Some(GatewayMention::Host(host)) if teach => {
             let name = gateway_display_name(app, &host);
             controller.observe_gateway(Some(name.clone().unwrap_or(host)));
             if let Some(name) = name {
                 harvest_gateway(app, &name).await;
             }
         }
-        None => {}
+        _ => {}
     }
 
     let _ = app.emit("vpn-log", &event);
@@ -2007,6 +2072,38 @@ mod tests {
         let state = rx.borrow_and_update();
         assert_eq!(state.phase, Phase::Connected);
         assert_eq!(state.pid, Some(4242));
+    }
+
+    /// N8: the tailer starts at EOF unless the log on disk belongs to a
+    /// live session — the root-owned log survives reboots, and replaying
+    /// the previous session's log taught its stale gateway into the
+    /// state and the config.
+    #[test]
+    fn tailer_startup_offset_is_eof_only_without_a_live_attempt() {
+        // A previous session's log, tunnel down, no worker: skip it all.
+        for phase in [Phase::Disconnected, Phase::Error, Phase::Disconnecting] {
+            assert_eq!(initial_tail_offset(phase.clone(), false, 4096), 4096);
+        }
+        // A live session's log: re-read it from the start.
+        assert_eq!(initial_tail_offset(Phase::Connecting, false, 4096), 0);
+        assert_eq!(initial_tail_offset(Phase::Connected, false, 4096), 0);
+        // The adopted tunnel: the phase has not caught up yet, the lock
+        // probe has — the probe decides (the tailer may start before the
+        // poller's first observation).
+        assert_eq!(initial_tail_offset(Phase::Disconnected, true, 4096), 0);
+        // Degenerate: an empty log is EOF either way — no lines to
+        // mis-teach, and the next writer truncates before writing.
+        assert_eq!(initial_tail_offset(Phase::Disconnected, false, 0), 0);
+    }
+
+    /// N8: a gateway mention teaches only while an attempt is live.
+    #[test]
+    fn gateway_teaching_requires_a_live_attempt() {
+        assert!(gateway_teaching_allowed(Phase::Connecting));
+        assert!(gateway_teaching_allowed(Phase::Connected));
+        assert!(!gateway_teaching_allowed(Phase::Disconnected));
+        assert!(!gateway_teaching_allowed(Phase::Disconnecting));
+        assert!(!gateway_teaching_allowed(Phase::Error));
     }
 
     #[test]
