@@ -293,12 +293,12 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
             // session (e.g. started from a terminal, or the app restarted).
             inner.state.phase = Phase::Connected;
             inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-            inner.state.pid = Some(obs.pid);
+            inner.state.pid = Some(obs.pid.get());
         }
         (Some(obs), Phase::Connecting) => {
             inner.state.phase = Phase::Connected;
             inner.state.connected_since_epoch_secs = Some(obs.connected_since_epoch_secs);
-            inner.state.pid = Some(obs.pid);
+            inner.state.pid = Some(obs.pid.get());
         }
         (Some(_), Phase::Connected | Phase::Disconnecting) => {}
         (None, Phase::Connected | Phase::Disconnecting) => {
@@ -313,9 +313,49 @@ fn apply_lock(inner: &mut Inner, lock: Option<LockObservation>) {
     }
 }
 
+/// A PID as kill(2)/proc_pidpath may legally receive it: positive and
+/// within the i32 range, so never 0 (a process group) and never the
+/// wrap-around `kill(-1, 0)` ("every process") a plain `u32 as
+/// libc::pid_t` produces above `i32::MAX`. The invariant is the type:
+/// parsing is the single validation point, and `raw()` is the only
+/// `libc::pid_t` conversion in the crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pid(std::num::NonZeroI32);
+
+impl std::str::FromStr for Pid {
+    type Err = ();
+    /// Rejects 0, negatives, anything above `i32::MAX` and garbage: such
+    /// lock content counts as having no PID at all.
+    fn from_str(raw: &str) -> Result<Self, ()> {
+        let n: i32 = raw.trim().parse().map_err(|_| ())?;
+        std::num::NonZeroI32::new(n)
+            .filter(|n| n.get() > 0)
+            .map(Pid)
+            .ok_or(())
+    }
+}
+
+impl std::fmt::Display for Pid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.get().fmt(f)
+    }
+}
+
+impl Pid {
+    /// The `libc::pid_t` every probe (kill, proc_pidpath) receives.
+    fn raw(self) -> libc::pid_t {
+        self.0.get()
+    }
+
+    /// The wire payload: `VpnState.pid` is a plain JSON number.
+    fn get(self) -> u32 {
+        self.0.get().unsigned_abs()
+    }
+}
+
 /// What the PID lock file tells us right now.
 pub struct LockObservation {
-    pub pid: u32,
+    pub pid: Pid,
     /// Lock file mtime; when gpclient wrote it, i.e. when the tunnel went up.
     pub connected_since_epoch_secs: i64,
 }
@@ -347,27 +387,25 @@ pub fn read_lock_observation() -> Option<LockObservation> {
     })
 }
 
-/// PID from the lock file (`gpclient` writes its own `std::process::id()`).
-/// Parse into a u32 FIRST and bound it to the positive i32 range: a `u32`
-/// cast straight to `libc::pid_t` would wrap negative above `i32::MAX`, and
-/// `kill(-1, 0)` means "every process" — a phantom-alive lock.
-/// Empty or garbage content is treated like a missing PID.
-fn parse_lock_pid(raw: &str) -> Option<u32> {
-    let pid = raw.trim().parse::<u32>().ok()?;
-    (pid > 0 && pid <= i32::MAX as u32).then_some(pid)
+/// PID from the lock file (`gpclient` writes its own
+/// `std::process::id()`). Parsing IS the validation: `Pid` exists only
+/// for positive in-range values, so the probes can neither target a
+/// process group nor wrap into `kill(-1, 0)`, and no `as libc::pid_t`
+/// cast survives anywhere. Empty or garbage content is treated like a
+/// missing PID.
+fn parse_lock_pid(raw: &str) -> Option<Pid> {
+    raw.trim().parse::<Pid>().ok()
 }
 
 /// `kill(pid, 0)` sends no signal: it only probes existence, and needs no
 /// fork/exec (a `ps -p` probe would spawn a subprocess every poll tick).
 /// When the probe fails with EPERM the process exists but belongs to root —
-/// our worker.
-fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
+/// our worker. `Pid` is positive by construction, so this can never
+/// address a process group.
+fn process_alive(pid: Pid) -> bool {
     // SAFETY: kill(2) with signal 0 only performs the permission/existence
     // check; it never delivers a signal.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let ret = unsafe { libc::kill(pid.raw(), 0) };
     ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -380,14 +418,12 @@ fn process_alive(pid: u32) -> bool {
 /// the worker's binary name (setup-admin.sh copies gpclient to
 /// `$PREFIX/bin/gpclient`, so the name is stable regardless of install).
 #[cfg(target_os = "macos")]
-fn process_is_gpclient(pid: u32) -> bool {
+fn process_is_gpclient(pid: Pid) -> bool {
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: proc_pidpath writes at most `buffersize` bytes into `buffer`
     // and only reads the integer `pid`; both come from here.
-    unsafe extern "C" {
-        fn proc_pidpath(pid: libc::pid_t, buffer: *mut u8, buffersize: u32) -> i32;
-    }
-    let mut buffer = [0u8; 4096];
-    let len = unsafe { proc_pidpath(pid as libc::pid_t, buffer.as_mut_ptr(), buffer.len() as u32) };
+    let len =
+        unsafe { libc::proc_pidpath(pid.raw(), buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     if len <= 0 {
         // Dead PID, or not permitted: cannot confirm, do not trust.
         return false;
@@ -399,7 +435,7 @@ fn process_is_gpclient(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn process_is_gpclient(_pid: u32) -> bool {
+fn process_is_gpclient(_pid: Pid) -> bool {
     // No proc_pidpath off macOS: keep the kill(pid, 0) semantics only.
     true
 }
@@ -1085,7 +1121,7 @@ mod tests {
     #[test]
     fn apply_lock_transitions() {
         let obs = || LockObservation {
-            pid: 4242,
+            pid: Pid(std::num::NonZeroI32::new(4242).unwrap()),
             connected_since_epoch_secs: 1_700_000_000,
         };
         let inner_at = |phase: Phase| {
@@ -1287,10 +1323,13 @@ mod tests {
 
     #[test]
     fn parses_lock_pids_within_the_positive_i32_range() {
-        // Values above i32::MAX must not wrap negative through `as`
-        // (kill(-1, 0) = "every process" = phantom alive).
-        assert_eq!(parse_lock_pid("4242\n"), Some(4242));
-        assert_eq!(parse_lock_pid("  4242  "), Some(4242));
+        let pid = |n: i32| Pid(std::num::NonZeroI32::new(n).unwrap());
+        // Values above i32::MAX are rejected at parse — the bounds are
+        // the Pid type now, not a check callers must remember (a `u32`
+        // `as libc::pid_t` would wrap negative: kill(-1, 0) = "every
+        // process" = phantom alive).
+        assert_eq!(parse_lock_pid("4242\n"), Some(pid(4242)));
+        assert_eq!(parse_lock_pid("  4242  "), Some(pid(4242)));
         assert_eq!(parse_lock_pid("0"), None);
         assert_eq!(parse_lock_pid("2147483648"), None);
         assert_eq!(parse_lock_pid("4294967295"), None);
@@ -1299,6 +1338,35 @@ mod tests {
         assert_eq!(parse_lock_pid(""), None);
         assert_eq!(parse_lock_pid("not a pid"), None);
         assert_eq!(parse_lock_pid("-1"), None);
+    }
+
+    #[test]
+    fn pids_are_positive_i32s_by_construction() {
+        let pid = |n: i32| Pid(std::num::NonZeroI32::new(n).unwrap());
+        // The wire payload is the plain number, never a wrapped negative.
+        assert_eq!(pid(4242).get(), 4242);
+        assert_eq!(pid(4242).raw(), 4242);
+        // Display keeps the stale-lock warning's "PID 4242" shape.
+        assert_eq!(pid(4242).to_string(), "4242");
+        assert_eq!(pid(1).to_string(), "1");
+        // FromStr rejects everything outside the positive i32 range.
+        assert!("1".parse::<Pid>().is_ok());
+        assert!("2147483647".parse::<Pid>().is_ok());
+        for bad in [
+            "0",
+            "-1",
+            "-2147483648",
+            "2147483648",
+            "",
+            "  ",
+            "x",
+            "42x",
+            "1.5",
+        ] {
+            assert!(bad.parse::<Pid>().is_err(), "{bad:?} must not be a Pid");
+        }
+        // The same trim the lock parse relies on.
+        assert_eq!(" 42\n".parse::<Pid>().ok(), Some(pid(42)));
     }
 
     #[test]
