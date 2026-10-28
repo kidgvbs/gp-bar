@@ -410,7 +410,9 @@ repair)
   # Wi-Fi must never be applied to Ethernet (or vice versa) after a switch.
   snap_svc=$(snapshot_svc)
   if [ "$snap_svc" != "$svc" ]; then
-    die "the pre-VPN snapshot was taken on '$snap_svc', but the active service is '$svc' — restoring it here would write another service's DNS. Re-connect and disconnect the VPN on '$svc' via GP Bar to record a fresh snapshot, or set the DNS by hand: networksetup -getdnsservers '$snap_svc' shows the recorded pre-VPN servers"
+    recorded=$(snapshot_dns)
+    recorded=${recorded% }
+    die "the pre-VPN snapshot was taken on '$snap_svc', but the active service is '$svc' — restoring it here would write another service's DNS. Re-connect and disconnect the VPN on '$svc' via GP Bar to record a fresh snapshot, or set the DNS by hand: the recorded pre-VPN servers for '$snap_svc' are '${recorded:-none}' ($SNAPSHOT)"
   fi
   restore_v4=$(snapshot_v4)
   restore_v6=$(snapshot_v6)
