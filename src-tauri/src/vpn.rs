@@ -1596,6 +1596,53 @@ mod tests {
     /// nothing, and a late subscriber still sees the latest state first.
     /// Uses only the sync receiver APIs (`has_changed`,
     /// `borrow_and_update`) — no async runtime in unit tests.
+    /// The async completions do not know which attempt they belong to yet:
+    /// this pair of tests pins the two races that fix introduces. They are
+    /// RED on purpose at this commit — the fencing (an attempt identity
+    /// carried by every completion) lands in the next one.
+    ///
+    /// Race (a): a completion arriving for a superseded or already-resolved
+    /// attempt must be a no-op. Today `connect_failed` applies to whatever
+    /// is current, so the poller's late blame overwrites a state the
+    /// machine has already moved past.
+    #[test]
+    fn a_late_connect_completion_must_not_overwrite_a_resolved_attempt() {
+        let controller = VpnController::new();
+        controller.try_begin_connect("vpn.example.com").unwrap();
+        // The tunnel came up (stale-lock adoption): the attempt RESOLVED as
+        // Connected...
+        controller.observe_lock(Some(LockObservation {
+            pid: Pid(std::num::NonZeroI32::new(4242).unwrap()),
+            connected_since_epoch_secs: 1_700_000_000,
+        }));
+        assert_eq!(controller.snapshot().phase, Phase::Connected);
+        // ...and THEN the poller's dead-worker blame for that same attempt
+        // arrives late (its `launchctl print` await resolved after the
+        // adoption tick). The blame belongs to an attempt that already
+        // succeeded: applying it must be impossible.
+        controller.connect_failed("The VPN worker exited before the tunnel came up".to_string());
+        assert_eq!(controller.snapshot().phase, Phase::Connected);
+    }
+
+    /// Race (b): a `worker_started` marker from a superseded attempt must
+    /// not arm the CURRENT attempt's poller gate. Today the marker is an
+    /// un-scoped bool, so attempt A's late start confirmation arms the
+    /// blame gate of attempt B.
+    #[test]
+    fn a_stale_worker_started_marker_must_not_arm_the_current_attempt() {
+        let controller = VpnController::new();
+        controller.try_begin_connect("vpn.example.com").unwrap();
+        // The attempt is canceled mid-flight...
+        controller.connect_failed("Connection canceled".to_string());
+        // ...a new attempt begins, and the FIRST attempt's `admin start`
+        // confirmation arrives late (the sudo command raced the cancel).
+        controller.try_begin_connect("vpn.example.com").unwrap();
+        controller.mark_worker_started();
+        // The late marker belongs to the dead attempt: it must not let the
+        // poller blame a job without a pid on the live one.
+        assert!(!controller.connecting_worker_started());
+    }
+
     #[test]
     fn state_changes_publish_over_the_watch_channel() {
         let controller = VpnController::new();
