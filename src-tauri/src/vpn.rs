@@ -161,7 +161,8 @@ impl VpnController {
             // runs no listener code on this thread (unlike the old direct
             // emit, whose synchronous listeners re-reading `snapshot()`
             // self-deadlocked the poller), but dropping every guard before
-            // any kind of notification stays the crate's uniform rule.
+            // any kind of notification stays the crate's uniform rule —
+            // see the lock-order doc on `AppContext` in main.rs.
         };
         self.publish(state.clone());
         state
@@ -812,7 +813,8 @@ async fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
     .await;
     match outcome {
         Ok(Some(Ok((true, cfg)))) => {
-            // Guard dropped BEFORE emitting (see `update`).
+            // Guard dropped BEFORE emitting (lock-order doc on
+            // `AppContext` in main.rs).
             let _ = app.emit("config-updated", &cfg);
         }
         Ok(Some(Ok((false, _)))) | Ok(None) => {}
@@ -866,7 +868,8 @@ async fn harvest_gateway(app: &AppHandle, gateway: &str) {
     .await;
     match outcome {
         Ok(Some(Ok((true, cfg)))) => {
-            // Guard dropped BEFORE emitting (see `update`).
+            // Guard dropped BEFORE emitting (lock-order doc on
+            // `AppContext` in main.rs).
             let _ = app.emit("config-updated", &cfg);
         }
         Ok(Some(Ok((false, _)))) | Ok(None) => {}

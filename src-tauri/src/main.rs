@@ -50,6 +50,32 @@ struct TrayMenuHandles {
     disconnect: MenuItem<Wry>,
 }
 
+/// Shared, lock-protected app state.
+///
+/// # Lock order
+///
+/// The crate has exactly three mutexes, and no code path holds two of
+/// them at once — every guard is leaf-scoped, which keeps the couplings
+/// below acyclic by construction:
+///
+/// 1. `config` — the persisted settings. Guard-scoped inside
+///    `update_config` (and the plain reads): taken, cloned/mutated,
+///    released; never held across an `.await` or an emit.
+/// 2. `controller.inner` (vpn.rs) — the VPN state machine. Guard-scoped
+///    inside `vpn::update` and the `try_begin_*` gates: the new state is
+///    computed under the guard, the guard is dropped, and only then is
+///    the state published on the watch channel.
+/// 3. `panel_hidden_at` — a pure leaf: taken and released inline by
+///    `toggle_panel` and the focus-loss handler, never nested with
+///    anything.
+///
+/// If a nesting ever becomes unavoidable, it may only be config →
+/// controller, never the reverse: `config-updated` is still emitted
+/// directly (`broadcast_config`, and the gateway harvest in vpn.rs) and
+/// its listener re-reads the controller (`snapshot`), so a config guard
+/// held across that emit needs exactly this direction to stay
+/// deadlock-free. The vpn-state path is structural — the publisher task
+/// owns the only subscriber, and nothing emits it under any guard.
 pub(crate) struct AppContext {
     controller: Arc<VpnController>,
     pub(crate) config: Mutex<Config>,
@@ -82,9 +108,10 @@ impl AppContext {
     /// result skips the disk write entirely.
     ///
     /// The config mutex is taken and released inside; anything that emits
-    /// (`broadcast_config`, `note_selected_portal`) may only run AFTER
-    /// this returns — the guard-dropped-before-emitting discipline, see
-    /// `vpn::update`.
+    /// (`broadcast_config`) or publishes (`note_selected_portal`,
+    /// `sync_reconnect_target`) may only run AFTER this returns — the
+    /// guard-before-notification discipline, see the lock-order doc on
+    /// `AppContext`.
     pub(crate) fn update_config<T>(
         &self,
         f: impl FnOnce(&mut Config) -> Result<T, String>,
@@ -204,7 +231,7 @@ async fn add_portal(
     })
     .await
     .map_err(|error| error.to_string())??;
-    // Emit outside the config lock — update_config has dropped it.
+    // Publish outside the config lock — update_config has dropped it.
     state.controller.note_selected_portal(cfg.selected.clone());
     Ok(())
 }
@@ -366,7 +393,7 @@ fn sync_reconnect_target(controller: &VpnController, cfg: &Config) {
 }
 
 fn broadcast_config(app: &AppHandle, cfg: &Config) {
-    // See vpn::update: emit outside the config lock.
+    // Emit outside the config lock (lock-order doc on `AppContext`).
     let _ = app.emit("config-updated", cfg);
 }
 
@@ -400,7 +427,7 @@ async fn select_gateway(
     })
     .await
     .map_err(|error| error.to_string())??;
-    // Guard dropped before emitting (deadlock discipline, see vpn::update).
+    // Guard dropped before emitting (lock-order doc on `AppContext`).
     broadcast_config(&app, &cfg);
     // The picker changed the resolution: re-note the target so the armed
     // flag (vpn-state → panel and tray) reflects the switch while Connected.
@@ -497,7 +524,7 @@ async fn add_gateway(
     })
     .await
     .map_err(|error| error.to_string())??;
-    // Guard dropped before emitting (deadlock discipline, see vpn::update).
+    // Guard dropped before emitting (lock-order doc on `AppContext`).
     broadcast_config(&app, &cfg);
     // Uniform with the other gateway commands: re-note the target (an add
     // cannot change the resolution, but one rule for one family of paths).
