@@ -675,22 +675,22 @@ fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
     let Some(ctx) = app.try_state::<crate::AppContext>() else {
         return;
     };
-    let (cfg, changed) = {
-        let mut cfg = ctx.config.lock().unwrap();
+    // update_config: mutate a clone, save, commit only on success — this
+    // used to mutate the live config before saving (see AppContext).
+    match ctx.update_config(|cfg| {
         if cfg.gateway_hosts.get(address).map(String::as_str) == Some(name) {
-            (cfg.clone(), false)
-        } else {
-            cfg.gateway_hosts
-                .insert(address.to_string(), name.to_string());
-            if let Err(error) = cfg.save() {
-                log::warn!("cannot save the gateway host map: {error}");
-            }
-            (cfg.clone(), true)
+            return Ok(false);
         }
-        // Guard dropped BEFORE emitting (see `update`).
-    };
-    if changed {
-        let _ = app.emit("config-updated", &cfg);
+        cfg.gateway_hosts
+            .insert(address.to_string(), name.to_string());
+        Ok(true)
+    }) {
+        Ok((true, cfg)) => {
+            // Guard dropped BEFORE emitting (see `update`).
+            let _ = app.emit("config-updated", &cfg);
+        }
+        Ok((false, _)) => {}
+        Err(error) => log::warn!("cannot save the gateway host map: {error}"),
     }
 }
 
@@ -717,20 +717,21 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
         log::warn!("skipping harvested gateway {gateway:?}: invalid name");
         return;
     }
-    let (cfg, changed) = {
-        let mut cfg = ctx.config.lock().unwrap();
-        let changed = !cfg.gateways.iter().any(|g| g == gateway);
-        if changed {
-            cfg.gateways.push(gateway.to_string());
-            if let Err(error) = cfg.save() {
-                log::warn!("cannot save the harvested gateway: {error}");
-            }
+    // update_config: mutate a clone, save, commit only on success (see
+    // AppContext) — the unchanged case skips the disk write too.
+    match ctx.update_config(|cfg| {
+        if cfg.gateways.iter().any(|g| g == gateway) {
+            return Ok(false);
         }
-        (cfg.clone(), changed)
-        // Guard dropped BEFORE emitting (see `update`).
-    };
-    if changed {
-        let _ = app.emit("config-updated", &cfg);
+        cfg.gateways.push(gateway.to_string());
+        Ok(true)
+    }) {
+        Ok((true, cfg)) => {
+            // Guard dropped BEFORE emitting (see `update`).
+            let _ = app.emit("config-updated", &cfg);
+        }
+        Ok((false, _)) => {}
+        Err(error) => log::warn!("cannot save the harvested gateway: {error}"),
     }
 }
 

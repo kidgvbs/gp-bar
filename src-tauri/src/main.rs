@@ -62,6 +62,32 @@ pub(crate) struct AppContext {
     panel_effect: PanelEffect,
 }
 
+impl AppContext {
+    /// The one way the config mutates: clone the live config, apply `f`,
+    /// save the clone, and commit it to the live copy only when the save
+    /// succeeded — a failed save must not leave memory diverged from
+    /// disk, and `f` bailing with Err must touch neither. An unchanged
+    /// result skips the disk write entirely.
+    ///
+    /// The config mutex is taken and released inside; anything that emits
+    /// (`broadcast_config`, `note_selected_portal`) may only run AFTER
+    /// this returns — the guard-dropped-before-emitting discipline, see
+    /// `vpn::update`.
+    pub(crate) fn update_config<T>(
+        &self,
+        f: impl FnOnce(&mut Config) -> Result<T, String>,
+    ) -> Result<(T, Config), String> {
+        let mut cfg = self.config.lock().unwrap();
+        let mut next = cfg.clone();
+        let out = f(&mut next)?;
+        if next != *cfg {
+            next.save()?;
+            *cfg = next;
+        }
+        Ok((out, cfg.clone()))
+    }
+}
+
 // -- commands -----------------------------------------------------------------
 
 #[tauri::command]
@@ -109,22 +135,19 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
                 .to_string(),
         );
     }
-    // Mutate a clone, save the clone, and commit to the live config only on
-    // success: a failed save must not leave memory diverged from disk.
-    let selected = {
-        let mut cfg = state.config.lock().unwrap();
-        let mut next = cfg.clone();
-        if !next.portals.contains(&portal) {
-            next.portals.push(portal.clone());
+    let (_, cfg) = state.update_config(|cfg| {
+        if !cfg.portals.contains(&portal) {
+            cfg.portals.push(portal.clone());
         }
-        if next.selected.is_none() {
-            next.selected = Some(portal);
+        if cfg.selected.is_none() {
+            cfg.selected = Some(portal);
         }
-        next.save()?;
-        *cfg = next;
-        cfg.selected.clone()
-    };
-    state.controller.note_selected_portal(&app, selected);
+        Ok(())
+    })?;
+    // Emit outside the config lock — update_config has dropped it.
+    state
+        .controller
+        .note_selected_portal(&app, cfg.selected.clone());
     Ok(())
 }
 
@@ -134,19 +157,16 @@ fn remove_portal(
     state: State<'_, AppContext>,
     portal: String,
 ) -> Result<(), String> {
-    let selected = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        next.portals.retain(|p| p != &portal);
-        if next.selected.as_deref() == Some(portal.as_str()) {
-            next.selected = next.portals.first().cloned();
+    let (_, cfg) = state.update_config(|cfg| {
+        cfg.portals.retain(|p| p != &portal);
+        if cfg.selected.as_deref() == Some(portal.as_str()) {
+            cfg.selected = cfg.portals.first().cloned();
         }
-        next.save()?;
-        *cfg = next;
-        cfg.selected.clone()
-    };
-    state.controller.note_selected_portal(&app, selected);
+        Ok(())
+    })?;
+    state
+        .controller
+        .note_selected_portal(&app, cfg.selected.clone());
     Ok(())
 }
 
@@ -156,31 +176,27 @@ fn select_portal(
     state: State<'_, AppContext>,
     portal: String,
 ) -> Result<(), String> {
-    let selected = {
-        let mut cfg = state.config.lock().unwrap();
+    let (_, cfg) = state.update_config(|cfg| {
         // An unknown portal must fail loud — not silently re-save and Ok.
         if !cfg.portals.contains(&portal) {
             return Err(format!("unknown portal: {portal}"));
         }
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        next.selected = Some(portal);
-        next.save()?;
-        *cfg = next;
-        cfg.selected.clone()
-    };
-    state.controller.note_selected_portal(&app, selected);
+        cfg.selected = Some(portal);
+        Ok(())
+    })?;
+    state
+        .controller
+        .note_selected_portal(&app, cfg.selected.clone());
     Ok(())
 }
 
 #[tauri::command]
 fn set_reuse_cookie(state: State<'_, AppContext>, value: bool) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    // Clone-save-commit (see add_portal): no divergence on save failure.
-    let mut next = cfg.clone();
-    next.reuse_cookie = value;
-    next.save()?;
-    *cfg = next;
+    // An unchanged value skips the disk write (see update_config).
+    state.update_config(|cfg| {
+        cfg.reuse_cookie = value;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -258,13 +274,10 @@ fn select_gateway(
     state: State<'_, AppContext>,
     gateway: Option<String>,
 ) -> Result<(), String> {
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
+    let (_, cfg) = state.update_config(|cfg| {
         match gateway.as_deref() {
             // null = "Auto": back to auto-gateway (preferred still applies).
-            None => next.selected_gateway = None,
+            None => cfg.selected_gateway = None,
             Some(name) => {
                 if !valid_name(name) {
                     return Err(
@@ -272,17 +285,15 @@ fn select_gateway(
                             .to_string(),
                     );
                 }
-                if !next.gateways.iter().any(|g| g == name) {
+                if !cfg.gateways.iter().any(|g| g == name) {
                     return Err("Unknown gateway".to_string());
                 }
-                next.selected_gateway = Some(name.to_string());
+                cfg.selected_gateway = Some(name.to_string());
             }
         }
-        next.save()?;
-        *cfg = next;
-        cfg.clone()
-        // Guard dropped before emitting (deadlock discipline, see vpn::update).
-    };
+        Ok(())
+    })?;
+    // Guard dropped before emitting (deadlock discipline, see vpn::update).
     broadcast_config(&app, &cfg);
     Ok(())
 }
@@ -293,26 +304,21 @@ fn set_preferred_gateway(
     state: State<'_, AppContext>,
     gateway: Option<String>,
 ) -> Result<(), String> {
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
+    let (_, cfg) = state.update_config(|cfg| {
         match gateway.as_deref() {
-            None => next.preferred_gateway = None,
+            None => cfg.preferred_gateway = None,
             Some(name) => {
                 if !valid_name(name) {
                     return Err("Invalid gateway name".to_string());
                 }
-                if !next.gateways.iter().any(|g| g == name) {
+                if !cfg.gateways.iter().any(|g| g == name) {
                     return Err("Unknown gateway".to_string());
                 }
-                next.preferred_gateway = Some(name.to_string());
+                cfg.preferred_gateway = Some(name.to_string());
             }
         }
-        next.save()?;
-        *cfg = next;
-        cfg.clone()
-    };
+        Ok(())
+    })?;
     broadcast_config(&app, &cfg);
     Ok(())
 }
@@ -323,21 +329,16 @@ fn remove_gateway(
     state: State<'_, AppContext>,
     name: String,
 ) -> Result<(), String> {
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        next.gateways.retain(|g| g != &name);
-        if next.preferred_gateway.as_deref() == Some(name.as_str()) {
-            next.preferred_gateway = None;
+    let (_, cfg) = state.update_config(|cfg| {
+        cfg.gateways.retain(|g| g != &name);
+        if cfg.preferred_gateway.as_deref() == Some(name.as_str()) {
+            cfg.preferred_gateway = None;
         }
-        if next.selected_gateway.as_deref() == Some(name.as_str()) {
-            next.selected_gateway = None;
+        if cfg.selected_gateway.as_deref() == Some(name.as_str()) {
+            cfg.selected_gateway = None;
         }
-        next.save()?;
-        *cfg = next;
-        cfg.clone()
-    };
+        Ok(())
+    })?;
     broadcast_config(&app, &cfg);
     Ok(())
 }
@@ -357,18 +358,13 @@ fn add_gateway(app: AppHandle, state: State<'_, AppContext>, name: String) -> Re
             "Gateway may only contain letters, digits, dots, dashes and underscores".to_string(),
         );
     }
-    let cfg = {
-        let mut cfg = state.config.lock().unwrap();
-        // Clone-save-commit (see add_portal): no divergence on save failure.
-        let mut next = cfg.clone();
-        if !next.gateways.iter().any(|g| g == &name) {
-            next.gateways.push(name.clone());
-            next.save()?;
+    let (_, cfg) = state.update_config(|cfg| {
+        if !cfg.gateways.iter().any(|g| g == &name) {
+            cfg.gateways.push(name.clone());
         }
-        *cfg = next;
-        cfg.clone()
-        // Guard dropped before emitting (deadlock discipline, see vpn::update).
-    };
+        Ok(())
+    })?;
+    // Guard dropped before emitting (deadlock discipline, see vpn::update).
     broadcast_config(&app, &cfg);
     Ok(())
 }
