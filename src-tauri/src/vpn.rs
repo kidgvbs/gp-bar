@@ -56,6 +56,11 @@ pub struct VpnState {
     pub gateway: Option<String>,
     pub connected_since_epoch_secs: Option<i64>,
     pub pid: Option<u32>,
+    /// While Connected: a fresh connect would go through a named gateway
+    /// other than the live one (a gateway switch waiting to happen). The
+    /// panel renders the amber Reconnect off it, the tray menu arms its
+    /// Reconnect item off it — backend-owned, so the two can never drift.
+    pub reconnect_armed: bool,
     pub last_error: Option<String>,
 }
 
@@ -67,6 +72,7 @@ impl Default for VpnState {
             gateway: None,
             connected_since_epoch_secs: None,
             pid: None,
+            reconnect_armed: false,
             last_error: None,
         }
     }
@@ -83,6 +89,13 @@ struct Inner {
     /// previous attempt's (stale, no pid) and would be reported as a false
     /// "worker exited" through the whole SSO login.
     worker_started: bool,
+    /// What a fresh connect would target right now (the resolved gateway:
+    /// explicit pick, else preferred — noted by `note_reconnect_target`
+    /// after every config change that touches the resolution, seeded once
+    /// at startup). `state.reconnect_armed` is derived from it on every
+    /// update (`apply_reconnect_armed`); the controller never reads the
+    /// config itself.
+    reconnect_target: Option<String>,
 }
 
 pub struct VpnController {
@@ -105,6 +118,10 @@ impl VpnController {
             let mut inner = self.inner.lock().unwrap();
             let before = inner.state.clone();
             mutate(&mut inner);
+            // The armed flag is derived state, never a second source of
+            // truth: recompute it after every mutation so every emitted
+            // state satisfies the formula (see `apply_reconnect_armed`).
+            apply_reconnect_armed(&mut inner);
             if inner.state == before {
                 // Nothing observable changed (e.g. a poll tick with the same
                 // phase): skip the event instead of waking every listener.
@@ -243,6 +260,33 @@ impl VpnController {
     pub fn note_selected_portal(&self, app: &AppHandle, portal: Option<String>) {
         self.update(app, |inner| apply_selected_portal(inner, portal));
     }
+
+    /// Record what a fresh connect would currently target (the resolved
+    /// gateway), so `reconnect_armed` stays truthful without the controller
+    /// ever reading the config: called after every config save that touches
+    /// the resolution (see `sync_reconnect_target` in main.rs) and seeded
+    /// once at startup. While Connected, a target differing from the live
+    /// gateway arms the flag in the very same update — the vpn-state event
+    /// carries it to the panel and the tray together.
+    pub fn note_reconnect_target(&self, app: &AppHandle, target: Option<String>) {
+        self.update(app, |inner| {
+            inner.reconnect_target = target;
+        });
+    }
+}
+
+/// Pure half of the armed flag: `reconnect_armed` is true exactly while
+/// Connected AND the fresh-connect target names a gateway other than the
+/// live one. `None` target = gpclient auto-gateway: nothing to switch to.
+/// A `None` live gateway (the tunnel came up before the log tailer parsed
+/// its name, or an outside-started worker never wrote our log) counts as a
+/// switch for any explicit target — same semantics the frontend condition
+/// this replaces had. Recomputed by `update` after every mutation.
+fn apply_reconnect_armed(inner: &mut Inner) {
+    let armed = inner.state.phase == Phase::Connected
+        && inner.reconnect_target.is_some()
+        && inner.reconnect_target != inner.state.gateway;
+    inner.state.reconnect_armed = armed;
 }
 
 /// Pure half of `VpnController::note_selected_portal`, so the state machine
@@ -267,6 +311,9 @@ fn enter_connecting(inner: &mut Inner, portal: &str) -> Result<(), Phase> {
     inner.state.connected_since_epoch_secs = None;
     // New attempt: its start is not confirmed yet (see `worker_started`).
     inner.worker_started = false;
+    // Leaving Connected clears the armed flag in the state this transition
+    // emits (it is Connected-only, see `apply_reconnect_armed`).
+    apply_reconnect_armed(inner);
     Ok(())
 }
 
@@ -276,6 +323,9 @@ fn enter_disconnecting(inner: &mut Inner) -> Result<(), Phase> {
     match inner.state.phase.clone() {
         Phase::Connected => {
             inner.state.phase = Phase::Disconnecting;
+            // The armed flag must not go stale through the Disconnecting
+            // window: clear it in the state this transition emits.
+            apply_reconnect_armed(inner);
             Ok(())
         }
         Phase::Disconnecting => Ok(()),
@@ -1256,6 +1306,64 @@ mod tests {
             inner.state.phase = phase.clone();
             assert_eq!(enter_disconnecting(&mut inner), Err(phase));
         }
+    }
+
+    /// The armed condition, moved here from main.rs's `tray_reconnect_armed`
+    /// with the flag itself: armed exactly when a fresh connect would go
+    /// through a named gateway other than the live tunnel's.
+    #[test]
+    fn reconnect_arms_only_on_a_real_gateway_switch() {
+        let g = |s: &str| Some(s.to_string());
+        let armed_at = |target: Option<String>, live: Option<String>| {
+            let mut inner = Inner::default();
+            inner.state.phase = Phase::Connected;
+            inner.state.gateway = live;
+            inner.reconnect_target = target;
+            apply_reconnect_armed(&mut inner);
+            inner.state.reconnect_armed
+        };
+        // Target equal to the live gateway: no switch.
+        assert!(!armed_at(g("gw-1"), g("gw-1")));
+        // Target differing from the live gateway: switch.
+        assert!(armed_at(g("gw-1"), g("gw-2")));
+        // No target (gpclient auto-gateway): nothing to switch to.
+        assert!(!armed_at(None, g("gw-1")));
+        assert!(!armed_at(None, None));
+        // Live gateway unknown (tunnel up before the tailer parsed its
+        // name): any explicit target counts as a switch.
+        assert!(armed_at(g("gw-1"), None));
+    }
+
+    /// The armed flag is a Connected-only affordance: every other phase
+    /// keeps it false, and the transitions leaving Connected clear it in
+    /// the state they emit instead of letting it go stale through the
+    /// Disconnecting window.
+    #[test]
+    fn reconnect_arms_only_while_connected() {
+        let g = |s: &str| Some(s.to_string());
+        for phase in [
+            Phase::Disconnected,
+            Phase::Connecting,
+            Phase::Disconnecting,
+            Phase::Error,
+        ] {
+            let mut inner = Inner::default();
+            inner.state.phase = phase;
+            inner.state.gateway = g("gw-2");
+            inner.reconnect_target = g("gw-1");
+            apply_reconnect_armed(&mut inner);
+            assert!(!inner.state.reconnect_armed);
+        }
+
+        // Armed while Connected, cleared by the teardown transition.
+        let mut inner = Inner::default();
+        inner.state.phase = Phase::Connected;
+        inner.state.gateway = g("gw-2");
+        inner.reconnect_target = g("gw-1");
+        apply_reconnect_armed(&mut inner);
+        assert!(inner.state.reconnect_armed);
+        enter_disconnecting(&mut inner).unwrap();
+        assert!(!inner.state.reconnect_armed);
     }
 
     #[test]
