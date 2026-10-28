@@ -122,6 +122,15 @@ impl AppContext {
 }
 
 // -- commands -----------------------------------------------------------------
+//
+// The mutating commands are `async` and run their whole `update_config`
+// in `tokio::task::spawn_blocking`: non-async commands execute on the
+// MAIN thread — the AppKit run loop — and every save fsyncs (tens of
+// milliseconds of UI freeze per portal/gateway click); async ones run
+// on tokio workers, where a blocking save silently stalls the runtime's
+// capacity. Either way the file I/O belongs on the blocking pool. The
+// config mutex is taken and released inside the closure, so the guard
+// never crosses an `.await`.
 
 #[tauri::command]
 fn get_state(state: State<'_, AppContext>) -> VpnState {
@@ -169,7 +178,11 @@ struct VersionInfo {
 }
 
 #[tauri::command]
-fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> Result<(), String> {
+async fn add_portal(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+    portal: String,
+) -> Result<(), String> {
     let portal = portal.trim().to_string();
     if !valid_name(&portal) {
         return Err(
@@ -177,15 +190,20 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
                 .to_string(),
         );
     }
-    let (_, cfg) = state.update_config(|cfg| {
-        if !cfg.portals.contains(&portal) {
-            cfg.portals.push(portal.clone());
-        }
-        if cfg.selected.is_none() {
-            cfg.selected = Some(portal);
-        }
-        Ok(())
-    })?;
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            if !cfg.portals.contains(&portal) {
+                cfg.portals.push(portal.clone());
+            }
+            if cfg.selected.is_none() {
+                cfg.selected = Some(portal);
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     // Emit outside the config lock — update_config has dropped it.
     state
         .controller
@@ -194,18 +212,23 @@ fn add_portal(app: AppHandle, state: State<'_, AppContext>, portal: String) -> R
 }
 
 #[tauri::command]
-fn remove_portal(
+async fn remove_portal(
     app: AppHandle,
     state: State<'_, AppContext>,
     portal: String,
 ) -> Result<(), String> {
-    let (_, cfg) = state.update_config(|cfg| {
-        cfg.portals.retain(|p| p != &portal);
-        if cfg.selected.as_deref() == Some(portal.as_str()) {
-            cfg.selected = cfg.portals.first().cloned();
-        }
-        Ok(())
-    })?;
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            cfg.portals.retain(|p| p != &portal);
+            if cfg.selected.as_deref() == Some(portal.as_str()) {
+                cfg.selected = cfg.portals.first().cloned();
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     state
         .controller
         .note_selected_portal(&app, cfg.selected.clone());
@@ -213,19 +236,24 @@ fn remove_portal(
 }
 
 #[tauri::command]
-fn select_portal(
+async fn select_portal(
     app: AppHandle,
     state: State<'_, AppContext>,
     portal: String,
 ) -> Result<(), String> {
-    let (_, cfg) = state.update_config(|cfg| {
-        // An unknown portal must fail loud — not silently re-save and Ok.
-        if !cfg.portals.contains(&portal) {
-            return Err(format!("unknown portal: {portal}"));
-        }
-        cfg.selected = Some(portal);
-        Ok(())
-    })?;
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            // An unknown portal must fail loud — not silently re-save and Ok.
+            if !cfg.portals.contains(&portal) {
+                return Err(format!("unknown portal: {portal}"));
+            }
+            cfg.selected = Some(portal);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     state
         .controller
         .note_selected_portal(&app, cfg.selected.clone());
@@ -233,12 +261,16 @@ fn select_portal(
 }
 
 #[tauri::command]
-fn set_reuse_cookie(state: State<'_, AppContext>, value: bool) -> Result<(), String> {
+async fn set_reuse_cookie(app: AppHandle, value: bool) -> Result<(), String> {
     // An unchanged value skips the disk write (see update_config).
-    state.update_config(|cfg| {
-        cfg.reuse_cookie = value;
-        Ok(())
-    })?;
+    tokio::task::spawn_blocking(move || {
+        app.state::<AppContext>().update_config(|cfg| {
+            cfg.reuse_cookie = value;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     Ok(())
 }
 
@@ -311,76 +343,79 @@ fn broadcast_config(app: &AppHandle, cfg: &Config) {
 }
 
 #[tauri::command]
-fn select_gateway(
-    app: AppHandle,
-    state: State<'_, AppContext>,
-    gateway: Option<String>,
-) -> Result<(), String> {
-    let (_, cfg) = state.update_config(|cfg| {
-        match gateway.as_deref() {
-            // null = "Auto": back to auto-gateway (preferred still applies).
-            None => cfg.selected_gateway = None,
-            Some(name) => {
-                if !valid_name(name) {
-                    return Err(
-                        "Gateway may only contain letters, digits, dots, dashes and underscores"
-                            .to_string(),
-                    );
+async fn select_gateway(app: AppHandle, gateway: Option<String>) -> Result<(), String> {
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            match gateway.as_deref() {
+                // null = "Auto": back to auto-gateway (preferred still applies).
+                None => cfg.selected_gateway = None,
+                Some(name) => {
+                    if !valid_name(name) {
+                        return Err(
+                            "Gateway may only contain letters, digits, dots, dashes and underscores"
+                                .to_string(),
+                        );
+                    }
+                    if !cfg.gateways.iter().any(|g| g == name) {
+                        return Err("Unknown gateway".to_string());
+                    }
+                    cfg.selected_gateway = Some(name.to_string());
                 }
-                if !cfg.gateways.iter().any(|g| g == name) {
-                    return Err("Unknown gateway".to_string());
-                }
-                cfg.selected_gateway = Some(name.to_string());
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     // Guard dropped before emitting (deadlock discipline, see vpn::update).
     broadcast_config(&app, &cfg);
     Ok(())
 }
 
 #[tauri::command]
-fn set_preferred_gateway(
-    app: AppHandle,
-    state: State<'_, AppContext>,
-    gateway: Option<String>,
-) -> Result<(), String> {
-    let (_, cfg) = state.update_config(|cfg| {
-        match gateway.as_deref() {
-            None => cfg.preferred_gateway = None,
-            Some(name) => {
-                if !valid_name(name) {
-                    return Err("Invalid gateway name".to_string());
+async fn set_preferred_gateway(app: AppHandle, gateway: Option<String>) -> Result<(), String> {
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            match gateway.as_deref() {
+                None => cfg.preferred_gateway = None,
+                Some(name) => {
+                    if !valid_name(name) {
+                        return Err("Invalid gateway name".to_string());
+                    }
+                    if !cfg.gateways.iter().any(|g| g == name) {
+                        return Err("Unknown gateway".to_string());
+                    }
+                    cfg.preferred_gateway = Some(name.to_string());
                 }
-                if !cfg.gateways.iter().any(|g| g == name) {
-                    return Err("Unknown gateway".to_string());
-                }
-                cfg.preferred_gateway = Some(name.to_string());
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
     Ok(())
 }
 
 #[tauri::command]
-fn remove_gateway(
-    app: AppHandle,
-    state: State<'_, AppContext>,
-    name: String,
-) -> Result<(), String> {
-    let (_, cfg) = state.update_config(|cfg| {
-        cfg.gateways.retain(|g| g != &name);
-        if cfg.preferred_gateway.as_deref() == Some(name.as_str()) {
-            cfg.preferred_gateway = None;
-        }
-        if cfg.selected_gateway.as_deref() == Some(name.as_str()) {
-            cfg.selected_gateway = None;
-        }
-        Ok(())
-    })?;
+async fn remove_gateway(app: AppHandle, name: String) -> Result<(), String> {
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            cfg.gateways.retain(|g| g != &name);
+            if cfg.preferred_gateway.as_deref() == Some(name.as_str()) {
+                cfg.preferred_gateway = None;
+            }
+            if cfg.selected_gateway.as_deref() == Some(name.as_str()) {
+                cfg.selected_gateway = None;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     broadcast_config(&app, &cfg);
     Ok(())
 }
@@ -393,19 +428,24 @@ fn remove_gateway(
 /// invalidations during connects — no gateway-list fetching, ever.
 /// Gateways are harvested from connect logs and added manually.
 #[tauri::command]
-fn add_gateway(app: AppHandle, state: State<'_, AppContext>, name: String) -> Result<(), String> {
+async fn add_gateway(app: AppHandle, name: String) -> Result<(), String> {
     let name = name.trim().to_string();
     if !valid_name(&name) {
         return Err(
             "Gateway may only contain letters, digits, dots, dashes and underscores".to_string(),
         );
     }
-    let (_, cfg) = state.update_config(|cfg| {
-        if !cfg.gateways.iter().any(|g| g == &name) {
-            cfg.gateways.push(name.clone());
-        }
-        Ok(())
-    })?;
+    let app_for_save = app.clone();
+    let (_, cfg) = tokio::task::spawn_blocking(move || {
+        app_for_save.state::<AppContext>().update_config(|cfg| {
+            if !cfg.gateways.iter().any(|g| g == &name) {
+                cfg.gateways.push(name.clone());
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     // Guard dropped before emitting (deadlock discipline, see vpn::update).
     broadcast_config(&app, &cfg);
     Ok(())

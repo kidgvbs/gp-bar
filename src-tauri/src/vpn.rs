@@ -589,7 +589,7 @@ async fn tail_chunk(
     buffer.extend_from_slice(&chunk);
 
     for line in drain_complete_lines(buffer) {
-        emit_log_line(app, controller, &line);
+        emit_log_line(app, controller, &line).await;
     }
     // Guard: never grow the buffer unboundedly if gpclient never prints a newline.
     if buffer.len() > 1 << 20 {
@@ -609,7 +609,7 @@ struct LogEvent {
     message: String,
 }
 
-fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
+async fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
     let event = match serde_json::from_str::<serde_json::Value>(line) {
         Ok(value) => LogEvent {
             level: value
@@ -641,10 +641,10 @@ fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
         // harvest the NAME (never the address — the picker stores names).
         Some(GatewayMention::Selected { name, address }) => {
             if let Some(address) = address {
-                learn_gateway_host(app, &address, &name);
+                learn_gateway_host(app, &address, &name).await;
             }
             controller.observe_gateway(app, Some(name.clone()));
-            harvest_gateway(app, &name);
+            harvest_gateway(app, &name).await;
         }
         // A getconfig POST: the cached-cookie path emits only this. Translate
         // to the picker name via the config map; display the raw FQDN when
@@ -653,7 +653,7 @@ fn emit_log_line(app: &AppHandle, controller: &VpnController, line: &str) {
             let name = gateway_display_name(app, &host);
             controller.observe_gateway(app, Some(name.clone().unwrap_or(host)));
             if let Some(name) = name {
-                harvest_gateway(app, &name);
+                harvest_gateway(app, &name).await;
             }
         }
         None => {}
@@ -706,27 +706,40 @@ fn parse_gateway(message: &str) -> Option<GatewayMention> {
 
 /// Remember a gateway FQDN → name pair in the config, so the cached-cookie
 /// re-auth path (which logs only the FQDN) can still display the name.
-fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
-    use tauri::Manager;
-    let Some(ctx) = app.try_state::<crate::AppContext>() else {
-        return;
-    };
-    // update_config: mutate a clone, save, commit only on success — this
-    // used to mutate the live config before saving (see AppContext).
-    match ctx.update_config(|cfg| {
-        if cfg.gateway_hosts.get(address).map(String::as_str) == Some(name) {
-            return Ok(false);
-        }
-        cfg.gateway_hosts
-            .insert(address.to_string(), name.to_string());
-        Ok(true)
-    }) {
-        Ok((true, cfg)) => {
+///
+/// Runs on the log tailer's async task, but the config save is blocking I/O
+/// behind a mutex: the whole `update_config` goes to the blocking pool
+/// (N13), and the emit happens back on the async side with every guard
+/// already dropped.
+async fn learn_gateway_host(app: &AppHandle, address: &str, name: &str) {
+    let app_for_save = app.clone();
+    let address = address.to_string();
+    let name = name.to_string();
+    // The Option layer is "no AppContext managed" (None); the inner Result
+    // is the save outcome.
+    let outcome = tokio::task::spawn_blocking(move || {
+        use tauri::Manager;
+        // No AppContext managed (?): None — the event was not ours to save.
+        let ctx = app_for_save.try_state::<crate::AppContext>()?;
+        // update_config: mutate a clone, save, commit only on success — this
+        // used to mutate the live config before saving (see AppContext).
+        Some(ctx.update_config(move |cfg| {
+            if cfg.gateway_hosts.get(&address).map(String::as_str) == Some(name.as_str()) {
+                return Ok(false);
+            }
+            cfg.gateway_hosts.insert(address, name);
+            Ok(true)
+        }))
+    })
+    .await;
+    match outcome {
+        Ok(Some(Ok((true, cfg)))) => {
             // Guard dropped BEFORE emitting (see `update`).
             let _ = app.emit("config-updated", &cfg);
         }
-        Ok((false, _)) => {}
-        Err(error) => log::warn!("cannot save the gateway host map: {error}"),
+        Ok(Some(Ok((false, _)))) | Ok(None) => {}
+        Ok(Some(Err(error))) => log::warn!("cannot save the gateway host map: {error}"),
+        Err(error) => log::warn!("gateway host map save task failed: {error}"),
     }
 }
 
@@ -741,11 +754,12 @@ fn gateway_display_name(app: &AppHandle, address: &str) -> Option<String> {
 /// A gateway name parsed from the live connect log: keep it in the config so
 /// the picker can offer it next time (`gpclient` lists gateways only while
 /// connecting; there is no query command).
-fn harvest_gateway(app: &AppHandle, gateway: &str) {
-    use tauri::Manager;
-    let Some(ctx) = app.try_state::<crate::AppContext>() else {
-        return;
-    };
+///
+/// Runs on the log tailer's async task, but the config save is blocking I/O
+/// behind a mutex: the whole `update_config` goes to the blocking pool
+/// (N13), and the emit happens back on the async side with every guard
+/// already dropped.
+async fn harvest_gateway(app: &AppHandle, gateway: &str) {
     // Same charset the wrapper and `select_gateway` enforce: a name
     // harvested straight from the log must not reach the picker if the
     // wrapper would refuse it (the picker would offer a dead entry).
@@ -753,21 +767,33 @@ fn harvest_gateway(app: &AppHandle, gateway: &str) {
         log::warn!("skipping harvested gateway {gateway:?}: invalid name");
         return;
     }
-    // update_config: mutate a clone, save, commit only on success (see
-    // AppContext) — the unchanged case skips the disk write too.
-    match ctx.update_config(|cfg| {
-        if cfg.gateways.iter().any(|g| g == gateway) {
-            return Ok(false);
-        }
-        cfg.gateways.push(gateway.to_string());
-        Ok(true)
-    }) {
-        Ok((true, cfg)) => {
+    let app_for_save = app.clone();
+    let gateway = gateway.to_string();
+    // The Option layer is "no AppContext managed" (None); the inner Result
+    // is the save outcome.
+    let outcome = tokio::task::spawn_blocking(move || {
+        use tauri::Manager;
+        // No AppContext managed (?): None — the event was not ours to save.
+        let ctx = app_for_save.try_state::<crate::AppContext>()?;
+        // update_config: mutate a clone, save, commit only on success (see
+        // AppContext) — the unchanged case skips the disk write too.
+        Some(ctx.update_config(move |cfg| {
+            if cfg.gateways.iter().any(|g| g == &gateway) {
+                return Ok(false);
+            }
+            cfg.gateways.push(gateway);
+            Ok(true)
+        }))
+    })
+    .await;
+    match outcome {
+        Ok(Some(Ok((true, cfg)))) => {
             // Guard dropped BEFORE emitting (see `update`).
             let _ = app.emit("config-updated", &cfg);
         }
-        Ok((false, _)) => {}
-        Err(error) => log::warn!("cannot save the harvested gateway: {error}"),
+        Ok(Some(Ok((false, _)))) | Ok(None) => {}
+        Ok(Some(Err(error))) => log::warn!("cannot save the harvested gateway: {error}"),
+        Err(error) => log::warn!("harvested gateway save task failed: {error}"),
     }
 }
 
