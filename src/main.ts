@@ -165,6 +165,51 @@ function clearCmdError() {
   cmdError.classList.add("hidden");
 }
 
+// -- typed command errors ---------------------------------------------------------
+// The backend's typed errors (vpn::AdminError, ActionError in main.rs)
+// reject the invoke promise as their SERIALIZED value `{kind, detail}` —
+// not an Error instance. Map them back to the exact strings the backend's
+// Display produces, so the panel texts stay byte-identical to the old
+// String-rejected errors (vpn::admin_error_texts_are_byte_identical).
+
+interface KindedError {
+  kind: string;
+  detail?: unknown;
+}
+
+function isKindedError(value: unknown): value is KindedError {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "kind" in value &&
+    typeof (value as { kind: unknown }).kind === "string"
+  );
+}
+
+function adminErrorText(error: KindedError): string {
+  const detail = (error.detail ?? {}) as Record<string, unknown>;
+  switch (error.kind) {
+    // AdminError::NotInstalled — the one-time setup hint.
+    case "NotInstalled":
+      return `The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '${detail.setup_script}'`;
+    case "Timeout":
+      return `admin op '${detail.op}' timed out`;
+    // AdminError::Failed: the wrapper's stderr verbatim.
+    default:
+      return String(detail.stderr);
+  }
+}
+
+function commandErrorText(error: unknown): string {
+  if (isKindedError(error)) {
+    if (error.kind === "Message") return String(error.detail);
+    if (error.kind === "Admin") return commandErrorText(error.detail);
+    // A bare AdminError reaches the panel too (repair_network).
+    return adminErrorText(error);
+  }
+  return String(error);
+}
+
 // -- config persistence ---------------------------------------------------------
 // get_config_read_error(): the startup config file could not be READ
 // (permissions, I/O). Saves are then no-ops for the whole session — the
@@ -308,7 +353,7 @@ function renderPortals(config: PortalsConfig) {
         await invoke("remove_portal", { portal: p });
         await refreshPortals();
       } catch (error) {
-        showCmdError(String(error));
+        showCmdError(commandErrorText(error));
         return;
       }
       syncWindowSize();
@@ -505,7 +550,7 @@ actionBtn.addEventListener("click", async () => {
       });
     }
   } catch (error) {
-    showCmdError(String(error));
+    showCmdError(commandErrorText(error));
   } finally {
     // Re-enable only after the state render that follows the invoke: if the
     // backend already emitted a vpn-state event it re-rendered with the
@@ -520,7 +565,7 @@ portalSelect.addEventListener("change", async () => {
   try {
     await invoke("select_portal", { portal: portalSelect.value });
   } catch (error) {
-    showCmdError(String(error));
+    showCmdError(commandErrorText(error));
   }
 });
 
@@ -531,7 +576,7 @@ gatewaySelect.addEventListener("change", async () => {
   try {
     await invoke("select_gateway", { gateway: gatewaySelect.value || null });
   } catch (error) {
-    showCmdError(String(error));
+    showCmdError(commandErrorText(error));
     return;
   }
   // While Connected, a pick that differs from the live tunnel arms the
@@ -553,7 +598,7 @@ gatewayPrefer.addEventListener("click", async () => {
       gateway: name === preferredGateway ? null : name,
     });
   } catch (error) {
-    showCmdError(String(error));
+    showCmdError(commandErrorText(error));
     return;
   }
   await refreshPortals();
@@ -577,7 +622,7 @@ gatewayRemove.addEventListener("click", async () => {
   try {
     await invoke("remove_gateway", { name });
   } catch (error) {
-    showCmdError(String(error));
+    showCmdError(commandErrorText(error));
     return;
   }
   await refreshPortals();
@@ -591,7 +636,7 @@ dnsRepair.addEventListener("click", async () => {
     const message = await invoke<string>("repair_network");
     showDnsResult(message || "DNS restored", false);
   } catch (error) {
-    showDnsResult(String(error), true);
+    showDnsResult(commandErrorText(error), true);
   } finally {
     dnsRepair.disabled = false;
     dnsRepair.textContent = "Restore";
@@ -604,7 +649,7 @@ cookieCache.addEventListener("change", async () => {
   try {
     await invoke("set_reuse_cookie", { value: cookieCache.checked });
   } catch (error) {
-    showCmdError(String(error));
+    showCmdError(commandErrorText(error));
   }
 });
 
@@ -624,7 +669,7 @@ portalAdd.addEventListener("click", async () => {
     await invoke("add_portal", { portal: value });
   } catch (error) {
     // e.g. "https://vpn.example.com": add_portal rejects ':' and '/'.
-    showCmdError(String(error));
+    showCmdError(commandErrorText(error));
     return;
   }
   portalInput.value = "";
@@ -645,10 +690,12 @@ gatewayAddBtn.addEventListener("click", async () => {
     await refreshPortals();
   } catch (error) {
     // Inline error: no native dialogs from the popover (they steal focus
-    // and the panel dismisses on Focused(false)).
-    gatewayInput.value = String(error);
+    // and the panel dismisses on Focused(false)). The mapped text is
+    // captured once — re-mapping later could resurrect a cleared field.
+    const text = commandErrorText(error);
+    gatewayInput.value = text;
     setTimeout(() => {
-      if (gatewayInput.value === String(error)) gatewayInput.value = "";
+      if (gatewayInput.value === text) gatewayInput.value = "";
     }, 3000);
   }
 });

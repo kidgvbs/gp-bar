@@ -19,6 +19,11 @@ dirs = "5"
 # Only kill(pid, 0) for worker liveness (no subprocess probes), no other
 # libc use. tauri already links libc transitively.
 libc = "0.2"
+# Typed command errors (vpn::AdminError and the wrapper enum around it):
+# Display texts are the user-facing strings, Serialize carries the
+# `{kind, detail}` wire shape to the frontend. Zero runtime dependencies
+# beyond std (only the proc-macro crate thiserror-impl at build time).
+thiserror = "2"
 # Logging: tauri-plugin-log installs itself as the global `log` logger and
 # owns the targets (stderr + the rotating ~/Library/Logs/gp-bar/panel.log),
 # so call sites use the `log` facade macros. Version-unified with the

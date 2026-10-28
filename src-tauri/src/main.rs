@@ -274,6 +274,22 @@ async fn set_reuse_cookie(app: AppHandle, value: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// A failed panel/tray action, typed the same way as [`vpn::AdminError`] so
+/// the frontend can tell the classes apart: `Message` is a plain refusal
+/// (the connect gates, an invalid gateway name), `Admin` wraps the
+/// privileged-helper failure with its own `{kind, detail}` shape inside.
+/// `Display` keeps the exact texts the old `Result<_, String>` carried —
+/// the tray menu's `{error}` log lines and the panel's error row stay
+/// byte-identical.
+#[derive(Debug, thiserror::Error, serde::Serialize)]
+#[serde(tag = "kind", content = "detail")]
+enum ActionError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    Admin(#[from] vpn::AdminError),
+}
+
 #[tauri::command]
 async fn connect(
     app: AppHandle,
@@ -281,12 +297,12 @@ async fn connect(
     portal: String,
     reuse_cookie: bool,
     gateway: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), ActionError> {
     do_connect(app, &state, &portal, reuse_cookie, gateway).await
 }
 
 #[tauri::command]
-async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
+async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), ActionError> {
     do_disconnect(app, &state).await
 }
 
@@ -296,7 +312,7 @@ async fn disconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), 
 /// panel's parameters — there is nothing to forward from the frontend:
 /// the armed flag and the target agree by construction.
 #[tauri::command]
-async fn reconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
+async fn reconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), ActionError> {
     do_reconnect(app, &state, "reconnect").await
 }
 
@@ -309,7 +325,7 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Stri
     if let Err(error) = vpn::run_admin("cancel", &[]).await {
         log::warn!(
             "cancel failed: {}",
-            vpn::admin_error_hint(&vpn::setup_script_path(&app), &error)
+            vpn::admin_error_hint(&vpn::setup_script_path(&app), error)
         );
     }
     controller.connect_failed(&app, "Connection canceled".to_string());
@@ -527,12 +543,15 @@ async fn get_network_health(state: State<'_, AppContext>) -> Result<vpn::Network
     })
 }
 
+/// The privileged repair's failure IS the typed admin failure (the setup
+/// hint is folded in server-side): the frontend receives `{kind, detail}`
+/// and maps it back to the Display texts.
 #[tauri::command]
-async fn repair_network(app: AppHandle) -> Result<String, String> {
+async fn repair_network(app: AppHandle) -> Result<String, vpn::AdminError> {
     // Refuses loudly while the VPN is up — see `gp-admin repair`.
     match vpn::run_admin("repair", &[]).await {
         Ok(message) => Ok(message),
-        Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), &error)),
+        Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), error)),
     }
 }
 
@@ -544,7 +563,7 @@ async fn do_connect(
     portal: &str,
     reuse_cookie: bool,
     gateway: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), ActionError> {
     let controller = state.controller.clone();
 
     // Gateway resolution: an explicit pick from the panel or the tray menu
@@ -557,7 +576,7 @@ async fn do_connect(
     );
     if let Some(name) = &resolved_gateway {
         if !valid_name(name) {
-            return Err("Invalid gateway name".to_string());
+            return Err(ActionError::Message("Invalid gateway name".to_string()));
         }
     }
     let gateway_arg = resolved_gateway.clone().unwrap_or_else(|| "-".to_string());
@@ -581,7 +600,9 @@ async fn do_connect(
     // Gate and transition atomically: a second concurrent Connect (double
     // click, panel + tray menu) must be refused BEFORE it can launch another
     // `admin start` and unload-kill the first worker mid-SSO.
-    controller.try_begin_connect(&app, portal)?;
+    controller
+        .try_begin_connect(&app, portal)
+        .map_err(ActionError::Message)?;
     let _ = app.emit("vpn-log-cleared", ());
 
     // No focus bookkeeping around the admin call: the helper is NOPASSWD so
@@ -597,25 +618,27 @@ async fn do_connect(
             Ok(())
         }
         Err(error) => {
-            let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
-            controller.connect_failed(&app, error.clone());
-            Err(error)
+            let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
+            controller.connect_failed(&app, error.to_string());
+            Err(error.into())
         }
     }
 }
 
-async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<(), String> {
+async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<(), ActionError> {
     let controller = state.controller.clone();
     // Gate and transition atomically (see try_begin_disconnect): a concurrent
     // connect that lands between a `snapshot()` check and the transition must
     // not be torn down by a second disconnect.
-    controller.try_begin_disconnect(&app)?;
+    controller
+        .try_begin_disconnect(&app)
+        .map_err(ActionError::Message)?;
     // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
     // helper never raises a dialog, so hide-on-blur stays in effect.
     let result = vpn::run_admin("stop", &[]).await;
     if let Err(error) = result {
         log::warn!("disconnect failed: {error}");
-        let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), &error);
+        let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
         // Fail loud, never SIGKILL: the worker may ignore the signal and a
         // killed worker skips the vpnc-script teardown, leaving macOS DNS
         // settings pointing at VPN resolvers. The poller reports the
@@ -656,7 +679,7 @@ async fn do_reconnect(
     app: AppHandle,
     state: &State<'_, AppContext>,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), ActionError> {
     let (portal, reuse_cookie, gateway) = {
         let cfg = state.config.lock().unwrap();
         connect_target_from_config(&cfg)

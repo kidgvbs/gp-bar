@@ -1016,17 +1016,50 @@ pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpc
 /// half a minute instead of never.
 const ADMIN_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A privileged-helper failure, classified so the consumer can tell the
+/// classes apart: a missing one-time setup needs the user's action, a
+/// timeout can be retried, a `Failed` is whatever the wrapper said.
+///
+/// `Display` is the user-facing text AND a stable grep contract — the
+/// setup-hint especially is byte-identical to what the old string-based
+/// errors carried (panel history and muscle memory match it). The serde
+/// shape `{kind, detail}` is the wire format: Tauri rejects the command's
+/// promise with the serialized value, and the frontend maps it back to
+/// those same strings (see `commandErrorText` in src/main.ts).
+#[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize)]
+#[serde(tag = "kind", content = "detail")]
+pub enum AdminError {
+    /// The wrapper/sudoers setup is missing on this machine.
+    #[error(
+        "The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '{setup_script}'"
+    )]
+    NotInstalled { setup_script: PathBuf },
+    /// The helper op did not finish within `ADMIN_OP_TIMEOUT`.
+    #[error("admin op '{op}' timed out")]
+    Timeout { op: &'static str },
+    /// The op ran and failed. `stderr` is the wrapper's stderr verbatim —
+    /// or, for the rarer shapes (sudo itself could not spawn, a non-zero
+    /// exit with no stderr), the same text the old formatting produced.
+    #[error("{stderr}")]
+    Failed { op: &'static str, stderr: String },
+}
+
 /// Run one admin operation (`selftest`, `start`, `stop`, `cancel`).
 ///
 /// `sudo -n` never prompts: without the sudoers rule it fails fast, and
-/// `admin_error_hint` turns that failure into the one-time setup
+/// `admin_error_hint` classifies that failure into the one-time setup
 /// instructions. No credentials are ever seen or handled by GP Bar — the
 /// whole point of the wrapper design (`pam_tid` falls back to the password
 /// for any process that is not an interactive terminal, so Touch ID
 /// cannot gate the helper).
-pub async fn run_admin(op: &str, args: &[&str]) -> Result<String, String> {
+///
+/// Errors are typed, not formatted: the timeout, a spawn failure and a
+/// non-zero exit are distinct [`AdminError`]s (the last two keep their
+/// old text inside `Failed::stderr`); the caller classifies the raw value
+/// through `admin_error_hint`.
+pub async fn run_admin(op: &'static str, args: &[&str]) -> Result<String, AdminError> {
     // LC_ALL/LANG=C: sudo and the wrapper run with stable, non-localized
-    // error strings, which `admin_error_hint` matches on.
+    // error strings, which the classification matches on.
     let fut = Command::new("/usr/bin/sudo")
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -1041,16 +1074,22 @@ pub async fn run_admin(op: &str, args: &[&str]) -> Result<String, String> {
         .output();
     let output = tokio::time::timeout(ADMIN_OP_TIMEOUT, fut)
         .await
-        .map_err(|_| format!("admin op '{op}' timed out"))?
-        .map_err(|e| format!("sudo failed to run: {e}"))?;
+        .map_err(|_| AdminError::Timeout { op })?
+        .map_err(|e| AdminError::Failed {
+            op,
+            stderr: format!("sudo failed to run: {e}"),
+        })?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.status.success() {
         Ok(stdout)
     } else if stderr.is_empty() {
-        Err(format!("admin op '{op}' failed: exit {}", output.status))
+        Err(AdminError::Failed {
+            op,
+            stderr: format!("admin op '{op}' failed: exit {}", output.status),
+        })
     } else {
-        Err(stderr)
+        Err(AdminError::Failed { op, stderr })
     }
 }
 
@@ -1063,32 +1102,44 @@ pub fn setup_script_path(app: &AppHandle) -> PathBuf {
         .join("scripts/setup-admin.sh")
 }
 
-/// Map sudo/wrapper failures to the one-time setup hint when the helper is
-/// not installed; operational failures pass through unchanged.
-pub fn admin_error_hint(setup_script: &Path, error: &str) -> String {
+/// Classify a raw admin failure from the live system: the only
+/// environment-dependent input is the wrapper's existence check.
+pub fn admin_error_hint(setup_script: &Path, error: AdminError) -> AdminError {
     admin_error_hint_for(Path::new(ADMIN_WRAPPER).exists(), setup_script, error)
 }
 
-/// Pure core of [`admin_error_hint`]: `wrapper_installed` is the caller's
-/// locale-independent existence check so tests are environment-free.
-pub fn admin_error_hint_for(wrapper_installed: bool, setup_script: &Path, error: &str) -> String {
+/// Pure core of [`admin_error_hint`] and the whole classification:
+/// `wrapper_installed` is the caller's locale-independent existence check
+/// so tests are environment-free.
+///
+/// A missing wrapper file, or sudo's password-prompt / command-not-found
+/// stderr, means the one-time setup is missing — whatever the raw failure
+/// said. Every other failure passes through unchanged, with the same
+/// `Display` the raw value already had.
+pub fn admin_error_hint_for(
+    wrapper_installed: bool,
+    setup_script: &Path,
+    error: AdminError,
+) -> AdminError {
     // No wrapper file means the setup is missing, whatever the exact
     // sudo/OS error string says. sudo's stderr is forced to LC_ALL=C by
     // `run_admin`, so the string matches below are stable, but the
     // existence check works even without them.
-    let hint = || {
-        format!(
-            "The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '{}'",
-            setup_script.display()
-        )
-    };
-    if !wrapper_installed
-        || error.contains("a password is required")
-        || error.contains("command not found")
-    {
-        hint()
-    } else {
-        error.to_string()
+    if !wrapper_installed {
+        return AdminError::NotInstalled {
+            setup_script: setup_script.to_path_buf(),
+        };
+    }
+    match error {
+        AdminError::Failed { stderr, .. }
+            if stderr.contains("a password is required")
+                || stderr.contains("command not found") =>
+        {
+            AdminError::NotInstalled {
+                setup_script: setup_script.to_path_buf(),
+            }
+        }
+        other => other,
     }
 }
 
@@ -1110,24 +1161,126 @@ mod tests {
     #[test]
     fn admin_errors_map_to_the_setup_hint() {
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
-        // Missing sudoers rule and missing wrapper both mean "run the setup".
-        assert!(
-            admin_error_hint_for(false, setup, "sudo: some other failure")
-                .contains("setup-admin.sh")
-        );
-        assert!(admin_error_hint(setup, "sudo: a password is required").contains("setup-admin.sh"));
-        assert!(
-            admin_error_hint(
-                setup,
-                "sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found"
-            )
-            .contains("setup-admin.sh")
-        );
+        let not_installed = |error: AdminError| match error {
+            AdminError::NotInstalled { setup_script } => {
+                assert_eq!(setup_script, setup);
+                true
+            }
+            _ => false,
+        };
+        let failed = |stderr: &str| AdminError::Failed {
+            op: "start",
+            stderr: stderr.to_string(),
+        };
+
+        // A missing wrapper beats everything, whatever the raw failure was:
+        // the machine has never run the one-time setup.
+        assert!(not_installed(admin_error_hint_for(
+            false,
+            setup,
+            failed("sudo: some other failure")
+        )));
+        assert!(not_installed(admin_error_hint_for(
+            false,
+            setup,
+            AdminError::Timeout { op: "stop" }
+        )));
+        // Installed, but sudo wants a password (no NOPASSWD rule) or cannot
+        // find the wrapper path: the setup is missing in those shapes too.
+        assert!(not_installed(admin_error_hint_for(
+            true,
+            setup,
+            failed("sudo: a password is required")
+        )));
+        assert!(not_installed(admin_error_hint_for(
+            true,
+            setup,
+            failed("sudo: /Library/PrivilegedHelperTools/gp-bar/admin: command not found")
+        )));
         // Operational failures pass through untouched.
+        let passthrough = failed("gp-admin: the VPN worker did not stop");
         assert_eq!(
-            admin_error_hint_for(true, setup, "gp-admin: the VPN worker did not stop"),
+            admin_error_hint_for(true, setup, passthrough.clone()),
+            passthrough
+        );
+    }
+
+    /// The user-facing texts are a stable grep contract (RECAP quotes,
+    /// panel history, muscle memory): the typed errors must format to
+    /// byte-identical strings — including the two rare `Failed` shapes
+    /// `run_admin` synthesizes with the old wording.
+    #[test]
+    fn admin_error_texts_are_byte_identical() {
+        let setup =
+            PathBuf::from("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
+        assert_eq!(
+            AdminError::NotInstalled {
+                setup_script: setup.clone()
+            }
+            .to_string(),
+            "The privileged helper is not installed. One-time setup (Terminal):\n  \
+             sudo bash '/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh'"
+        );
+        assert_eq!(
+            AdminError::Timeout { op: "stop" }.to_string(),
+            "admin op 'stop' timed out"
+        );
+        assert_eq!(
+            AdminError::Failed {
+                op: "start",
+                stderr: "sudo failed to run: No such file or directory (os error 2)".to_string(),
+            }
+            .to_string(),
+            "sudo failed to run: No such file or directory (os error 2)"
+        );
+        assert_eq!(
+            AdminError::Failed {
+                op: "stop",
+                stderr: "admin op 'stop' failed: exit exit status: 1".to_string(),
+            }
+            .to_string(),
+            "admin op 'stop' failed: exit exit status: 1"
+        );
+        // A wrapper stderr surfaces verbatim, not wrapped.
+        assert_eq!(
+            AdminError::Failed {
+                op: "stop",
+                stderr: "gp-admin: the VPN worker did not stop".to_string(),
+            }
+            .to_string(),
             "gp-admin: the VPN worker did not stop"
         );
+    }
+
+    /// The wire shape of a rejected command promise: Tauri serializes the
+    /// error value, so the frontend receives `{kind, detail}` and maps it
+    /// back to the same strings (`commandErrorText` in src/main.ts).
+    #[test]
+    fn admin_errors_serialize_to_kind_and_detail() {
+        let setup =
+            PathBuf::from("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
+        let value = serde_json::to_value(AdminError::NotInstalled {
+            setup_script: setup,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "NotInstalled");
+        assert_eq!(
+            value["detail"]["setup_script"],
+            "/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh"
+        );
+
+        let value = serde_json::to_value(AdminError::Timeout { op: "stop" }).unwrap();
+        assert_eq!(value["kind"], "Timeout");
+        assert_eq!(value["detail"]["op"], "stop");
+
+        let value = serde_json::to_value(AdminError::Failed {
+            op: "start",
+            stderr: "boom".to_string(),
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "Failed");
+        assert_eq!(value["detail"]["op"], "start");
+        assert_eq!(value["detail"]["stderr"], "boom");
     }
 
     #[test]
@@ -1505,11 +1658,11 @@ mod tests {
 
     #[test]
     fn admin_timeout_errors_reach_the_setup_hint_unchanged() {
-        // The timeout string is an operational failure, not a setup one —
-        // it must pass through and be surfaced by the caller.
+        // The timeout is an operational failure, not a setup one — it must
+        // pass through and be surfaced by the caller.
         let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
-        let error = "admin op 'stop' timed out";
-        assert_eq!(admin_error_hint_for(true, setup, error), error);
+        let error = AdminError::Timeout { op: "stop" };
+        assert_eq!(admin_error_hint_for(true, setup, error.clone()), error);
     }
 
     #[test]
