@@ -61,6 +61,27 @@ GPLOGIN_APP="$PREFIX/GP Connect Login.app"
 
 die() { echo "gp-admin: $*" >&2; exit 1; }
 
+# Bounded wait for a background child of this shell: POSIX sh has no
+# `wait` timeout, so poll `kill -0` every 0.5 s for up to `$2` seconds.
+# /bin/sh reaps background children as they exit, so a dead child fails
+# the probe — no zombie false-positive (verified empirically on this
+# /bin/sh). Returns 0 once the child is gone, 1 on budget expiry. The
+# caller then collects the exit status with its own `wait "$pid"`
+# (immediate after a 0: the shell kept the status for that job) and
+# decides what a survivor means: kill -9 + die, or warn and move on.
+# Always invoke from a condition (`if ! wait_bounded ...`) — a bare call
+# under `set -e` would abort on the 1.
+wait_bounded() {
+  wb_pid=$1
+  wb_ticks=$(($2 * 2))
+  while kill -0 "$wb_pid" 2>/dev/null; do
+    [ "$wb_ticks" -le 0 ] && return 1
+    sleep 0.5
+    wb_ticks=$((wb_ticks - 1))
+  done
+  return 0
+}
+
 # Refuse to run unless `path` (symlink-resolved) and EVERY component of
 # its directory chain is owned by root and not group/world-writable.
 # A user-writable parent (or a user-swappable file) would make the
@@ -359,8 +380,19 @@ stop)
   # gpclient disconnect signals the lock-file PID with SIGINT and exits 0
   # even when the signal went nowhere: the lock file is the truth. Fail
   # loud, never SIGKILL — a killed worker skips the vpnc-script teardown
-  # that restores DNS settings and routes.
-  "$GPCLIENT" disconnect
+  # that restores DNS settings and routes. Bounded now (5 s; the kill -9
+  # below touches only OUR messenger process, never the worker): the old
+  # foreground call could hang the whole stop past every budget above it
+  # (ADMIN_OP_TIMEOUT 30 s in the app, ExitTimeOut 60 s in launchd) with
+  # nothing to cut it loose.
+  "$GPCLIENT" disconnect &
+  disc_pid=$!
+  if ! wait_bounded "$disc_pid" 5; then
+    kill -9 "$disc_pid" 2>/dev/null || true
+    wait "$disc_pid" 2>/dev/null || true
+    die "gpclient disconnect did not finish within 5 s"
+  fi
+  wait "$disc_pid"
   i=0
   while [ "$i" -lt 20 ] && [ -e "$LOCK" ]; do
     sleep 0.5
@@ -370,14 +402,36 @@ stop)
     echo "gp-admin: the VPN worker did not stop" >&2
     exit 1
   fi
-  launchctl unload -w "$PLIST" 2>/dev/null || true
+  # The last step only retires the one-shot job, and the VPN is already
+  # down (the lock file is gone): bounded (5 s) but warn-not-fail. The
+  # kill bounds OUR launchctl client, never the worker — launchd keeps
+  # servicing the request it was sent, and its ExitTimeOut bounds the
+  # worker side on its own.
+  launchctl unload -w "$PLIST" 2>/dev/null &
+  unload_pid=$!
+  if ! wait_bounded "$unload_pid" 5; then
+    kill -9 "$unload_pid" 2>/dev/null || true
+    echo "gp-admin: the final job unload did not finish within 5 s (the VPN is down; launchd's ExitTimeOut bounds the rest)" >&2
+  fi
+  wait "$unload_pid" 2>/dev/null || true
   ;;
 
 cancel)
   # Unloading the one-shot job makes launchd terminate the worker, which
   # runs its own teardown instead of a blind kill (SIGTERM first, with
-  # the 60 s ExitTimeOut grace — see the plist above).
-  launchctl unload -w "$PLIST" 2>/dev/null || true
+  # the 60 s ExitTimeOut grace — see the plist above). Bounded (10 s):
+  # this unload is the whole operation, and a hang would hold the app's
+  # ADMIN_OPS serialization forever. The kill bounds only OUR launchctl
+  # client; launchd keeps servicing the request, and its ExitTimeOut
+  # bounds the worker side.
+  launchctl unload -w "$PLIST" 2>/dev/null &
+  unload_pid=$!
+  if ! wait_bounded "$unload_pid" 10; then
+    kill -9 "$unload_pid" 2>/dev/null || true
+    wait "$unload_pid" 2>/dev/null || true
+    die "the job unload did not finish within 10 s"
+  fi
+  wait "$unload_pid" 2>/dev/null || true
   ;;
 
 repair)

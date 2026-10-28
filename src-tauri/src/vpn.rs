@@ -1204,11 +1204,17 @@ pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpc
 pub static ADMIN_OPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How long to wait for one privileged helper operation before giving up
-/// and reporting a timeout. 30 s is far above every healthy op (start
-/// ≈1 s, stop waits on the worker's 60 s SIGTERM grace — a stop that long
-/// means a stuck `gpclient disconnect`, exactly what must not hang the UI
-/// forever); short enough that the "Disconnecting…" state resolves within
-/// half a minute instead of never.
+/// and reporting a timeout. The wrapper bounds every internal wait BELOW
+/// this (see scripts/gp-admin): a `stop` is at worst 5 s
+/// (`gpclient disconnect`) + 10 s (lock-file wait) + 5 s (final job
+/// unload) = 20 s, a `cancel` at worst 10 s, the rest ≈1 s — so hitting
+/// this timeout means the wrapper itself is stuck (a hung sudo, a wedged
+/// launchctl), never a merely slow teardown. 30 s keeps ~10 s of margin
+/// over that worst case while still resolving a stuck "Disconnecting…"
+/// within half a minute instead of never. launchd's ExitTimeOut (60 s)
+/// stays the independent backstop underneath both budgets: it SIGKILLs a
+/// worker that ignores SIGTERM even after everyone above gave up waiting
+/// for it.
 const ADMIN_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A privileged-helper failure, classified so the consumer can tell the
@@ -1262,9 +1268,14 @@ pub async fn run_admin(op: &'static str, args: &[&str]) -> Result<String, AdminE
         .arg(ADMIN_WRAPPER)
         .arg(op)
         .args(args)
-        // Reap the child if this future is dropped by the timeout below:
-        // a hung `gpclient disconnect` must not survive as a stray root
-        // process (sudo forwards nothing here; the worker is launchd's).
+        // Kill the child if this future is dropped by the timeout below.
+        // Honest about what that buys: it kills the SUDO parent only —
+        // the root shell it spawned, and anything that shell left behind,
+        // can survive it orphaned (sudo forwards no signal here, and the
+        // worker is launchd's child, not ours). A last-resort resource
+        // guard against a stray root process, NOT a reliable teardown —
+        // the wrapper's own bounded waits, with launchd's ExitTimeOut
+        // below them, are the real bounds.
         .kill_on_drop(true)
         .output();
     let output = tokio::time::timeout(ADMIN_OP_TIMEOUT, fut)
