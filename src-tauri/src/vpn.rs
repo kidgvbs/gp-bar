@@ -78,16 +78,45 @@ impl Default for VpnState {
     }
 }
 
+/// Identity of one connect attempt. Every async completion — the start
+/// confirmation, the poller's dead-worker blame, a cancel — carries the id
+/// of the attempt it belongs to, and the transition applies only if that
+/// is still the current one (checked under the controller's lock): a
+/// completion that arrives "later" belongs to a world that may have moved
+/// on twice over (the attempt superseded, or resolved in place by a stale
+/// lock adoption). Same principle as a fencing token in distributed locks.
+///
+/// Bumped ONLY by `enter_connecting` (every gated connect BEGIN): a
+/// disconnect or a cancel ENDS an attempt, it never starts a new one —
+/// their completions are phase-fenced instead (`disconnect_failed` only
+/// ever fires while in the Disconnecting its own gate created; nothing
+/// else may transition out from under it). The counter starts at 0, so
+/// the `Default` id is never a live attempt's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct AttemptId(u64);
+
+impl AttemptId {
+    /// The next attempt's id.
+    fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
 /// Shared, lock-protected inner state.
 #[derive(Default)]
 struct Inner {
     state: VpnState,
+    /// The connect attempt the current phase belongs to. Superseding it
+    /// (a cancel, a failure, then a new connect) is what makes late
+    /// completions stale: they carry the old id and no longer match.
+    attempt: AttemptId,
     /// Whether the in-flight connect attempt's `admin start` has been
     /// confirmed (the wrapper returned Ok and loaded a fresh launchd job).
     /// The status poller may blame a job without a pid on a dead worker ONLY
-    /// while this is true: before it, the job on the system is still the
-    /// previous attempt's (stale, no pid) and would be reported as a false
-    /// "worker exited" through the whole SSO login.
+    /// while this is true AND the attempt matches: before the confirmation,
+    /// the job on the system is still the previous attempt's (stale, no
+    /// pid) and would be reported as a false "worker exited" through the
+    /// whole SSO login.
     worker_started: bool,
     /// What a fresh connect would target right now (the resolved gateway:
     /// explicit pick, else preferred — noted by `note_reconnect_target`
@@ -142,21 +171,26 @@ impl VpnController {
         let _ = self.tx.send(state);
     }
 
-    fn update(&self, mutate: impl FnOnce(&mut Inner)) -> VpnState {
-        let state = {
+    /// Apply `mutate` under the lock and publish the result if anything
+    /// observable changed. `mutate` returns a value so the fenced callers
+    /// (see `connect_failed`) learn whether they were applied or ignored;
+    /// every other caller returns `()`.
+    fn update<T>(&self, mutate: impl FnOnce(&mut Inner) -> T) -> (T, VpnState) {
+        let (value, state) = {
             let mut inner = self.inner.lock().unwrap();
             let before = inner.state.clone();
-            mutate(&mut inner);
+            let value = mutate(&mut inner);
             // The armed flag is derived state, never a second source of
             // truth: recompute it after every mutation so every published
             // state satisfies the formula (see `apply_reconnect_armed`).
             apply_reconnect_armed(&mut inner);
             if inner.state == before {
                 // Nothing observable changed (e.g. a poll tick with the same
-                // phase): skip the publish instead of waking every listener.
-                return before;
+                // phase, or a fenced-off stale completion): skip the
+                // publish instead of waking every listener.
+                return (value, before);
             }
-            inner.state.clone()
+            (value, inner.state.clone())
             // The guard is dropped here, before publishing. `watch::send`
             // runs no listener code on this thread (unlike the old direct
             // emit, whose synchronous listeners re-reading `snapshot()`
@@ -165,7 +199,7 @@ impl VpnController {
             // see the lock-order doc on `AppContext` in main.rs.
         };
         self.publish(state.clone());
-        state
+        (value, state)
     }
 
     // -- connect ---------------------------------------------------------------
@@ -177,19 +211,23 @@ impl VpnController {
     /// and the second `admin start` unloads — killing — the first worker
     /// mid-SSO. The check and the transition must be atomic; the refusal
     /// error is the caller's to surface.
-    pub fn try_begin_connect(&self, portal: &str) -> Result<(), String> {
+    ///
+    /// On success the caller receives the NEW attempt's [`AttemptId`]: every
+    /// async completion of this attempt (the start confirmation, a failure,
+    /// a cancel) must carry it back so the transition can fence staleness.
+    pub fn try_begin_connect(&self, portal: &str) -> Result<AttemptId, String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
             match enter_connecting(&mut inner, portal) {
-                Ok(()) => Ok(inner.state.clone()),
+                Ok(attempt) => Ok((attempt, inner.state.clone())),
                 Err(phase) => Err(format!("cannot connect while {phase:?}")),
             }
             // Guard dropped BEFORE publishing (the `update` discipline).
         };
         match outcome {
-            Ok(state) => {
+            Ok((attempt, state)) => {
                 self.publish(state);
-                Ok(())
+                Ok(attempt)
             }
             Err(error) => Err(error),
         }
@@ -198,6 +236,11 @@ impl VpnController {
     /// Gate + transition for a disconnect attempt, atomic like
     /// `try_begin_connect`. A second disconnect while already Disconnecting
     /// is idempotent (Ok): the stop request is already in flight.
+    ///
+    /// No `AttemptId`: a disconnect ENDS an attempt (it never begins a new
+    /// one — see the type's doc), and its completions are phase-fenced: the
+    /// only transition out of Disconnecting is the poller's filesystem truth
+    /// (`apply_lock`), so there is nothing to fence against.
     pub fn try_begin_disconnect(&self) -> Result<(), String> {
         let outcome = {
             let mut inner = self.inner.lock().unwrap();
@@ -216,25 +259,30 @@ impl VpnController {
         }
     }
 
-    pub fn connect_failed(&self, error: String) {
-        self.update(|inner| {
-            inner.state.phase = Phase::Error;
-            inner.state.last_error = Some(error);
-            inner.worker_started = false;
-        });
+    /// A completion of connect attempt `id` that failed: applies ONLY if
+    /// `id` is still the current attempt AND the phase is still Connecting —
+    /// anything else is a stale completion (the attempt was superseded, or
+    /// resolved in place: canceled, failed once, or graduated to Connected
+    /// by a stale lock file) and is a logged no-op.
+    pub fn connect_failed(&self, id: AttemptId, error: String) {
+        let (applied, _) = self.update(|inner| apply_connect_failed(inner, id, &error));
+        if !applied {
+            log::debug!("connect_failed: ignoring a stale completion for attempt {id:?}");
+        }
     }
 
-    /// The wrapper's `start` returned Ok: the launchd job now belongs to this
-    /// attempt, and the poller may trust its `pid =` line from here on.
-    ///
-    /// If the phase already left Connecting (the attempt failed, was
-    /// canceled, or a stale lock file graduated it straight to Connected),
-    /// setting the flag is harmless: it is reset by `enter_connecting` on
-    /// every new attempt and cleared on every teardown/failed transition, so
-    /// a stale `true` can never gate a future attempt.
-    pub fn mark_worker_started(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.worker_started = true;
+    /// The wrapper's `start` returned Ok for attempt `id`: the launchd job
+    /// now belongs to it, and the poller may trust its `pid =` line from
+    /// here on. A marker from a superseded attempt is ignored: it must not
+    /// arm the CURRENT attempt's blame gate. (A marker whose phase already
+    /// left Connecting within the SAME attempt is still harmless, as
+    /// before: the flag is only consulted via `connecting_attempt_started`,
+    /// which re-checks the phase.)
+    pub fn mark_worker_started(&self, id: AttemptId) {
+        let (armed, _) = self.update(|inner| apply_worker_started(inner, id));
+        if !armed {
+            log::debug!("mark_worker_started: ignoring a stale marker for attempt {id:?}");
+        }
     }
 
     // -- disconnect ------------------------------------------------------------
@@ -255,15 +303,30 @@ impl VpnController {
         self.update(|inner| apply_lock(inner, lock));
     }
 
-    /// Whether the poller may attribute a missing lock file to a dead worker:
-    /// only while a connect attempt is in flight AND its start has been
-    /// confirmed (`mark_worker_started`, set once `run_admin("start")`
-    /// returned Ok). Before that the launchd job is still the previous one
-    /// (or not loaded), and a job without a `pid =` line would be reported as
-    /// a false "worker exited" through the whole SSO login.
-    pub fn connecting_worker_started(&self) -> bool {
+    /// The in-flight connect attempt's id, iff the phase is Connecting.
+    /// The id-only half of the poller gate (no `worker_started`
+    /// requirement): `cancel` uses it as the completion's id — the fence
+    /// inside `connect_failed` then decides whether it still applies.
+    pub fn connecting_attempt(&self) -> Option<AttemptId> {
         let inner = self.inner.lock().unwrap();
-        inner.state.phase == Phase::Connecting && inner.worker_started
+        (inner.state.phase == Phase::Connecting).then_some(inner.attempt)
+    }
+
+    /// The in-flight connect attempt's id, iff the poller may attribute a
+    /// missing lock file to a dead worker: the phase must be Connecting AND
+    /// the attempt's start must be confirmed (`mark_worker_started`, set
+    /// once `run_admin("start")` returned Ok — for THIS attempt). Before
+    /// that the launchd job is still the previous one (or not loaded), and
+    /// a job without a `pid =` line would be reported as a false "worker
+    /// exited" through the whole SSO login.
+    ///
+    /// Capturing the id here (under the same lock as the gate check) and
+    /// passing it to the completion is the fencing pattern: the blame is
+    /// issued for a KNOWN attempt, and `connect_failed` re-validates that
+    /// it is still current after the `launchctl print` await that follows.
+    pub fn connecting_attempt_started(&self) -> Option<AttemptId> {
+        let inner = self.inner.lock().unwrap();
+        (inner.state.phase == Phase::Connecting && inner.worker_started).then_some(inner.attempt)
     }
 
     /// A parsed gateway name from the JSON log stream.
@@ -328,11 +391,14 @@ fn apply_selected_portal(inner: &mut Inner, portal: Option<String>) {
 
 /// Pure half of `VpnController::try_begin_connect`: the connect gate and
 /// transition, unit-testable without an AppHandle. Only the idle phases may
-/// start a connect; the refusal carries the blocking phase.
-fn enter_connecting(inner: &mut Inner, portal: &str) -> Result<(), Phase> {
+/// start a connect; the refusal carries the blocking phase. On success the
+/// attempt counter is bumped and the NEW id is returned: every completion
+/// of the attempt must carry it back (see `AttemptId`).
+fn enter_connecting(inner: &mut Inner, portal: &str) -> Result<AttemptId, Phase> {
     if !matches!(inner.state.phase, Phase::Disconnected | Phase::Error) {
         return Err(inner.state.phase.clone());
     }
+    inner.attempt = inner.attempt.next();
     inner.state.phase = Phase::Connecting;
     inner.state.portal = Some(portal.to_string());
     inner.state.gateway = None;
@@ -343,7 +409,38 @@ fn enter_connecting(inner: &mut Inner, portal: &str) -> Result<(), Phase> {
     // Leaving Connected clears the armed flag in the state this transition
     // emits (it is Connected-only, see `apply_reconnect_armed`).
     apply_reconnect_armed(inner);
-    Ok(())
+    Ok(inner.attempt)
+}
+
+/// Pure half of `VpnController::mark_worker_started`: arms the poller blame
+/// gate only for the attempt the confirmation belongs to. A marker from a
+/// superseded attempt (its `admin start` raced a cancel + retry) is refused:
+/// the dead attempt must not arm the live one's gate. Within the SAME
+/// attempt there is no phase check — a late-but-current marker stays
+/// harmless exactly as before, because the gate (`connecting_attempt_started`)
+/// re-checks the phase under the lock.
+fn apply_worker_started(inner: &mut Inner, id: AttemptId) -> bool {
+    if inner.attempt != id {
+        return false;
+    }
+    inner.worker_started = true;
+    true
+}
+
+/// Pure half of `VpnController::connect_failed`: the fenced failure
+/// transition. Applies ONLY if the completion's attempt is still the
+/// current one AND the phase is still Connecting — one fence for each way a
+/// completion can be stale (the attempt was superseded; the phase resolved
+/// in place, e.g. a stale lock graduated it to Connected). Returns whether
+/// it applied, so the caller can log the ignored case.
+fn apply_connect_failed(inner: &mut Inner, id: AttemptId, error: &str) -> bool {
+    if inner.attempt != id || inner.state.phase != Phase::Connecting {
+        return false;
+    }
+    inner.state.phase = Phase::Error;
+    inner.state.last_error = Some(error.to_string());
+    inner.worker_started = false;
+    true
 }
 
 /// Pure half of `VpnController::try_begin_disconnect`. Connected proceeds;
@@ -531,27 +628,39 @@ pub fn spawn_status_poller(controller: Arc<VpnController>) {
             // gpclient only writes the lock once it is established, so a dead
             // worker here is a failed attempt (wrong SSO, closed browser,
             // gateway error, crash) — surface it instead of spinning forever.
-            // But only once the start is CONFIRMED (`worker_started`, set
-            // after `run_admin("start")` returns Ok): before that the job on
-            // the system is still the previous attempt's, and its missing
-            // `pid =` line would be a false "worker exited" sticking on screen
-            // through the whole SSO login.
+            // But only once the start is CONFIRMED for THIS attempt (the id
+            // `connecting_attempt_started` captures under the same lock):
+            // before that the job on the system is still the previous
+            // attempt's, and its missing `pid =` line would be a false
+            // "worker exited" sticking on screen through the whole SSO
+            // login.
             // The one-shot job stays loaded (no KeepAlive), so probing it
             // needs the `pid =` line, not the command's exit status.
-            if observation.is_none() && controller.connecting_worker_started() {
-                if let Some(false) = worker_has_active_pid(WORKER_LABEL).await {
-                    // The job is loaded but has no live process: gpclient ran
-                    // and exited before the tunnel came up (wrong SSO, closed
-                    // browser, gateway error, crash).
-                    controller.connect_failed(
-                        "The VPN worker exited before the tunnel came up".to_string(),
-                    );
+            if observation.is_none() {
+                if let Some(attempt) = controller.connecting_attempt_started() {
+                    if let Some(false) = worker_has_active_pid(WORKER_LABEL).await {
+                        // The job is loaded but has no live process: gpclient
+                        // ran and exited before the tunnel came up (wrong
+                        // SSO, closed browser, gateway error, crash). The
+                        // completion carries the id the gate captured: if
+                        // the await above outlived the attempt (canceled and
+                        // superseded, or graduated to Connected by the lock
+                        // file appearing), `connect_failed` is a no-op.
+                        controller.connect_failed(
+                            attempt,
+                            "The VPN worker exited before the tunnel came up".to_string(),
+                        );
+                    }
                 }
                 // Some(true) = still authenticating; None = the job is not
                 // loaded yet or launchctl failed: nothing to report here.
                 // `run_admin("start")` reports its own failure, and
                 // cancel/stop set their own phases.
             }
+            // `observe_lock` is filesystem truth and deliberately NOT
+            // attempt-fenced: an outside-started worker (a terminal, or the
+            // app restarting on a live tunnel) must be adopted as Connected
+            // even though no attempt of ours exists to match.
             controller.observe_lock(observation);
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -1038,6 +1147,25 @@ pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
 /// reported in the About box is resolved from THIS binary when it exists, so
 /// the displayed version matches what the worker really runs.
 pub const WORKER_GPCLIENT: &str = "/Library/PrivilegedHelperTools/gp-bar/bin/gpclient";
+
+/// One privileged helper operation at a time, process-wide: the guard is
+/// held ACROSS each `run_admin` await in connect/disconnect/cancel/repair.
+/// A `tokio::sync::Mutex` because the guard legitimately crosses an
+/// `.await` — everything else in the crate keeps the std `Mutex`
+/// discipline documented on `AppContext` (never across an await).
+///
+/// What it buys: the wrapper's operations all write the same launchd job,
+/// and two of them racing produce a lost update the state machine cannot
+/// see. The user-visible one is the lost cancel — Cancel clicked within
+/// the first second of Connect used to `unload` the job BEFORE the
+/// start's `load` ran, unload nothing, show "Connection canceled", and
+/// then let the start load the job anyway: the SSO browser opens and the
+/// VPN connects. Serialized, the cancel waits for the start's sudo to
+/// finish and THEN unloads a job that is actually loaded. The same
+/// ordering protects stop vs. a concurrent start (no half-fresh job for
+/// the next teardown to miss). The wrapper itself stays stateless; this
+/// lock sequences the APP's operations, nothing more.
+pub static ADMIN_OPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How long to wait for one privileged helper operation before giving up
 /// and reporting a timeout. 30 s is far above every healthy op (start
@@ -1560,16 +1688,13 @@ mod tests {
         assert_eq!(inner.state.phase, Phase::Connecting);
 
         let controller = VpnController::new();
-        {
-            let mut i = controller.inner.lock().unwrap();
-            i.state.phase = Phase::Connecting;
-            i.worker_started = false;
-        }
-        assert!(!controller.connecting_worker_started());
+        let attempt = controller.try_begin_connect("vpn.example.com").unwrap();
+        assert_eq!(controller.connecting_attempt_started(), None);
 
-        // Once the start is confirmed, the gate opens...
-        controller.mark_worker_started();
-        assert!(controller.connecting_worker_started());
+        // Once the start is confirmed, the gate opens — and hands the
+        // poller the attempt id to fence its completion with.
+        controller.mark_worker_started(attempt);
+        assert_eq!(controller.connecting_attempt_started(), Some(attempt));
 
         // ...and if the phase already moved on (stale lock graduated it to
         // Connected, or a cancel failed the attempt), marking is harmless:
@@ -1578,8 +1703,8 @@ mod tests {
             let mut i = controller.inner.lock().unwrap();
             i.state.phase = Phase::Error;
         }
-        controller.mark_worker_started();
-        assert!(!controller.connecting_worker_started());
+        controller.mark_worker_started(attempt);
+        assert_eq!(controller.connecting_attempt_started(), None);
 
         // Teardown and failure clear it for the next attempt too.
         {
@@ -1588,7 +1713,7 @@ mod tests {
             i.worker_started = true;
         }
         apply_lock(&mut controller.inner.lock().unwrap(), None);
-        assert!(!controller.connecting_worker_started());
+        assert_eq!(controller.connecting_attempt_started(), None);
     }
 
     /// Publishing goes through the watch channel: every real transition
@@ -1596,19 +1721,15 @@ mod tests {
     /// nothing, and a late subscriber still sees the latest state first.
     /// Uses only the sync receiver APIs (`has_changed`,
     /// `borrow_and_update`) — no async runtime in unit tests.
-    /// The async completions do not know which attempt they belong to yet:
-    /// this pair of tests pins the two races that fix introduces. They are
-    /// RED on purpose at this commit — the fencing (an attempt identity
-    /// carried by every completion) lands in the next one.
-    ///
-    /// Race (a): a completion arriving for a superseded or already-resolved
-    /// attempt must be a no-op. Today `connect_failed` applies to whatever
-    /// is current, so the poller's late blame overwrites a state the
-    /// machine has already moved past.
+    /// Race (a), through the controller: a completion arriving for an
+    /// attempt that already RESOLVED (a stale lock graduated it to
+    /// Connected) is a no-op — it neither overwrites the phase nor
+    /// publishes anything.
     #[test]
     fn a_late_connect_completion_must_not_overwrite_a_resolved_attempt() {
         let controller = VpnController::new();
-        controller.try_begin_connect("vpn.example.com").unwrap();
+        let mut rx = controller.subscribe();
+        let attempt = controller.try_begin_connect("vpn.example.com").unwrap();
         // The tunnel came up (stale-lock adoption): the attempt RESOLVED as
         // Connected...
         controller.observe_lock(Some(LockObservation {
@@ -1616,31 +1737,146 @@ mod tests {
             connected_since_epoch_secs: 1_700_000_000,
         }));
         assert_eq!(controller.snapshot().phase, Phase::Connected);
+        assert!(rx.has_changed().unwrap()); // the graduation was published
+        assert_eq!(rx.borrow_and_update().phase, Phase::Connected);
         // ...and THEN the poller's dead-worker blame for that same attempt
         // arrives late (its `launchctl print` await resolved after the
         // adoption tick). The blame belongs to an attempt that already
-        // succeeded: applying it must be impossible.
-        controller.connect_failed("The VPN worker exited before the tunnel came up".to_string());
+        // succeeded: applying it must be impossible, and a no-op
+        // completion must not even wake the subscribers.
+        controller.connect_failed(
+            attempt,
+            "The VPN worker exited before the tunnel came up".to_string(),
+        );
         assert_eq!(controller.snapshot().phase, Phase::Connected);
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    /// Race (a) again, superseded rather than resolved: the attempt was
+    /// canceled and a NEW one began; the old attempt's late blame must not
+    /// fail the new one.
+    #[test]
+    fn a_late_connect_completion_must_not_fail_a_superseding_attempt() {
+        let controller = VpnController::new();
+        let a = controller.try_begin_connect("vpn.example.com").unwrap();
+        // Canceled mid-flight (the fence below is what a real cancel goes
+        // through), then a new attempt begins.
+        controller.connect_failed(a, "Connection canceled".to_string());
+        let b = controller.try_begin_connect("vpn.example.com").unwrap();
+        assert_ne!(a, b);
+        // A's blame arrives late, carrying A's id.
+        controller.connect_failed(
+            a,
+            "The VPN worker exited before the tunnel came up".to_string(),
+        );
+        // B is untouched: still Connecting, no error recorded for it.
+        assert_eq!(controller.snapshot().phase, Phase::Connecting);
+        assert_eq!(controller.snapshot().last_error, None);
+        // B's own completion applies normally.
+        controller.connect_failed(b, "B's own failure".to_string());
+        assert_eq!(controller.snapshot().phase, Phase::Error);
+        assert_eq!(
+            controller.snapshot().last_error.as_deref(),
+            Some("B's own failure")
+        );
     }
 
     /// Race (b): a `worker_started` marker from a superseded attempt must
-    /// not arm the CURRENT attempt's poller gate. Today the marker is an
-    /// un-scoped bool, so attempt A's late start confirmation arms the
-    /// blame gate of attempt B.
+    /// not arm the CURRENT attempt's poller gate. The marker is
+    /// attempt-scoped: A's late start confirmation is ignored, B's own
+    /// arms B.
     #[test]
     fn a_stale_worker_started_marker_must_not_arm_the_current_attempt() {
         let controller = VpnController::new();
-        controller.try_begin_connect("vpn.example.com").unwrap();
+        let a = controller.try_begin_connect("vpn.example.com").unwrap();
         // The attempt is canceled mid-flight...
-        controller.connect_failed("Connection canceled".to_string());
+        controller.connect_failed(a, "Connection canceled".to_string());
         // ...a new attempt begins, and the FIRST attempt's `admin start`
         // confirmation arrives late (the sudo command raced the cancel).
-        controller.try_begin_connect("vpn.example.com").unwrap();
-        controller.mark_worker_started();
+        let b = controller.try_begin_connect("vpn.example.com").unwrap();
+        controller.mark_worker_started(a);
         // The late marker belongs to the dead attempt: it must not let the
         // poller blame a job without a pid on the live one.
-        assert!(!controller.connecting_worker_started());
+        assert_eq!(controller.connecting_attempt_started(), None);
+        // B's own confirmation arms B.
+        controller.mark_worker_started(b);
+        assert_eq!(controller.connecting_attempt_started(), Some(b));
+    }
+
+    /// The pure halves of both fences, at the table level. A completion is
+    /// stale in two dimensions and each has its own fence: the attempt id
+    /// (superseded) and the phase (resolved in place). Only the CURRENT
+    /// attempt, still Connecting, may fail.
+    #[test]
+    fn stale_connect_completions_are_no_ops_in_both_dimensions() {
+        // Superseded: A canceled, B in flight, A's blame carries A's id.
+        let mut inner = Inner::default();
+        let a = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        assert!(apply_connect_failed(&mut inner, a, "Connection canceled"));
+        let b = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        assert_ne!(a, b);
+        assert!(!apply_connect_failed(&mut inner, a, "A's late blame"));
+        assert_eq!(inner.state.phase, Phase::Connecting);
+        assert_eq!(inner.state.last_error, None);
+        assert!(apply_connect_failed(&mut inner, b, "B's own failure"));
+        assert_eq!(inner.state.phase, Phase::Error);
+
+        // Resolved in place: A graduated to Connected (stale-lock adoption)
+        // before its blame arrived. Same id, wrong phase: still a no-op.
+        let mut inner = Inner::default();
+        let a = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        apply_lock(
+            &mut inner,
+            Some(LockObservation {
+                pid: Pid(std::num::NonZeroI32::new(4242).unwrap()),
+                connected_since_epoch_secs: 1_700_000_000,
+            }),
+        );
+        assert_eq!(inner.state.phase, Phase::Connected);
+        assert!(!apply_connect_failed(&mut inner, a, "A's late blame"));
+        assert_eq!(inner.state.phase, Phase::Connected);
+
+        // The stale marker fence, pure: A's late confirmation must not arm
+        // B's gate — and within one attempt, marking still works even after
+        // the phase moved on (the gate re-checks the phase under the lock).
+        let mut inner = Inner::default();
+        let a = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        apply_connect_failed(&mut inner, a, "Connection canceled");
+        let b = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        assert!(!inner.worker_started);
+        assert!(!apply_worker_started(&mut inner, a));
+        assert!(!inner.worker_started);
+        assert!(apply_worker_started(&mut inner, b));
+        assert!(inner.worker_started);
+    }
+
+    /// The attempt ids themselves: monotonic from the first connect, never
+    /// repeating, and never the `Default` id (0) — a completion built from
+    /// the default cannot match anything live.
+    #[test]
+    fn attempt_ids_are_monotonic_and_never_the_default() {
+        let mut inner = Inner::default();
+        assert_eq!(inner.attempt, AttemptId::default());
+        let first = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        assert_ne!(first, AttemptId::default());
+        // Each attempt must resolve before the next begins (the gate
+        // refuses a connect while one is in flight — pinned by
+        // `connect_gate_only_allows_idle_phases`).
+        assert!(apply_connect_failed(&mut inner, first, "done"));
+        let second = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        assert!(apply_connect_failed(&mut inner, second, "done"));
+        let third = enter_connecting(&mut inner, "vpn.example.com").unwrap();
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+
+        // A disconnect does NOT begin an attempt: the id stays put through
+        // the teardown (its completions are phase-fenced, not id-fenced —
+        // see `AttemptId`'s doc).
+        let mut inner = Inner::default();
+        inner.state.phase = Phase::Connected;
+        let before = inner.attempt;
+        enter_disconnecting(&mut inner).unwrap();
+        assert_eq!(inner.attempt, before);
     }
 
     #[test]
@@ -1655,8 +1891,12 @@ mod tests {
         controller.observe_lock(None);
         assert!(!rx.has_changed().unwrap());
 
-        // A real transition publishes the new state...
-        controller.connect_failed("boom".to_string());
+        // A real transition publishes the new state... (a connect, then
+        // that attempt's failure — the completion carries the id).
+        let attempt = controller.try_begin_connect("vpn.example.com").unwrap();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().phase, Phase::Connecting);
+        controller.connect_failed(attempt, "boom".to_string());
         assert!(rx.has_changed().unwrap());
         let state = rx.borrow_and_update();
         assert_eq!(state.phase, Phase::Error);
@@ -1669,6 +1909,8 @@ mod tests {
         assert_eq!(late.borrow_and_update().phase, Phase::Error);
 
         // The gate messages are unchanged, and refusals publish nothing.
+        // Error is an idle phase: the retry connect passes, then the
+        // in-flight refusals apply.
         controller.try_begin_connect("vpn.example.com").unwrap();
         assert!(rx.has_changed().unwrap());
         assert_eq!(rx.borrow_and_update().phase, Phase::Connecting);

@@ -341,6 +341,10 @@ async fn reconnect(app: AppHandle, state: State<'_, AppContext>) -> Result<(), A
 #[tauri::command]
 async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), String> {
     let controller = state.controller.clone();
+    // Serialized with the start this very cancel is racing (see ADMIN_OPS):
+    // the unload happens after any in-flight `admin start` has loaded the
+    // job, so it unloads something real instead of losing the cancel.
+    let _guard = vpn::ADMIN_OPS.lock().await;
     // Interrupt a connecting worker by unloading the one-shot launchd job:
     // launchd terminates it, which runs the worker's own teardown instead of
     // a blind kill.
@@ -350,7 +354,13 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Stri
             vpn::admin_error_hint(&vpn::setup_script_path(&app), error)
         );
     }
-    controller.connect_failed("Connection canceled".to_string());
+    // The completion carries the in-flight attempt's id and is fenced inside
+    // `connect_failed` (id match + phase still Connecting): a cancel whose
+    // attempt already resolved — the tunnel came up, the poller blamed the
+    // worker first — is a no-op instead of an Error overwrite.
+    if let Some(attempt) = controller.connecting_attempt() {
+        controller.connect_failed(attempt, "Connection canceled".to_string());
+    }
     Ok(())
 }
 
@@ -570,7 +580,10 @@ async fn get_network_health(state: State<'_, AppContext>) -> Result<vpn::Network
 /// and maps it back to the Display texts.
 #[tauri::command]
 async fn repair_network(app: AppHandle) -> Result<String, vpn::AdminError> {
-    // Refuses loudly while the VPN is up — see `gp-admin repair`.
+    // Refuses loudly while the VPN is up — see `gp-admin repair`. Serialized
+    // with the other privileged ops (see ADMIN_OPS) so its networksetup
+    // writes never interleave with a stop's teardown.
+    let _guard = vpn::ADMIN_OPS.lock().await;
     match vpn::run_admin("repair", &[]).await {
         Ok(message) => Ok(message),
         Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), error)),
@@ -619,10 +632,18 @@ async fn do_connect(
         if reuse_cookie { "1" } else { "0" },
         gateway_arg.as_str(),
     ];
-    // Gate and transition atomically: a second concurrent Connect (double
-    // click, panel + tray menu) must be refused BEFORE it can launch another
-    // `admin start` and unload-kill the first worker mid-SSO.
-    controller
+    // Serialized privileged ops, guard BEFORE the gate: a Cancel can only
+    // pass its own gate while THIS gate has already set Connecting, so a
+    // cancel always ends up waiting on this guard until the start has
+    // loaded the job — then unloads a job that is actually loaded instead
+    // of racing ahead of the start and unloading nothing (the lost cancel).
+    // A second concurrent Connect waits here too and is refused by the
+    // gate the moment the first one holds it — before it can launch
+    // another `admin start` and unload-kill the first worker mid-SSO.
+    let _guard = vpn::ADMIN_OPS.lock().await;
+    // Gate and transition atomically; the returned id is this attempt's
+    // identity — every async completion of it must carry it back.
+    let attempt = controller
         .try_begin_connect(portal)
         .map_err(ActionError::Message)?;
     let _ = app.emit("vpn-log-cleared", ());
@@ -633,15 +654,17 @@ async fn do_connect(
     let result = vpn::run_admin("start", &args).await;
     match result {
         Ok(_) => {
-            // The start is confirmed: the launchd job now exists and belongs to
-            // THIS attempt. Only now may the poller blame a job without a pid
-            // on a dead worker (see `connecting_worker_started`).
-            controller.mark_worker_started();
+            // The start is confirmed: the launchd job now exists and belongs
+            // to THIS attempt. Only now may the poller blame a job without a
+            // pid on a dead worker (see `connecting_attempt_started`) — and
+            // the marker carries the id, so a start confirmation racing a
+            // cancel + retry cannot arm the NEXT attempt's gate.
+            controller.mark_worker_started(attempt);
             Ok(())
         }
         Err(error) => {
             let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
-            controller.connect_failed(error.to_string());
+            controller.connect_failed(attempt, error.to_string());
             Err(error.into())
         }
     }
@@ -655,6 +678,9 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     controller
         .try_begin_disconnect()
         .map_err(ActionError::Message)?;
+    // Serialized with start/cancel/repair (see ADMIN_OPS): a stop never
+    // races a start's load or a repair's networksetup writes.
+    let _guard = vpn::ADMIN_OPS.lock().await;
     // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
     // helper never raises a dialog, so hide-on-blur stays in effect.
     let result = vpn::run_admin("stop", &[]).await;
