@@ -6,7 +6,8 @@
 //! daemon makes per message lives in [`decide`], a pure function; the XPC
 //! layer only transports what it says.
 //!
-//! The plist is generated **at build time** (`smprobe make-plist`) and
+//! The plist is generated **at install time** (`smprobe make-plist
+//! <dest>` — by `scripts/build-probe.sh`, with the DESTINATION path) and
 //! written into the bundle before the ad-hoc codesign step, so BTM always
 //! sees it as a sealed resource (anomaly B avoided by construction). It is
 //! XML-escaped by construction, reusing the discipline of the app crate's
@@ -90,8 +91,9 @@ pub fn xml_escape(value: &str) -> String {
   escaped
 }
 
-/// The LaunchDaemon plist, generated at build time for the bundle at
-/// `bundle_root` (an absolute path).
+/// The LaunchDaemon plist, generated at install time for the bundle at
+/// `bundle_root` (an absolute path — the destination, never the build
+/// tree).
 ///
 /// Deliberately minimal:
 ///

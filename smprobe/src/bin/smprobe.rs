@@ -14,8 +14,8 @@
 //!   the daemon side only).
 //!
 //! * **CLI verbs** — `status`, `ping`, `register`, `unregister`, `log [N]`,
-//!   `make-plist <bundle-root>` (the build-time plist generator used by
-//!   `scripts/build-probe.sh`), `help`.
+//!   `make-plist <bundle-root>` (the install-time plist generator used by
+//!   `scripts/build-probe.sh`, called with the DESTINATION path), `help`.
 //!
 //!   `register` from a Terminal may return EPERM with no prompt (anomaly
 //!   A): the protocol tells the human to prefer the `open`-launched
@@ -226,8 +226,9 @@ fn cmd_log(n: usize) -> i32 {
   }
 }
 
-/// Build-time helper: print the daemon plist for the bundle at
-/// `bundle_root` (absolute). `scripts/build-probe.sh` writes it into
+/// Install-time helper: print the daemon plist for the bundle at
+/// `bundle_root` (absolute — the DESTINATION path, never the build tree).
+/// `scripts/build-probe.sh` writes it into
 /// `Contents/Library/LaunchDaemons/` BEFORE the ad-hoc codesign, so the
 /// plist is sealed into the bundle signature (anomaly B).
 fn cmd_make_plist(bundle_root: &str) -> i32 {

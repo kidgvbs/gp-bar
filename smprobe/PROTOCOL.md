@@ -10,7 +10,7 @@ sonda non fa NIENTE di privilegiato da sola: registra un LaunchDaemon via
 parcheggiata per quattro anomalie osservate su macOS 27.0.1 beta 26A434
 (`docs/btm-27.0.1-beta.md`): **A** EPERM da app Accessory (evitata qui per
 costruzione: nessun `LSUIElement`, policy Regular), **B** plist fuori firma
-(evitata per costruzione: plist scritta a build time dentro la firma),
+(evitata per costruzione: plist scritta a install time dentro la firma),
 **C** registrazione che sparisce ore dopo (`NotFound` spontaneo), **D**
 dopo `launchctl bootout` il job non riparte più nonostante BTM dica
 `Enabled`. Su macOS 27.0 release è emerso pubblicamente un caso simile
@@ -37,28 +37,34 @@ processo vive ~61 secondi; non cercarlo come residente.
 
 ---
 
-## Passo 0 — build (una tantum, se non già fatto)
+## Passo 0/1 — build + installazione in un path stabile (un solo comando)
 
 ```sh
-bash ~/Rust/gp-bar-solution1/smprobe/scripts/build-probe.sh
-```
-
-**GO:** il terminale di build finisce con `SMProbe.app is ready: ...` e
-`OK: the daemon plist is sealed into the bundle signature`.
-**NO-GO:** un errore qualsiasi — non procedere, incolla l'output.
-
-## Passo 1 — installazione in un path stabile
-
-```sh
-cp -R ~/Rust/gp-bar-solution1/smprobe/build/SMProbe.app ~/Applications/
+bash ~/Rust/gp-bar-solution1/smprobe/scripts/build-probe.sh "$HOME/Applications/SMProbe.app"
 codesign -dv ~/Applications/SMProbe.app
 ```
 
-**GO:** `codesign -dv` mostra `Identifier=dev.gpbar.smprobe` e
-`Signature=adhoc`. (Il path stabile + la registrazione LaunchServices al
-primo `open` sono le condizioni del 21/10; un binario nudo in una
-cartella temp dà NotFound/EPERM.)
-**NO-GO:** identifier diverso — ferma tutto, ricostruisci.
+Il comando compila (`--release --locked`), installa il bundle
+**direttamente a destinazione**, genera la plist del demone con il path
+**dell'esemplare installato** (`Program` →
+`~/Applications/SMProbe.app/...`, mai il worktree), firma ad-hoc e
+verifica il tutto (`codesign --verify`, `plutil -lint`, plist sigillata
+in `_CodeSignature/CodeResources`). Lo script può `rm -rf` **solo** il
+path passato, e solo dopo averlo loggato: è la tua azione di install.
+
+**GO:** il terminale finisce con `SMProbe.app is installed at: ...`,
+`OK: the daemon plist is sealed into the bundle signature`, e
+`codesign -dv` mostra `Identifier=dev.gpbar.smprobe` e `Signature=adhoc`.
+(Il path stabile + la registrazione LaunchServices al primo `open` sono
+le condizioni del 21/10; un binario nudo in una cartella temp dà
+NotFound/EPERM.)
+**NO-GO:** un errore qualsiasi, o identifier diverso — non procedere,
+incolla l'output.
+
+**ATTENZIONE**: reinstallare sopra una registrazione viva (senza il
+Passo 7 di unregister PRIMA) è lo scenario app-auto-update che questa
+sonda **non** testa deliberatamente — fai SEMPRE il cleanup (Passo 7)
+prima di reinstallare.
 
 ## Passo 2 — snapshot BTM PRIMA della registrazione
 
@@ -72,7 +78,7 @@ grep -B2 -A10 -i smprobe ~/BTM-TEST/1-before.txt
 massimo un record in stato non approvato. Conserva il file: è il
 riferimento per capire se il record "sparisce" dopo.
 **NO-GO:** esiste già un record attivo da test vecchi → fai prima il
-Passo 7 (cleanup), poi riparti dal Passo 1.
+Passo 7 (cleanup), poi riparti dal Passo 0/1.
 
 ## Passo 3 — registrazione (qui appare il prompt con Touch ID)
 

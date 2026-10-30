@@ -14,7 +14,8 @@
 //!   Regular — the known-good path validated on 21/10.
 //! * **B** — `-67054` "Codesigning failure loading plist" when the daemon
 //!   plist is written after the bundle is signed. Avoided **by construction**:
-//!   the plist is generated at build time by `make-plist` and sealed into the
+//!   the plist is generated at install time by `make-plist` (with the
+//!   destination path) and sealed into the
 //!   bundle's ad-hoc signature (verified in `scripts/build-probe.sh`).
 //! * **C** — a valid registration spontaneously turns `NotFound` hours later.
 //!   This is what the sampler detects: it records `SMAppService.status()` plus
