@@ -1,0 +1,42 @@
+[package]
+name = "smprobe"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.77"
+description = "SMProbe v2: Background Task Management (SMAppService) stability probe for macOS 27.x. Two binaries: a sampler app (smprobe) and an XPC echo LaunchDaemon (smprobe-helper)."
+license = "MIT"
+publish = false
+
+# Standalone crate BY DESIGN: this crate is macOS-only, lives on the parked
+# `solution-1-smappservice` branch and never enters any workspace (so it never
+# reaches the Linux CI either). The empty [workspace] table makes it immune to
+# a parent workspace adopting it by accident.
+[workspace]
+
+[lib]
+name = "smprobe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smprobe"
+path = "src/bin/smprobe.rs"
+
+[[bin]]
+name = "smprobe-helper"
+path = "src/bin/smprobe-helper.rs"
+
+[dependencies]
+# Exact pins reused from the solution-1 app crate of this branch
+# (src-tauri/Cargo.lock): objc2 0.6.5, objc2-service-management 0.3.2,
+# objc2-foundation 0.3.2, block2 0.6.2. The probe must exercise the same
+# dependency set the real implementation would ship.
+objc2 = "=0.6.5"
+objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSError"] }
+objc2-service-management = "=0.3.2"
+block2 = "=0.6.2"
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

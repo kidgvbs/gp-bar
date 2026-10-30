@@ -1,0 +1,2 @@
+# Matches the worktree's rustfmt.toml (gp-bar-solution1/rustfmt.toml).
+tab_spaces = 2
