@@ -99,12 +99,14 @@ Creating the tunnel requires root. GP Bar never handles a password itself:
   anything drifts.
 
 An alternative elevation design (SMAppService LaunchDaemon + XPC, the
-macOS-blessed road) exists on the `solution-1-smappservice` branch: the daemon
-is registered from the app with a single system prompt, then everything runs
-promptless over XPC. It works, but on this macOS beta (27.0.1, 26A434) the
-Background Task Management layer proved unstable around it — see
-`docs/btm-27.0.1-beta.md` for the open observations. The sudoers design above
-is the one in production.
+macOS-blessed road) exists on the `solution-1-smappservice` branch. That
+branch predates both security reviews and **must not be installed as-is**:
+its helper daemon is a KeepAlive resident launched from a user-writable
+bundle location — exactly the design the production path above avoids. It is
+kept as a mechanical reference for a future restart-from-main XPC transport.
+It also proved unstable on the macOS 27.0.1 beta (26A434): see
+`docs/btm-27.0.1-beta.md` for the open BTM observations. The sudoers design
+above is the one in production.
 
 ## Install
 
