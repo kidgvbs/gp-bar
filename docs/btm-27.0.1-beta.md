@@ -80,3 +80,87 @@ Ogni successiva `unregister`/`register` via `SMAppService` (da codice, stesso ri
 
 - **Produzione = Soluzione 3** (sudoers NOPASSWD + wrapper root-owned): semplice, nessuna di queste anomalie, in uso e verde. Il BTM/SMAppService (Soluzione 1) è parcheggiato sul branch `solution-1-smappservice`, in attesa di capire se C/D sono riproducibili o dovuti alla beta.
 - Questa nota è anche una richiesta di confronto: se hai altri strumenti che usano `SMAppService`/Login Items su questa beta e vedi flip o rifiuti inspiegabili, fatti sentire.
+
+---
+
+## Aggiornamento 2 novembre 2026 (macOS 27.2, 26B123) — il NotFound della sonda era uno zombie BTM di ottobre
+
+Fase 0 della ripresa della soluzione 1: sonda SMProbe v2 (identità
+`dev.gpbar.smprobe`, bundle minimale ad-hoc, installata in
+`~/Applications`; codice in `smprobe/` sul branch
+`solution-1-smappservice`). Il Passo 3 (registrazione) è fallito con
+esattamente il paio di sintomi dell'issue exelban/stats #3716 — che è
+su macOS 27.0 **release** (26A428), non beta:
+
+- `SMAppService.status()` → **`NotFound` (3)** persistente, anche a
+  LaunchServices assestato (`lsregister -dump` vedeva correttamente
+  app, identifier e plist come library item);
+- `registerAndReturnError()` → **EPERM "Operation not permitted"**,
+  nessun prompt — da Terminale e persino dal sampler lanciato via
+  `open`.
+
+### Causa trovata: la registrazione di ottobre non fu mai cancellata
+
+`sfltool dumpbtm` mostrava **due record per la stessa identità
+`dev.gpbar.smprobe`**: lo zombie di ottobre — `[disabled, allowed,
+notified]`, l'approvazione della v1 del probe — e la scansione fresca
+del 2/11 — `[pending authorization, not notified]`, con l'item demone
+`16.dev.gpbar.smprobe.helper` `[enabled, disallowed, not notified]`.
+Il cleanup del 22/10 cancellò i **bundle** ("cartelle ripulite", RECAP
+§12.4) ma non eseguì mai `unregister`: il record sopravvisse a due
+upgrade di OS. Il fantasma rende ambigua l'identità → SMAppService non
+risolve più il servizio → `NotFound`; il passo di autorizzazione viene
+rifiutato → EPERM. È il desync record↔bundle dell'issue stats #3716
+(lì innescato da auto-update: "parent bundle version = 846 ← app is
+now 851"; qui da elimina-senza-unregister + reinstall con la stessa
+identità).
+
+Questo **rafforza il sospetto già scritto in "Fatti stratificati"**:
+l'anomalia C (NotFound spontaneo del 22/10) è plausibilmente la stessa
+famiglia di desync, innescata dai nostri `rm -rf` + `cp -R` del
+bundle durante il turnover del demone — non un flip a caso del
+database.
+
+### Due scoperte semantiche (2/11)
+
+1. **`register` EPERM ≠ registrazione rifiutata.** L'EPERM copre solo
+   la presentazione del prompt: la registrazione **atterra comunque**
+   in `RequiresApproval`. Evidenza: subito dopo ogni register EPERMato
+   (Terminale ~17:56Z, sampler 18:04:26Z) lo status era 2. Un binario
+   nudo non sembra poter presentare il prompt nemmeno via `open`
+   (il prompt del 21/10 arrivava dall'app Tauri con step-up Regular,
+   fix `999df9a`): per la sonda l'approvazione va completata a mano
+   via toggle in Impostazioni; per l'app reale (Tauri) vale la via
+   prompt.
+2. **L'approvazione è legata al record, non all'identità — e si
+   completa a mano.** Fatta la registrazione pulita (EPERM al prompt
+   ma registrazione atterrata), lo stato era `RequiresApproval` (2):
+   l'utente ha approvato **a mano** — Impostazioni di Sistema →
+   Elementi di login, voce SMProbe ("Consenti in background") — poi
+   `status` → `Enabled` e launchd ha avviato il demone on-demand come
+   root al primo ping (`ok uid=0`). L'"allowed" del record zombie di
+   ottobre NON è stato ereditato dalla nuova registrazione: dopo un
+   unregister l'approvazione va rifatta. (La nota di RECAP §11 "con
+   l'approvazione già attiva, register va a Enabled senza nuovo
+   prompt" descrive il caso idempotente — registrazione già attiva —
+   non un'eredita attraverso unregister.)
+
+### Riparazione validata (funziona anche dallo stato rotto, senza prompt)
+
+```sh
+smprobe unregister      # SMAppService.unregister: ok anche con status=3, da Terminale
+smprobe status          # → 0 (NotRegistered): il fantasma è andato
+open ~/Applications/SMProbe.app   # il sampler ri-registra (EPERM al prompt: atteso); poi
+                                 # approva a mano: Impostazioni → Elementi di login → SMProbe ON
+```
+
+### Conseguenze per la soluzione 1 reale
+
+1. **Requisito di design (Fase 3, registrazione/UX):** l'app deve
+   rilevare `NotFound`/EPERM dopo un cambio di bundle e proporre (o
+   eseguire) unregister→register come **recovery**, con messaggio
+   chiaro — e guidare l'utente all'approvazione (prompt Touch ID se
+   l'app lo presenta, altrimenti il toggle in Impostazioni). La classe di guasto esiste su macOS 27.0 release con app
+   firmate e distribuite — non è roba da beta.
+2. Il test C/D della sonda su 27.2 è ripartito alle 18:04Z del 2/11
+   con una registrazione sana: endurance → reboot → bootout.
