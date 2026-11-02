@@ -115,6 +115,17 @@ tail -3 ~/Library/Logs/smprobe.log
 - `ping` fallisce: annota la riga di log e `sudo cat
   /Library/Logs/gp-bar/smprobe-helper.log`.
 
+**Nota sul prompt (scoperta sul campo, 2/11):** il prompt può NON
+comparire anche quando tutto funziona. Due varianti documentate:
+- `register` può tornare `Operation not permitted` riferito SOLO al
+  prompt: la registrazione **atterra comunque** (`status` →
+  `2 (RequiresApproval)` subito dopo). L'EPERM non è un rifiuto.
+- la registrazione atterrata in `RequiresApproval` va completata
+  **a mano**: Impostazioni di Sistema → Generali → Elementi di login
+  ed estensioni → attiva SMProbe in "Consenti in background". Poi
+  `status` → `1 (Enabled)` e `ping` → `ok uid=0`. (L'approvazione è
+  legata al record: dopo un unregister si rifà, non si eredita.)
+
 ## Passo 4 — endurance, il rilevatore dell'anomalia C
 
 Lascia il sampler girare per **ore** (mezza giornata o una notte è
@@ -228,6 +239,42 @@ grep -B2 -A10 -i smprobe ~/BTM-TEST/4-after-cleanup.txt  # attendersi: vuoto
 **GO:** `unregister` ok, `launchctl print` non trova più nulla, snapshot 4
 senza record. Il log del demone e `~/Library/Logs/smprobe.log` restano
 come documentazione finché non li rimuovi a mano.
+
+**Mai saltare l'unregister**: cancellare il bundle senza prima fare
+`unregister` lascia nel database BTM un record "zombie" della stessa
+identità che **blocca** le registrazioni future con `NotFound` + EPERM
+— successo davvero (2/11, vedi "Risoluzione" sotto).
+
+---
+
+## Risoluzione: `status` resta `3 (NotFound)` e `register` fa EPERM
+
+Sintomo osservato il 2/11 su macOS 27.2: installazione pulita,
+LaunchServices vede l'app, ma `status` → `3 (NotFound)` persistente,
+`register` → `Operation not permitted`, nessun prompt. Causa: nel
+database BTM era sopravvissuto il **record zombie** di una
+registrazione precedente della stessa identità, spenta cancellando il
+bundle senza `unregister` (ottobre 2026, due upgrade di OS prima). Il
+fantasma rende ambigua l'identità e SMAppService smette di risolvere
+il servizio — stesso meccanismo dell'issue exelban/stats #3716 su
+macOS 27.0 release.
+
+Riparazione (validata; funziona anche dallo stato rotto, senza prompt):
+
+```sh
+~/Applications/SMProbe.app/Contents/MacOS/smprobe unregister
+~/Applications/SMProbe.app/Contents/MacOS/smprobe status   # atteso: 0 (NotRegistered)
+pkill -f "SMProbe.app/Contents/MacOS/smprobe"
+open ~/Applications/SMProbe.app                            # il sampler ri-registra (EPERM al prompt: atteso)
+# approva a mano: Impostazioni di Sistema → Generali → Elementi di
+# login ed estensioni → SMProbe in "Consenti in background"
+~/Applications/SMProbe.app/Contents/MacOS/smprobe status   # atteso: 1 (Enabled)
+~/Applications/SMProbe.app/Contents/MacOS/smprobe ping     # atteso: ok uid=0
+```
+
+Evidenza diagnostica da documentare prima di riparare:
+`sudo sfltool dumpbtm | grep -B3 -A12 -i smprobe` (due record con UUID
+diversi per la stessa identità = zombie) e `smprobe log 20`.
 
 ---
 
