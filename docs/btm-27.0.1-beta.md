@@ -132,18 +132,21 @@ database.
    fix `999df9a`): per la sonda l'approvazione va completata a mano
    via toggle in Impostazioni; per l'app reale (Tauri) vale la via
    prompt.
-2. **L'approvazione è legata al record, non all'identità — e si
-   completa a mano.** Fatta la registrazione pulita (EPERM al prompt
-   ma registrazione atterrata), lo stato era `RequiresApproval` (2):
-   l'utente ha approvato **a mano** — Impostazioni di Sistema →
-   Elementi di login, voce SMProbe ("Consenti in background") — poi
-   `status` → `Enabled` e launchd ha avviato il demone on-demand come
-   root al primo ping (`ok uid=0`). L'"allowed" del record zombie di
-   ottobre NON è stato ereditato dalla nuova registrazione: dopo un
-   unregister l'approvazione va rifatta. (La nota di RECAP §11 "con
-   l'approvazione già attiva, register va a Enabled senza nuovo
-   prompt" descrive il caso idempotente — registrazione già attiva —
-   non un'eredita attraverso unregister.)
+2. **`RequiresApproval` si completa a mano in Impostazioni.** Fatta la
+   registrazione pulita (EPERM al prompt ma registrazione atterrata),
+   lo stato era `RequiresApproval` (2): l'utente ha approvato **a
+   mano** il toggle "Consenti in background" (Impostazioni di Sistema
+   → Elementi di login, voce SMProbe) → `status` → `Enabled` e launchd
+   ha avviato il demone on-demand come root al primo ping
+   (`ok uid=0`).
+   [Corretto il 3/11: l'approvazione NON è per-record come prima
+   ipotizzato — il toggle "Consenti in background" **sopravvive
+   all'unregister** e le registrazioni successive lo ereditano: una
+   unregister→register del 3/11 è andata dritta a `Enabled` senza
+   ri-approvazione e con `register: ok` (nessun EPERM: nessun prompt
+   necessario). Il 2/11 servì il toggle manuale perché la voce era
+   nata spenta con la scansione fresca, non perché l'approvazione non
+   possa persistere.]
 
 ### Riparazione validata (funziona anche dallo stato rotto, senza prompt)
 
@@ -164,3 +167,75 @@ open ~/Applications/SMProbe.app   # il sampler ri-registra (EPERM al prompt: att
    firmate e distribuite — non è roba da beta.
 2. Il test C/D della sonda su 27.2 è ripartito alle 18:04Z del 2/11
    con una registrazione sana: endurance → reboot → bootout.
+
+---
+
+## Aggiornamento 3 novembre 2026 — Fase 0 chiusa: D è riproducibile su 27.2, ma riparabile con una chiamata
+
+### Passo 4 (endurance, anomalia C): NON riprodotta
+
+47 campioni su 47 verdi (2/11 18:09Z → 3/11 08:53Z); il `grep -v`
+restituisce solo le righe dell'era-zombie. Nota onesta: il Mac ha
+dormito quasi tutta la notte (~4 ore di campionamento effettivo), ma
+ogni campione ha comunque costretto launchd a uno spawn fresco del
+demone (pid sempre diversi) e nessun flip è mai comparso. Zero
+`NotFound` post-registrazione.
+
+### Passo 5 (reboot): PASS
+
+Dopo il riavvio, senza aprire l'app: `status` → `1 (Enabled)`, `ping`
+→ `ok uid=0` con pid nato dopo il boot. BTM ha re-bootstrappato il
+job all'avvio: registrazione e approvazione sopravvivono al boot su
+27.2. Era la domanda lasciata aperta il 22/10.
+
+### Passo 6 (bootout, anomalia D): RIPRODOTTA — ma con il recovery che a ottobre non c'era
+
+Baseline pre-bootout: `launchctl print` mostra il job (`Submitted`,
+`managed_by = com.apple.xpc.ServiceManagement`) e il legame esplicito
+`BTM uuid = 951890E3…` verso il record del demone nel dumpbtm. Poi:
+
+1. `sudo launchctl bootout system/dev.gpbar.smprobe.helper` → tutti e
+   sei i ping (3 min) → unreachable; `launchctl print` → **"Could not
+   find service"** (il job è sparito da launchd, non solo count=0);
+   `status` resta `1 (Enabled)`; il record BTM del demone resta
+   `[enabled, allowed]` (Generation 105, "Last Use" pre-bootout —
+   BTM seguiva l'attività del demone a ogni spawn). Stato ibrido
+   BTM-sì/launchd-no, nessun re-bootstrap spontaneo. **D confermata
+   anche su 27.2.**
+2. **Recovery scoperto: basta una `register()`.** Da Terminale:
+   `register` → **`register: ok — status=1 (Enabled)`** (approvazione
+   già attiva → nessun prompt → nessun EPERM) e al ping successivo il
+   demone è vivo con pid nuovo: smd ha re-sottomesso il job. Il
+   sampler non lo aveva fatto perché registra solo con `status==0` —
+   la D si presenta come `Enabled`, quindi il retry non scatta.
+   **Lezione di design: per l'app reale il retry va innescato da
+   "unreachable", non da `status==0`.**
+3. Secondo esperimento (unregister → register dal sampler): dritta a
+   `Enabled` **senza ri-approvazione** — il toggle "Consenti in
+   background" è rimasto attivo attraverso l'unregister (correzione
+   sopra) — con `register=ok` nel log; cold restart confermati (ping
+   ogni >60 s → pid sempre diversi; print: `state = running`).
+
+**Differenza chiave vs 26A434**: lì il re-register dopo il bootout
+non rimetteva MAI in moto il job ("nessun unregister/register
+successivo ha sanato", §D di questa nota). Su 27.2 la stessa chiamata
+lo risana al primo colpo. D passa da muro a guasto riparabile con
+una chiamata.
+
+### Esito Fase 0 e requisiti per la soluzione 1
+
+- **C: non riprodotta** su 27.2 (endurance + reboot).
+- **D: riprodotta ma riparabile** → requisito **R1**: l'app fa
+  self-healing (helper unreachable + `status==Enabled` → richiama
+  `register()` → job torna; nessuna interazione utente).
+- **Zombie (2/11)** → requisito **R2**: dopo cambio bundle, se
+  `NotFound`/EPERM → unregister→register con eventuale guida
+  all'approvazione.
+- **Prima installazione** → requisito **R3**: register dalla UI
+  dell'app (prompt Touch ID, politica Regular, fix `999df9a`) con
+  fallback documentato al toggle in Impostazioni.
+- **GO per la Fase 1** (trasporto XPC ricostruito da main), con la
+  soluzione 3 in produzione come fallback perenne.
+- Curiosità forense: il record zombie dell'app (UUID 6508D9DE,
+  ottobre) persiste nel dumpbtm anche dopo i register/unregister di
+  questi giorni — innocuo finora, documentato.

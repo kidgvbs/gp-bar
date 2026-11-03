@@ -519,3 +519,25 @@ Il posizionamento non veniva **mai** eseguito: non era un problema di set_positi
 **Il resto in breve**: `AppContext::update_config` chokepoint (clone → applica → salva → commit solo se il save riesce; no-op se nulla cambia) — `harvest_gateway`/`learn_gateway_host` mutavano senza la disciplina clone-first (N10); config load onesto `Loaded::{Fresh,FromDisk,Unreadable}` — un file illeggibile non viene **mai** sovrascritto (save no-op + avviso), `.corrupt` con timestamp (N7); errori tipizzati `AdminError`/`ActionError` sul wire `{kind, detail}`, testi byte-identici (N14); `place_panel` pura con i numeri veri dell'incidente §13 (N15); stato pubblicato su `tokio::sync::watch` — nessun listener sotto lock, per costruzione (N11); `libc::proc_pidpath` + `Pid(NonZeroI32)` "parse, don't validate" (N12); command mutanti async con `spawn_blocking` (N13); `setup-admin.sh` verifica firma e Team ID delle sorgenti prima di copiare (N6); CI `--locked` + azioni SHA-pinnate + ubuntu-24.04 (N5); repair refusal elenca i server registrati (N9a).
 
 **Coalescing dichiarato**: il watch può saltare stati transitori tra due letture — accettato per design; `wait_out_disconnecting` legge `snapshot()` e non dipende dagli eventi.
+
+---
+
+## 20. Fase 0 della ripresa soluzione 1 (2–3/11, macOS 27.2 26B123): D è reale ma riparabile — GO per la Fase 1
+
+Sonda SMProbe v2 (crate `smprobe/` sul branch, identità propria
+`dev.gpbar.smprobe`, demone root on-demand con idle-exit a 60 s),
+protocollo GO/NO-GO del `docs/btm-27.0.1-beta.md` eseguito su macOS
+27.2 (26B123) — un OS diverso dalla beta 26A434 dove nacquero le
+anomalie.
+
+**Lo zombie BTM (2/11)**: installazione pulita bloccata su `NotFound` + EPERM senza prompt. Causa trovata con `sfltool dumpbtm`: nel database sopravviveva la registrazione di ottobre della stessa identità, spenta il 22/10 cancellando i bundle **senza** `unregister` (due upgrade di OS prima) — due record per `dev.gpbar.smprobe` con UUID diversi. Stessa classe dell'issue exelban/stats #3716 (macOS 27.0 release, record che punta al bundle precedente). Riparato con `unregister` anche dallo stato rotto. Due scoperte semantiche: (1) `register` EPERM ≠ rifiuto — copre solo il prompt, la registrazione atterra comunque in `RequiresApproval`; (2) il toggle "Consenti in background" sopravvive all'unregister e le registrazioni successive lo ereditano (confermato il 3/11: unregister→register dritta a `Enabled` senza ri-approvazione). Forensica completa nel doc BTM (aggiornamenti 2–3/11).
+
+**Anomalia C: non riprodotta.** 47/47 campioni verdi (2/11 18:09Z → 3/11 08:53Z; il Mac ha dormito la notte, ~4 ore effettive — ogni campione comunque con spawn fresco del demone).
+
+**Reboot: PASS.** Registrazione e approvazione sopravvivono al boot; job re-bootstrappato da BTM all'avvio (pid post-boot, `uid=0`), senza aprire l'app. Chiudeva la domanda lasciata aperta il 22/10.
+
+**Anomalia D: RIPRODOTTA — ma stavolta con il recovery.** Dopo `launchctl bootout`: 6/6 ping unreachable, job **sparito** da launchd ("Could not find service"), `status` resta `1 (Enabled)`, record BTM intatto (`enabled, allowed`) — stato ibrido senza re-bootstrap spontaneo. Ma `SMAppService.register()` da Terminale → `register: ok` (nessun prompt necessario) → demone vivo al ping successivo: **una chiamata risana**. Su 26A434 la stessa chiamata non risanava; su 27.2 D passa da muro a guasto riparabile.
+
+**Requisiti di design nati dalla Fase 0** (entrano nel piano delle fasi): **R1** self-healing — l'app rileva "helper unreachable + status Enabled" e richiama `register()` (il gancio è l'unreachable, NON `status==0`: la D si presenta come Enabled, e il sampler della sonda che registrava solo su 0 non ha mai innescato il retry); **R2** recovery zombie post-cambio-bundle (NotFound/EPERM → unregister→register + guida all'approvazione); **R3** UX di approvazione alla prima installazione (prompt Touch ID da Tauri con politica Regular — fix `999df9a` — fallback documentato al toggle in Impostazioni).
+
+**Verdetto: GO per la Fase 1** (trasporto XPC ricostruito da main, branch dedicato), con la soluzione 3 saldamente in produzione come fallback perenne. Commit della sonda sul branch: `d539fb1`, `7b49947`, `0b08646` (locali finché la fase non chiude, scelta dell'utente).
