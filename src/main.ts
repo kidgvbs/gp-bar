@@ -306,7 +306,7 @@ async function refreshHelperOverview() {
     );
   } else if (overview.elevation !== "xpc") {
     setHelperExplanation(
-      "Switch the transport to the SMAppService daemon to manage the helper.",
+      "Transport is sudo — the registration below is independent and stays dormant until the transport switches to XPC.",
     );
   } else {
     setHelperExplanation(null);

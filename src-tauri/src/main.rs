@@ -742,13 +742,16 @@ async fn helper_register() -> Result<String, String> {
 }
 
 /// Read the daemon status after a register attempt and turn it into the
-/// command's `Result`: `Ok("Enabled")` when it landed, otherwise an error
-/// naming the actual status (the register may have shown the prompt but
-/// still not enabled the daemon). macOS-only (calls [`smapp::read_status`]).
+/// command's `Result`: `Ok` when the registration landed — `Enabled`, or
+/// `RequiresApproval`, which is the **normal first-time landing** (the
+/// register worked; the human's approval in System Settings is the next
+/// step, and the refreshed overview shows that guidance) — `Err` otherwise,
+/// naming the actual status (a register that never landed: NotRegistered,
+/// NotFound, Unknown). macOS-only (calls [`smapp::read_status`]).
 #[cfg(target_os = "macos")]
 fn register_outcome() -> Result<String, String> {
     let status = gp_bar::smapp::read_status();
-    if status == gp_bar::smapp::ENABLED {
+    if status == gp_bar::smapp::ENABLED || status == gp_bar::smapp::REQUIRES_APPROVAL {
         Ok(gp_bar::smapp::decode(status))
     } else {
         Err(format!(
