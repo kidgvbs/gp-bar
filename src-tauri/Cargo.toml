@@ -56,7 +56,13 @@ window-vibrancy = "0.8.1"
 # objc2-foundation supplies NSProcessInfo for the runtime OS-version check.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc2-app-kit", "WKWebView"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSProcessInfo"] }
+# NSString: smapp.rs builds the daemon plist name as an NSString.
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSProcessInfo", "NSString"] }
+# SMAppService (register/unregister/status) for the daemon, and the `Retained`
+# return type smapp.rs names. Pinned like the Fase-0 probe module (the only
+# provenance for the call shapes): objc2 0.6.5 is already the graph's version.
+objc2 = "=0.6.5"
+objc2-service-management = "=0.3.2"
 block2 = "=0.6.2"
 
 [profile.release]
