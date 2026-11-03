@@ -403,6 +403,8 @@ pub fn generate_daemon_plist() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use super::*;
 
     #[test]
@@ -657,5 +659,50 @@ mod tests {
         // A relative program path: no absolute bundle location leaks in.
         assert!(!plist.contains("/Applications"));
         assert!(!plist.contains("Program</key><string>/"));
+    }
+
+    /// The checked-in plist file is byte-identical to what `generate_daemon_plist()`
+    /// produces — any drift (a changed constant, a formatting change in the
+    /// generator) turns this red and must update both atomically.
+    #[test]
+    fn static_plist_matches_the_generator_byte_for_byte() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let static_path = manifest_dir.join("scripts/dev.gpbar.helper.plist");
+        let on_disk =
+            fs::read_to_string(&static_path).expect("static plist file must be readable");
+        let generated = generate_daemon_plist();
+        assert_eq!(
+            on_disk, generated,
+            "the checked-in plist at {} is not byte-identical to generate_daemon_plist() — update both",
+            static_path.display()
+        );
+    }
+
+    /// The tauri.conf.json files-map entries for the daemon plist and the
+    /// helper binary are exactly what the code expects. A drift here would
+    /// silently mis-package the daemon without the build noticing.
+    #[test]
+    fn tauri_conf_maps_the_daemon_files_to_the_expected_paths() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let conf_path = manifest_dir.join("tauri.conf.json");
+        let raw = fs::read_to_string(&conf_path).expect("tauri.conf.json must be readable");
+        let conf: serde_json::Value =
+            serde_json::from_str(&raw).expect("tauri.conf.json must be valid JSON");
+        let files = conf["bundle"]["macOS"]["files"]
+            .as_object()
+            .expect("bundle.macOS.files must be a map");
+        // The plist key is verbatim "Library/LaunchDaemons/" + DAEMON_PLIST.
+        let expected_plist_key = format!("Library/LaunchDaemons/{DAEMON_PLIST}");
+        assert_eq!(
+            files[&expected_plist_key].as_str(),
+            Some("scripts/dev.gpbar.helper.plist"),
+            "plist destination key must be {expected_plist_key:?}"
+        );
+        // The binary key is verbatim "MacOS/gp-helper".
+        assert_eq!(
+            files["MacOS/gp-helper"].as_str(),
+            Some("target/release/gp-helper"),
+            "binary destination key must be \"MacOS/gp-helper\""
+        );
     }
 }

@@ -43,6 +43,12 @@
     "resources": {
       "scripts/gp-admin": "scripts/gp-admin",
       "scripts/setup-admin.sh": "scripts/setup-admin.sh"
+    },
+    "macOS": {
+      "files": {
+        "Library/LaunchDaemons/dev.gpbar.helper.plist": "scripts/dev.gpbar.helper.plist",
+        "MacOS/gp-helper": "target/release/gp-helper"
+      }
     }
   }
 }
