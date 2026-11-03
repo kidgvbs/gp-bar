@@ -136,12 +136,9 @@ impl HelperReply {
         if reply.ok {
             Ok(reply)
         } else {
-            Err(ReplyError::Refused(
-                reply
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "the privileged helper reported a failure".to_string()),
-            ))
+            Err(ReplyError::Refused(reply.error.clone().unwrap_or_else(
+                || "the privileged helper reported a failure".to_string(),
+            )))
         }
     }
 }
@@ -187,7 +184,9 @@ pub fn decide(op: Option<&str>, peer_allowed: bool) -> Decision {
         Some(_) => Decision::Refuse {
             error: "unknown operation",
         },
-        None => Decision::Refuse { error: "missing op" },
+        None => Decision::Refuse {
+            error: "missing op",
+        },
     }
 }
 
@@ -287,7 +286,12 @@ mod tests {
                 error: "unknown operation",
             }
         );
-        assert_eq!(decide(None, true), Decision::Refuse { error: "missing op" });
+        assert_eq!(
+            decide(None, true),
+            Decision::Refuse {
+                error: "missing op"
+            }
+        );
     }
 
     #[test]

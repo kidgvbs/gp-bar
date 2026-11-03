@@ -418,28 +418,38 @@ pub fn run_forever() -> ! {
 
 // -- dispatch queues ----------------------------------------------------------------
 
-/// Create a **serial** dispatch queue (review B5: every handler — listener
-/// accept, peer message, watchdog bookkeeping — is dispatched through one
-/// serial queue, so no two handlers run concurrently).
+/// A **serial** dispatch queue (review B5: every handler — listener accept,
+/// peer message, watchdog bookkeeping — is dispatched through one serial
+/// queue, so no two handlers run concurrently).
 ///
-/// Never released on purpose: the queue lives exactly as long as the daemon,
-/// and `dispatch_main` never returns, so a `Drop` could not run anyway.
-pub fn serial_queue(label: &CStr) -> XpcRaw {
-    unsafe { dispatch_queue_create(label.as_ptr(), std::ptr::null_mut()) }
+/// Owned by libdispatch for the process's whole life and deliberately never
+/// released: it must outlive every connection whose events it dispatches, and
+/// `dispatch_main` never returns. The raw handle stays private so no public
+/// function accepts a raw pointer (B8).
+#[derive(Clone, Copy)]
+pub struct SerialQueue(XpcRaw);
+
+impl SerialQueue {
+    /// Create the serial queue; the `label` is what `sample` and Instruments
+    /// show. `None` only if libdispatch cannot allocate the queue.
+    pub fn new(label: &CStr) -> Option<Self> {
+        // NULL attributes == serial (no DISPATCH_QUEUE_CONCURRENT).
+        let raw = unsafe { dispatch_queue_create(label.as_ptr(), std::ptr::null_mut()) };
+        std::ptr::NonNull::new(raw).map(|raw| Self(raw.as_ptr()))
+    }
 }
 
 impl XpcConnection {
-    /// Route this connection's events onto `queue` (the serial queue). Call
-    /// BEFORE `resume`: the header requires the target queue to be set on an
-    /// inactive connection.
-    pub fn set_target_queue(&self, queue: XpcRaw) {
-        unsafe { xpc_connection_set_target_queue(self.0.as_ptr(), queue) };
+    /// Route this connection's events onto `queue`. Call BEFORE `resume`: the
+    /// header requires the target queue to be set on an inactive connection.
+    pub fn set_target_queue(&self, queue: SerialQueue) {
+        unsafe { xpc_connection_set_target_queue(self.0.as_ptr(), queue.0) };
     }
 }
 
 impl XpcPeer<'_> {
     /// Route this accepted connection's events onto `queue`, before `accept`.
-    pub fn set_target_queue(&self, queue: XpcRaw) {
-        unsafe { xpc_connection_set_target_queue(self.raw.as_ptr(), queue) };
+    pub fn set_target_queue(&self, queue: SerialQueue) {
+        unsafe { xpc_connection_set_target_queue(self.raw.as_ptr(), queue.0) };
     }
 }

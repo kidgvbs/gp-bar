@@ -71,7 +71,10 @@ mod imp {
             None => eprintln!("gp-helper: cannot resolve the bundle owner; refusing all peers"),
         }
 
-        let queue = xpc::serial_queue(c"gp-helper.serial");
+        let Some(queue) = xpc::SerialQueue::new(c"gp-helper.serial") else {
+            eprintln!("gp-helper: cannot create the serial dispatch queue");
+            std::process::exit(1);
+        };
         let listener = match xpc::XpcConnection::listen(proto::SERVICE_C) {
             Some(listener) => listener,
             None => {
@@ -136,7 +139,11 @@ mod imp {
 
     /// Build the listener's accept handler. Separated from `run` to keep the
     /// block construction (and its captured state) auditable in one place.
-    fn new_listener_handler(owner: Option<u32>, queue: XpcRaw, state: Arc<State>) -> HandlerBlock {
+    fn new_listener_handler(
+        owner: Option<u32>,
+        queue: xpc::SerialQueue,
+        state: Arc<State>,
+    ) -> HandlerBlock {
         block2::RcBlock::new(move |raw| {
             // SAFETY: `raw` is the event libxpc passed to this listener block;
             // valid for the duration of the invocation, owned by the runtime.
@@ -236,11 +243,11 @@ mod imp {
                     env!("CARGO_PKG_VERSION"),
                     proto::OP_PING,
                 );
-                send(&event, &reply);
+                send(event, &reply);
             }
             Decision::NotImplemented => {
                 eprintln!("gp-helper: {op:?} is not implemented in the transport phase");
-                send(&event, &HelperReply::refused(proto::NOT_IMPLEMENTED));
+                send(event, &HelperReply::refused(proto::NOT_IMPLEMENTED));
             }
             Decision::Refuse { error } => refuse(event, error),
         }
