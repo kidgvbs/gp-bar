@@ -239,3 +239,34 @@ una chiamata.
 - Curiosità forense: il record zombie dell'app (UUID 6508D9DE,
   ottobre) persiste nel dumpbtm anche dopo i register/unregister di
   questi giorni — innocuo finora, documentato.
+
+## Aggiornamento 3 novembre 2026 (sera) — Passo 7: cleanup post-Fase 0, e una terza conferma di R2
+
+Sonda ritirata. `smprobe unregister` → **`status=0 (NotRegistered)`**;
+job booted out, demone terminato, bundle `~/Applications/SMProbe.app`
+rimosso. Un processo residuo è sopravvissuto al primo giro di pulizia: la
+CLI `smprobe` (partita alle 10:53, orfana su launchd) — `pkill -f
+smprobe-helper` non la matchava perché il nome è un altro; uccisa a mano
+(PID 13122). Lezione da tenere: `pkill -f` per nome esatto, o per
+percorso del bundle.
+
+Il dump post-cleanup (`~/4-after-cleanup.txt`) conferma le attese e
+aggiunge un dato:
+
+- lo **zombie 6508D9DE** persiste dopo il cleanup, come previsto
+  (Generation 1, bundle inesistente, `[disabled, allowed, notified]`) —
+  inerte e innocuo;
+- i record **v2** dei test (app #2 + helper #16, `Last Use` = il bootout
+  di oggi) permangono come **`[disabled, allowed, not notified]`** — la
+  registrazione è sparita ma **il bit "allowed" dell'approvazione
+  sopravvive all'unregister**.
+
+La seconda osservazione è la **terza conferma indipendente** del
+comportamento che fonda R2 (le prime due: theevilbit, e la register del
+3/11 atterrata dritta a `Enabled` senza ri-approvazione) — e stavolta
+osservata nel flusso di *cleanup*, non di re-register: il database BTM
+**non torna pulito** dopo unregister, i record restano lì disabilitati
+con il consenso conservato, pronti perché una `register()` futura li
+riattivi senza ri-approvazione. Il "reinstall mechanism"
+unregister→register è quindi ancora più economico del previsto: il
+consenso dell'utente è un asset persistente, non qualcosa da ri-chiedere.
