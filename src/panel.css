@@ -444,6 +444,104 @@ footer {
   background: rgba(255, 69, 58, 0.3);
 }
 
+/* -- system helper (SMAppService daemon, Fase 3b) ---------------------------- */
+
+.helper-block {
+  margin: 0 0 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.helper-block.collapsed .helper-body {
+  display: none;
+}
+
+.helper-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.helper-header .log-toggle {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  cursor: default;
+}
+
+.helper-header .log-toggle .beta-tag {
+  font-style: italic;
+  font-weight: 400;
+  opacity: 0.6;
+  font-size: 10px;
+}
+
+.helper-status {
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.helper-body {
+  padding: 0 10px 8px;
+}
+
+.helper-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.helper-label {
+  font-size: 11px;
+  opacity: 0.7;
+  min-width: 56px;
+}
+
+.helper-row select {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: inherit;
+  font-size: 11px;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.helper-row select:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+#helper-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+#helper-actions .btn.secondary {
+  font-size: 10px;
+  padding: 2px 8px;
+}
+
+/* "Confirm?" state of the helper unregister button (inline confirmation,
+   same pattern as the gateway remove button). */
+#helper-actions .btn.secondary.confirm {
+  background: rgba(255, 69, 58, 0.16);
+  color: #ff453a;
+}
+
+.helper-note {
+  font-size: 10px;
+  opacity: 0.6;
+  margin-top: 2px;
+}
+
 .hidden {
   display: none !important;
 }

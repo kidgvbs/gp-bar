@@ -366,7 +366,10 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Acti
     // Interrupt a connecting worker by booting the one-shot launchd job
     // out: launchd terminates it, which runs the worker's own teardown
     // instead of a blind kill.
-    if let Err(error) = vpn::run_admin("cancel", &[]).await {
+    // The transport the user selected (`sudo` by default). Read out of the
+    // guard in the same statement: the guard is released before the await.
+    let elevation = state.config.lock().unwrap().elevation();
+    if let Err(error) = vpn::run_admin("cancel", &[], elevation).await {
         // Not confirmed: the phase stays as it is — the poller reports the
         // truth (the worker may die anyway, the tunnel may yet come up) —
         // and the failure reaches the invoker instead of the old
@@ -598,14 +601,190 @@ async fn get_network_health(state: State<'_, AppContext>) -> Result<vpn::Network
 /// hint is folded in server-side): the frontend receives `{kind, detail}`
 /// and maps it back to the Display texts.
 #[tauri::command]
-async fn repair_network(app: AppHandle) -> Result<String, vpn::AdminError> {
+async fn repair_network(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+) -> Result<String, vpn::AdminError> {
     // Refuses loudly while the VPN is up — see `gp-admin repair`. Serialized
     // with the other privileged ops (see ADMIN_OPS) so its networksetup
     // writes never interleave with a stop's teardown.
     let _guard = vpn::ADMIN_OPS.lock().await;
-    match vpn::run_admin("repair", &[]).await {
+    let elevation = state.config.lock().unwrap().elevation();
+    match vpn::run_admin("repair", &[], elevation).await {
         Ok(message) => Ok(message),
         Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), error)),
+    }
+}
+
+// -- system helper (SMAppService daemon, xpc transport, Fase 3b) ---------------
+
+/// Overview of the SMAppService daemon for the "System helper (beta)" section.
+///
+/// Returns `{ status, status_name, in_bundle, helper_available, elevation }`
+/// — a read-only snapshot the frontend renders without any side effect.
+/// `helper_available` is whether the SMAppService machinery exists at all
+/// (macOS only); `in_bundle` is whether this run is the bundled app (a dev
+/// build sitting in target/debug cannot register the daemon). Off macOS
+/// both are false and the panel shows "not available on this platform".
+#[tauri::command]
+async fn get_helper_overview(app: AppHandle) -> serde_json::Value {
+    // `AppHandle` is an owned handle (no borrow), so this async command can
+    // return a plain value; the elevation is read once here and moved into
+    // the blocking closure / the non-macOS branch.
+    let elevation = app
+        .state::<AppContext>()
+        .config
+        .lock()
+        .unwrap()
+        .elevation()
+        .to_string();
+    #[cfg(target_os = "macos")]
+    // `read_status` is a runtime SMAppService call — keep it off the async
+    // worker, like every other blocking command.
+    let result = tokio::task::spawn_blocking(move || {
+        let raw = gp_bar::smapp::read_status();
+        let in_bundle = gp_bar::peer::current_bundle_root().is_some();
+        serde_json::json!({
+            "status": raw,
+            "status_name": gp_bar::smapp::decode(raw),
+            "in_bundle": in_bundle,
+            "helper_available": true,
+            "elevation": elevation,
+        })
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("get_helper_overview: spawn_blocking failed: {error}");
+        serde_json::json!({
+            "status": null,
+            "status_name": "unavailable",
+            "in_bundle": false,
+            "helper_available": false,
+            "elevation": "sudo",
+        })
+    });
+    #[cfg(not(target_os = "macos"))]
+    let result = serde_json::json!({
+        "status": null,
+        "status_name": "unavailable",
+        "in_bundle": false,
+        "helper_available": false,
+        "elevation": elevation,
+    });
+    result
+}
+
+/// Change the privileged transport in the config: `"sudo"` (the v1.2.0
+/// wrapper path) or `"xpc"` (the SMAppService daemon). The frontend
+/// guards — only `"sudo"` ↔ `"xpc"` is reachable, but the command
+/// validates anyway and refuses unknowns.
+#[tauri::command]
+async fn helper_set_elevation(app: AppHandle, value: String) -> Result<(), String> {
+    if value != "sudo" && value != "xpc" {
+        return Err(format!("unknown elevation: {value}"));
+    }
+    tokio::task::spawn_blocking(move || {
+        app.state::<AppContext>().update_config(|cfg| {
+            cfg.elevation = value;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(())
+}
+
+/// Register the SMAppService daemon — the explicit R3 gesture from the UI.
+/// The user clicks "Register" in the panel; this calls `SMAppService::register`
+/// and may present the system approval prompt (Touch ID), so it runs on the
+/// blocking pool. Off macOS, or outside a bundle (dev build), it errors out.
+///
+/// Returns the final decoded status name (`"Enabled"`) when registration
+/// landed; otherwise an error, with the R2 fallback for a stale bundle path:
+/// `register()` err → re-read status → `NotFound` → `unregister()` (logged,
+/// not fatal) → `register()` once more — the same shape as the path-op R2.
+#[tauri::command]
+async fn helper_register() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        tokio::task::spawn_blocking(|| {
+            if gp_bar::peer::current_bundle_root().is_none() {
+                return Err("helper registration requires the bundled app".to_string());
+            }
+            match gp_bar::smapp::register() {
+                Ok(()) => register_outcome(),
+                Err(first) => {
+                    // R2 fallback: a stale path leaves the status NotFound
+                    // even after a failed register — unregister + one retry.
+                    if gp_bar::smapp::read_status() == gp_bar::smapp::NOT_FOUND {
+                        if let Err(e) = gp_bar::smapp::unregister() {
+                            log::warn!("helper_register R2 unregister failed: {e}");
+                        }
+                        if let Err(e) = gp_bar::smapp::register() {
+                            return Err(format!(
+                                "re-register failed: {e} (first attempt: {first})"
+                            ));
+                        }
+                        register_outcome()
+                    } else {
+                        Err(first)
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("SMAppService is only available on macOS".to_string())
+    }
+}
+
+/// Read the daemon status after a register attempt and turn it into the
+/// command's `Result`: `Ok` when the registration landed — `Enabled`, or
+/// `RequiresApproval`, which is the **normal first-time landing** (the
+/// register worked; the human's approval in System Settings is the next
+/// step, and the refreshed overview shows that guidance) — `Err` otherwise,
+/// naming the actual status (a register that never landed: NotRegistered,
+/// NotFound, Unknown). macOS-only (calls [`smapp::read_status`]).
+#[cfg(target_os = "macos")]
+fn register_outcome() -> Result<String, String> {
+    let status = gp_bar::smapp::read_status();
+    if status == gp_bar::smapp::ENABLED || status == gp_bar::smapp::REQUIRES_APPROVAL {
+        Ok(gp_bar::smapp::decode(status))
+    } else {
+        Err(format!(
+            "registration did not enable the daemon (status: {})",
+            gp_bar::smapp::status_line(status)
+        ))
+    }
+}
+
+/// Unregister the SMAppService daemon. Blocks on the daemon call, so it runs
+/// on the blocking pool. Off macOS returns an error immediately.
+#[tauri::command]
+async fn helper_unregister() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        tokio::task::spawn_blocking(gp_bar::smapp::unregister)
+            .await
+            .map_err(|error| error.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("SMAppService is only available on macOS".to_string())
+    }
+}
+
+/// Open System Settings → General → Login Items & Extensions, where the
+/// user can approve the daemon if it's stuck in RequiresApproval.
+/// Off macOS this is a no-op (no settings panel to open).
+#[tauri::command]
+fn open_login_items_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        gp_bar::smapp::open_system_settings();
     }
 }
 
@@ -671,7 +850,8 @@ async fn do_connect(
     // No focus bookkeeping around the admin call: the helper is NOPASSWD so
     // no dialog steals the panel's focus mid-operation; popover hide-on-blur
     // (see `on_window_event`) behaves normally during connects.
-    let result = vpn::run_admin("start", &args).await;
+    let elevation = state.config.lock().unwrap().elevation();
+    let result = vpn::run_admin("start", &args, elevation).await;
     match result {
         Ok(_) => {
             // The start is confirmed: the launchd job now exists and belongs
@@ -703,7 +883,8 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     let _guard = vpn::ADMIN_OPS.lock().await;
     // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
     // helper never raises a dialog, so hide-on-blur stays in effect.
-    let result = vpn::run_admin("stop", &[]).await;
+    let elevation = state.config.lock().unwrap().elevation();
+    let result = vpn::run_admin("stop", &[], elevation).await;
     if let Err(error) = result {
         log::warn!("disconnect failed: {error}");
         let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
@@ -1355,7 +1536,12 @@ fn main() {
             disconnect,
             reconnect,
             cancel,
-            quit
+            quit,
+            get_helper_overview,
+            helper_set_elevation,
+            helper_register,
+            helper_unregister,
+            open_login_items_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running gp-bar");
