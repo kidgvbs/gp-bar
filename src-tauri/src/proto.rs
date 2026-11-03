@@ -50,7 +50,11 @@ pub const DAEMON_IDLE_EXIT_SECS: u64 = 60;
 /// `scripts/setup-admin.sh`). It is the security boundary: validated args, a
 /// root-only prefix and launchd discipline all live inside it, so neither
 /// transport reimplements any of it.
-pub const ADMIN_SCRIPT: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
+///
+/// Defined at the crate root — cross-platform, because the sudo path
+/// aliases it from code the Linux CI compiles — and re-exported here so
+/// the daemon keeps its one `proto::` namespace.
+pub use crate::ADMIN_SCRIPT;
 
 /// How long the daemon waits for one [`ADMIN_SCRIPT`] run before SIGKILLing
 /// it and refusing the op.

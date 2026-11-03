@@ -1242,10 +1242,11 @@ fn parse_service_for_device(output: &str, device: &str) -> Option<String> {
 /// that path is system-owned, unlike a /usr/local prefix that Homebrew
 /// chowns to the user on Intel Macs.
 ///
-/// An alias of [`gp_bar::proto::ADMIN_SCRIPT`] since Fase 2: the XPC daemon
-/// execs the very same file, so the canonical constant lives with the
-/// protocol and this name stays for the sudo path's call sites.
-pub const ADMIN_WRAPPER: &str = gp_bar::proto::ADMIN_SCRIPT;
+/// An alias of [`gp_bar::ADMIN_SCRIPT`] since Fase 2: the XPC daemon
+/// execs the very same file, so the canonical constant lives at the crate
+/// root (cross-platform) and this name stays for the sudo path's call
+/// sites.
+pub const ADMIN_WRAPPER: &str = gp_bar::ADMIN_SCRIPT;
 
 /// The gpclient the admin wrapper actually executes (installed by the setup
 /// script under the same root-owned prefix as `ADMIN_WRAPPER`). The version
