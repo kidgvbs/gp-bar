@@ -44,6 +44,34 @@ pub const ENABLED: isize = 1;
 pub const REQUIRES_APPROVAL: isize = 2;
 pub const NOT_FOUND: isize = 3;
 
+/// What the heal path should do, decided from a raw status alone (pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealAction {
+    /// The status is not a healable signature — return the original error.
+    None,
+    /// ENABLED + Unreachable = anomaly D: try a single re-register (R1).
+    ReRegister,
+    /// NOT_FOUND: the bundle path changed (or this is a fresh install in a
+    /// new location) — unregister the old record and re-register (R2).
+    Reinstall,
+}
+
+/// The shared, pure decision: maps a raw SMAppServiceStatus to the heal
+/// action both the path-op R1/R2 logic and the register command use.
+///
+/// * `ENABLED` → `ReRegister` (anomaly D).
+/// * `NOT_FOUND` → `Reinstall` (bundle changed location — exelban/stats case).
+/// * Everything else (`NOT_REGISTERED`, `REQUIRES_APPROVAL`, `Unknown`) →
+///   `None`: `RequiresApproval` is approval territory (hint, never
+///   automatic register); `NotRegistered` needs the explicit R3 gesture.
+pub fn heal_action(raw: isize) -> HealAction {
+    match raw {
+        ENABLED => HealAction::ReRegister,
+        NOT_FOUND => HealAction::Reinstall,
+        _ => HealAction::None,
+    }
+}
+
 /// The daemon service of this app's bundle: the plist name, resolved against
 /// `Contents/Library/LaunchDaemons` by ServiceManagement.
 fn daemon_service() -> Retained<SMAppService> {
@@ -74,6 +102,13 @@ pub fn unregister() -> Result<(), String> {
     }
 }
 
+/// Opens System Settings → General → Login Items & Extensions, the panel
+/// where the user can approve the daemon. Class method on `SMAppService`
+/// (objc2-service-management 0.3.2: `+openSystemSettingsLoginItems`).
+pub fn open_system_settings() {
+    unsafe { SMAppService::openSystemSettingsLoginItems() };
+}
+
 /// Decode a raw status into a stable name. Unknown values (including negative
 /// ones or anything a future SDK adds) stay visible.
 pub fn decode(raw: isize) -> String {
@@ -97,13 +132,10 @@ pub fn status_line(raw: isize) -> String {
 /// reports the service enabled (RECAP §20/§22) — the one case a single
 /// re-register can repair.
 ///
-/// Every other status is somebody else's territory: `NOT_REGISTERED` and
-/// `REQUIRES_APPROVAL` need R3's install/consent flow, `NOT_FOUND` means the
-/// bundle does not ship the plist yet (Fase 3b), and `Unknown(raw)` is an SDK
-/// surprise where a retry would only add noise or an unwanted prompt. Those
-/// are R2/R3 (Fase 3b), so they answer `false` here.
+/// Delegates to [`heal_action`] for the decision: `ReRegister` is the only
+/// case where a single re-register is the right thing.
 pub fn should_self_heal(raw: isize) -> bool {
-    raw == ENABLED
+    heal_action(raw) == HealAction::ReRegister
 }
 
 #[cfg(test)]
@@ -147,5 +179,20 @@ mod tests {
                 if raw == ENABLED { "" } else { "not" }
             );
         }
+    }
+
+    #[test]
+    fn heal_action_matrix_covers_every_known_and_unknown_status() {
+        // 0: NotRegistered → None (needs the explicit R3 gesture)
+        assert_eq!(heal_action(NOT_REGISTERED), HealAction::None);
+        // 1: Enabled → ReRegister (anomaly D, R1)
+        assert_eq!(heal_action(ENABLED), HealAction::ReRegister);
+        // 2: RequiresApproval → None (approval territory, hint only)
+        assert_eq!(heal_action(REQUIRES_APPROVAL), HealAction::None);
+        // 3: NotFound → Reinstall (bundle path changed, R2)
+        assert_eq!(heal_action(NOT_FOUND), HealAction::Reinstall);
+        // 4, -1: Unknown → None
+        assert_eq!(heal_action(4), HealAction::None);
+        assert_eq!(heal_action(-1), HealAction::None);
     }
 }
