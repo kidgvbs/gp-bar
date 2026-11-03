@@ -12,8 +12,8 @@
 >
 > Le scoperte empiriche nostre (Fase 0) sono in `docs/btm-27.0.1-beta.md`
 > (aggiornamenti 2–3/11) e RECAP §20; i requisiti di design R1–R3 e la
-> mappa B1–B11 della review sono in `gp-bar-review-smappservice.md`.
-> Fonti primarie in coda.
+> mappa B1–B11 della review del branch parked sono in un documento di
+> lavoro locale non tracciato nel repo. Fonti primarie in coda.
 
 ## 1. exelban/stats — il caso più vicino al nostro (open source, Swift)
 
