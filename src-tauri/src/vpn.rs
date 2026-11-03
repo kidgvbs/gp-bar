@@ -1241,7 +1241,11 @@ fn parse_service_for_device(output: &str, device: &str) -> Option<String> {
 /// is root-owned under /Library/PrivilegedHelperTools: every parent of
 /// that path is system-owned, unlike a /usr/local prefix that Homebrew
 /// chowns to the user on Intel Macs.
-pub const ADMIN_WRAPPER: &str = "/Library/PrivilegedHelperTools/gp-bar/admin";
+///
+/// An alias of [`gp_bar::proto::ADMIN_SCRIPT`] since Fase 2: the XPC daemon
+/// execs the very same file, so the canonical constant lives with the
+/// protocol and this name stays for the sudo path's call sites.
+pub const ADMIN_WRAPPER: &str = gp_bar::proto::ADMIN_SCRIPT;
 
 /// The gpclient the admin wrapper actually executes (installed by the setup
 /// script under the same root-owned prefix as `ADMIN_WRAPPER`). The version
@@ -1338,7 +1342,7 @@ pub async fn run_admin(
 ) -> Result<String, AdminError> {
     match transport_for(elevation) {
         AdminTransport::Sudo => run_admin_sudo(op, args).await,
-        AdminTransport::Xpc => run_admin_xpc(op).await,
+        AdminTransport::Xpc => run_admin_xpc(op, args).await,
     }
 }
 
@@ -1409,11 +1413,13 @@ async fn run_admin_sudo(op: &'static str, args: &[&str]) -> Result<String, Admin
 /// is awaited from Tauri commands, and parking a runtime worker for up to
 /// `ADMIN_OP_TIMEOUT` would starve the rest of the app.
 ///
-/// Transport phase only: the protocol carries the operation name and nothing
-/// else (the daemon refuses every privileged op), so `args` stay on the sudo
-/// path until Fase 3 adds them to the request dictionary.
-async fn run_admin_xpc(op: &'static str) -> Result<String, AdminError> {
-    tokio::task::spawn_blocking(move || call_helper(op))
+/// `args` are carried in the request (`KEY_ARGS`) exactly like the sudo path
+/// passes them on the command line: same values, same script, validated again
+/// by the daemon ([`gp_bar::proto::validate_op`]) and then by the script.
+async fn run_admin_xpc(op: &'static str, args: &[&str]) -> Result<String, AdminError> {
+    // Owned so the blocking task does not borrow the caller's slice.
+    let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || call_helper(op, &args))
         .await
         .map_err(|error| AdminError::Failed {
             op,
@@ -1422,7 +1428,7 @@ async fn run_admin_xpc(op: &'static str) -> Result<String, AdminError> {
 }
 
 #[cfg(target_os = "macos")]
-fn call_helper(op: &'static str) -> Result<String, AdminError> {
+fn call_helper(op: &'static str, args: &[String]) -> Result<String, AdminError> {
     use std::sync::mpsc;
 
     use gp_bar::proto::{self, HelperReply, ReplyError};
@@ -1433,6 +1439,7 @@ fn call_helper(op: &'static str) -> Result<String, AdminError> {
 
     let message = XpcObject::dict_new();
     message.set_string(proto::KEY_OP, op);
+    message.set_string_array(proto::KEY_ARGS, args);
 
     let (tx, rx) = mpsc::channel::<Result<HelperReply, ReplyError>>();
     let reply_block: HandlerBlock = block2::RcBlock::new(move |raw| {
@@ -1451,16 +1458,18 @@ fn call_helper(op: &'static str) -> Result<String, AdminError> {
     // and released, so a timed-out call leaks neither.
 
     match rx.recv_timeout(ADMIN_OP_TIMEOUT) {
-        Ok(Ok(reply)) => Ok(format!(
-            "{op}: ok (helper uid={}, pid={}, version={})",
-            reply.uid, reply.pid, reply.version
-        )),
+        // The daemon ran the script: `out` is its stdout, the same `Ok(String)`
+        // contract the sudo path returns.
+        Ok(Ok(reply)) => Ok(reply.out),
         // A dropped sender and a connection error event are the same fact:
         // nothing is answering on the other end.
         Ok(Err(ReplyError::Unreachable)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err(AdminError::Unreachable { op })
         }
         Ok(Err(ReplyError::Refused(stderr))) => Err(AdminError::Failed { op, stderr }),
+        // Deliberately `Failed`, never `Unreachable` (Review Fase 1, note 1,
+        // see `ReplyError::Malformed`): the daemon answered, so "re-register
+        // the service" (R1, Fase 3) is the wrong repair.
         Ok(Err(ReplyError::Malformed)) => Err(AdminError::Failed {
             op,
             stderr: format!("unexpected reply from the privileged helper ({op})"),
@@ -1472,7 +1481,7 @@ fn call_helper(op: &'static str) -> Result<String, AdminError> {
 /// Every other platform (Linux CI) has no XPC transport: report the daemon as
 /// unreachable rather than pretending the op ran.
 #[cfg(not(target_os = "macos"))]
-fn call_helper(op: &'static str) -> Result<String, AdminError> {
+fn call_helper(op: &'static str, _args: &[String]) -> Result<String, AdminError> {
     Err(AdminError::Unreachable { op })
 }
 
