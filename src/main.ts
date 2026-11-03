@@ -194,6 +194,10 @@ function adminErrorText(error: KindedError): string {
       return `The privileged helper is not installed. One-time setup (Terminal):\n  sudo bash '${detail.setup_script}'`;
     case "Timeout":
       return `admin op '${detail.op}' timed out`;
+    // AdminError::Unreachable: the SMAppService daemon did not answer — not a
+    // missing setup, so it must not borrow the NotInstalled hint.
+    case "Unreachable":
+      return `the privileged SMAppService daemon is unreachable (op '${detail.op}')`;
     // AdminError::Failed: the wrapper's stderr verbatim.
     default:
       return String(detail.stderr);
