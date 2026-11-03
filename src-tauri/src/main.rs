@@ -654,10 +654,7 @@ fn get_helper_overview(state: State<'_, AppContext>) -> serde_json::Value {
 /// guards — only `"sudo"` ↔ `"xpc"` is reachable, but the command
 /// validates anyway and refuses unknowns.
 #[tauri::command]
-async fn helper_set_elevation(
-    app: AppHandle,
-    value: String,
-) -> Result<(), String> {
+async fn helper_set_elevation(app: AppHandle, value: String) -> Result<(), String> {
     if value != "sudo" && value != "xpc" {
         return Err(format!("unknown elevation: {value}"));
     }

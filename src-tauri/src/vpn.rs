@@ -1317,9 +1317,7 @@ pub enum AdminError {
     /// `detail` is a human-readable suffix appended by [`admin_error_hint_for`]
     /// when the SMAppService status is known (e.g. "status: Not Found").
     /// When empty, the display is the bare op line.
-    #[error(
-        "the privileged SMAppService daemon is unreachable (op '{op}'){detail}"
-    )]
+    #[error("the privileged SMAppService daemon is unreachable (op '{op}'){detail}")]
     Unreachable {
         op: &'static str,
         #[serde(default)]
@@ -1534,7 +1532,10 @@ fn call_helper(op: &'static str, args: &[String]) -> Result<String, AdminError> 
     use gp_bar::xpc::{HandlerBlock, XpcConnection, XpcEvent, XpcObject};
 
     // `None` = libxpc could not create the connection: no daemon to talk to.
-    let conn = XpcConnection::connect(proto::SERVICE_C).ok_or(AdminError::Unreachable { op, detail: String::new() })?;
+    let conn = XpcConnection::connect(proto::SERVICE_C).ok_or(AdminError::Unreachable {
+        op,
+        detail: String::new(),
+    })?;
 
     let message = XpcObject::dict_new();
     message.set_string(proto::KEY_OP, op);
@@ -1563,7 +1564,10 @@ fn call_helper(op: &'static str, args: &[String]) -> Result<String, AdminError> 
         // A dropped sender and a connection error event are the same fact:
         // nothing is answering on the other end.
         Ok(Err(ReplyError::Unreachable)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(AdminError::Unreachable { op, detail: String::new() })
+            Err(AdminError::Unreachable {
+                op,
+                detail: String::new(),
+            })
         }
         Ok(Err(ReplyError::Refused(stderr))) => Err(AdminError::Failed { op, stderr }),
         // Deliberately `Failed`, never `Unreachable` (Review Fase 1, note 1,
@@ -1581,7 +1585,10 @@ fn call_helper(op: &'static str, args: &[String]) -> Result<String, AdminError> 
 /// unreachable rather than pretending the op ran.
 #[cfg(not(target_os = "macos"))]
 fn call_helper(op: &'static str, _args: &[String]) -> Result<String, AdminError> {
-    Err(AdminError::Unreachable { op, detail: String::new() })
+    Err(AdminError::Unreachable {
+        op,
+        detail: String::new(),
+    })
 }
 
 /// The bundled setup script path inside the running app bundle.
@@ -1684,7 +1691,10 @@ mod tests {
         // Read the two setup markers into one check: an unreachable daemon must
         // survive the classification even when the sudo wrapper is absent, or
         // the user would be told to run a setup that is not their problem.
-        let raw = AdminError::Unreachable { op: "start", detail: String::new() };
+        let raw = AdminError::Unreachable {
+            op: "start",
+            detail: String::new(),
+        };
         let hint = admin_error_hint_for(false, setup, raw.clone());
         assert_eq!(hint, raw);
         assert_eq!(

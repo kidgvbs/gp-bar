@@ -668,11 +668,11 @@ mod tests {
     fn static_plist_matches_the_generator_byte_for_byte() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let static_path = manifest_dir.join("scripts/dev.gpbar.helper.plist");
-        let on_disk =
-            fs::read_to_string(&static_path).expect("static plist file must be readable");
+        let on_disk = fs::read_to_string(&static_path).expect("static plist file must be readable");
         let generated = generate_daemon_plist();
         assert_eq!(
-            on_disk, generated,
+            on_disk,
+            generated,
             "the checked-in plist at {} is not byte-identical to generate_daemon_plist() — update both",
             static_path.display()
         );
