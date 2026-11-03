@@ -1311,11 +1311,20 @@ pub enum AdminError {
     Timeout { op: &'static str },
     /// The SMAppService daemon could not be reached: no connection, or no
     /// reply within `ADMIN_OP_TIMEOUT`. Kept distinct from `Failed` on
-    /// purpose — "the daemon is not there" is the retryable class (R1 in
-    /// Fase 2 will re-register/wake the job), while `Failed` means the op ran
-    /// and refused.
-    #[error("the privileged SMAppService daemon is unreachable (op '{op}')")]
-    Unreachable { op: &'static str },
+    /// purpose — "the daemon is not there" is the retryable class (R1/R2
+    /// self-heal paths), while `Failed` means the op ran and refused.
+    ///
+    /// `detail` is a human-readable suffix appended by [`admin_error_hint_for`]
+    /// when the SMAppService status is known (e.g. "status: Not Found").
+    /// When empty, the display is the bare op line.
+    #[error(
+        "the privileged SMAppService daemon is unreachable (op '{op}'){detail}"
+    )]
+    Unreachable {
+        op: &'static str,
+        #[serde(default)]
+        detail: String,
+    },
     /// The op ran and failed. `stderr` is the wrapper's stderr verbatim —
     /// or, for the rarer shapes (sudo itself could not spawn, a non-zero
     /// exit with no stderr), the same text the old formatting produced.
@@ -1428,18 +1437,26 @@ async fn run_admin_xpc(op: &'static str, args: &[&str]) -> Result<String, AdminE
         })?
 }
 
-/// One XPC attempt plus R1 self-healing, for the single recoverable signature:
-/// the daemon is unreachable **while BTM reports the service enabled**
-/// (anomaly D — the job missing from the launchd domain although the
-/// registration claims it is there, RECAP §20/§22).
+/// One XPC attempt plus self-healing (R1 + R2), for the two recoverable
+/// signatures of an unreachable daemon:
 ///
-/// On that signature only, re-register the daemon and retry [`call_helper`]
-/// exactly ONCE; the retry's result is the op's result. Every other outcome —
-/// a non-`Unreachable` error, a status that is not `Enabled`, a failed
-/// re-register — returns the original error unchanged: `NOT_REGISTERED` /
-/// `REQUIRES_APPROVAL` are R2/R3 territory (Fase 3b), where a bare
-/// re-register would be noise or an unwanted prompt, and a `Failed` proves
-/// the op ran, so re-registering answers the wrong question.
+/// * R1 (anomaly D): `Unreachable` while the service reports `Enabled` —
+///   the job is missing from the launchd domain despite the registration
+///   claiming it is there (RECAP §20/§22). A single re-register fixes it.
+/// * R2 (bundle path changed): `Unreachable` while the service reports
+///   `Not Found` — this app was moved (or this is a fresh install in a
+///   new location). ServiceManagement holds a stale path, so we must
+///   unregister the old record before re-registering (exelban/stats case).
+///
+/// Both paths retry [`call_helper`] exactly ONCE; the retry's result is the
+/// op's result. Every other outcome — a non-`Unreachable` error, a status
+/// that is neither `Enabled` nor `Not Found`, a failed heal — returns the
+/// original error unchanged: `NotRegistered` / `RequiresApproval` need the
+/// explicit R3 gesture (register from the UI).
+///
+/// The in-bundle gate: healing only runs when the daemon lives inside an
+/// `.app` bundle (the `gp-helper` binary is at `Contents/MacOS/gp-helper`).
+/// Outside a bundle — dev builds, Linux CI — the first error stands.
 ///
 /// Blocking (both [`call_helper`] and the SMAppService calls are), so the
 /// caller keeps it on the blocking pool. Off macOS there is no SMAppService
@@ -1448,11 +1465,9 @@ async fn run_admin_xpc(op: &'static str, args: &[&str]) -> Result<String, AdminE
 /// Time budget honesty: each `call_helper` attempt stays bounded by
 /// `ADMIN_OP_TIMEOUT` (30 s), but the heal path in between is NOT —
 /// `register()` can present the system approval prompt and block on the
-/// human's answer (Touch ID), so a healing op can legitimately take longer
-/// in wall-clock than a plain one. With `Enabled` as the gate this should
-/// be prompt-free in practice (the approval persists — Fase 0), but the
-/// wall-clock bound of the whole op is "two attempts + however long the
-/// human takes".
+/// human's answer (Touch ID). With R1's `Enabled` gate the re-register is
+/// prompt-free in practice (the approval persists — Fase 0); R2's
+/// unregister+register may legitimately take longer.
 fn call_helper_with_self_heal(op: &'static str, args: &[String]) -> Result<String, AdminError> {
     let first = call_helper(op, args);
     if !matches!(&first, Err(AdminError::Unreachable { .. })) {
@@ -1460,21 +1475,48 @@ fn call_helper_with_self_heal(op: &'static str, args: &[String]) -> Result<Strin
     }
     #[cfg(target_os = "macos")]
     {
-        let status = gp_bar::smapp::read_status();
-        if !gp_bar::smapp::should_self_heal(status) {
+        // In-bundle gate: self-healing only when the daemon ships inside
+        // the .app bundle (not a dev build sitting in target/debug).
+        let in_bundle = gp_bar::peer::current_bundle_root().is_some();
+        if !in_bundle {
             return first;
         }
-        log::warn!(
-            "daemon unreachable + status {} — re-registering (anomaly D self-heal)",
-            gp_bar::smapp::status_line(status)
-        );
-        match gp_bar::smapp::register() {
-            // The ONE retry: this calls `call_helper` directly, never back
-            // into this function, so no error can ever re-enter the heal.
-            Ok(()) => call_helper(op, args),
-            Err(error) => {
-                log::warn!("self-heal re-register failed: {error}");
-                first
+        let status = gp_bar::smapp::read_status();
+        let action = gp_bar::smapp::heal_action(status);
+        match action {
+            gp_bar::smapp::HealAction::None => first,
+            gp_bar::smapp::HealAction::ReRegister => {
+                log::warn!(
+                    "daemon unreachable + status {} — re-registering (R1 anomaly D)",
+                    gp_bar::smapp::status_line(status)
+                );
+                match gp_bar::smapp::register() {
+                    Ok(()) => call_helper(op, args),
+                    Err(error) => {
+                        log::warn!("self-heal R1 re-register failed: {error}");
+                        first
+                    }
+                }
+            }
+            gp_bar::smapp::HealAction::Reinstall => {
+                log::warn!(
+                    "daemon unreachable + status {} — reinstalling (R2 bundle path changed)",
+                    gp_bar::smapp::status_line(status)
+                );
+                // Unregister the stale record, then register the new path.
+                // The ONE retry is after the register; if unregister fails
+                // we still try register (the old record might already be gone).
+                let unreg = gp_bar::smapp::unregister();
+                if let Err(ref e) = unreg {
+                    log::warn!("R2 unregister failed: {e}");
+                }
+                match gp_bar::smapp::register() {
+                    Ok(()) => call_helper(op, args),
+                    Err(error) => {
+                        log::warn!("self-heal R2 register failed: {error}");
+                        first
+                    }
+                }
             }
         }
     }
@@ -1492,7 +1534,7 @@ fn call_helper(op: &'static str, args: &[String]) -> Result<String, AdminError> 
     use gp_bar::xpc::{HandlerBlock, XpcConnection, XpcEvent, XpcObject};
 
     // `None` = libxpc could not create the connection: no daemon to talk to.
-    let conn = XpcConnection::connect(proto::SERVICE_C).ok_or(AdminError::Unreachable { op })?;
+    let conn = XpcConnection::connect(proto::SERVICE_C).ok_or(AdminError::Unreachable { op, detail: String::new() })?;
 
     let message = XpcObject::dict_new();
     message.set_string(proto::KEY_OP, op);
@@ -1521,7 +1563,7 @@ fn call_helper(op: &'static str, args: &[String]) -> Result<String, AdminError> 
         // A dropped sender and a connection error event are the same fact:
         // nothing is answering on the other end.
         Ok(Err(ReplyError::Unreachable)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(AdminError::Unreachable { op })
+            Err(AdminError::Unreachable { op, detail: String::new() })
         }
         Ok(Err(ReplyError::Refused(stderr))) => Err(AdminError::Failed { op, stderr }),
         // Deliberately `Failed`, never `Unreachable` (Review Fase 1, note 1,
@@ -1539,7 +1581,7 @@ fn call_helper(op: &'static str, args: &[String]) -> Result<String, AdminError> 
 /// unreachable rather than pretending the op ran.
 #[cfg(not(target_os = "macos"))]
 fn call_helper(op: &'static str, _args: &[String]) -> Result<String, AdminError> {
-    Err(AdminError::Unreachable { op })
+    Err(AdminError::Unreachable { op, detail: String::new() })
 }
 
 /// The bundled setup script path inside the running app bundle.
@@ -1573,8 +1615,15 @@ pub fn admin_error_hint_for(
     // The SMAppService transport never touches the sudo wrapper, so its
     // failures are not a missing one-time setup: relabeling an unreachable
     // daemon as "not installed" would point the user at the wrong fix.
-    if matches!(error, AdminError::Unreachable { .. }) {
-        return error;
+    // Instead, annotate it with the current SMAppService status so the
+    // user (and support) can see what the system thinks at this moment.
+    if let AdminError::Unreachable { op, mut detail } = error {
+        #[cfg(target_os = "macos")]
+        if detail.is_empty() {
+            let raw = gp_bar::smapp::read_status();
+            detail = format!(" (status: {})", gp_bar::smapp::status_line(raw));
+        }
+        return AdminError::Unreachable { op, detail };
     }
     // No wrapper file means the setup is missing, whatever the exact
     // sudo/OS error string says. sudo's stderr is forced to LC_ALL=C by
@@ -1635,8 +1684,9 @@ mod tests {
         // Read the two setup markers into one check: an unreachable daemon must
         // survive the classification even when the sudo wrapper is absent, or
         // the user would be told to run a setup that is not their problem.
-        let hint = admin_error_hint_for(false, setup, AdminError::Unreachable { op: "start" });
-        assert_eq!(hint, AdminError::Unreachable { op: "start" });
+        let raw = AdminError::Unreachable { op: "start", detail: String::new() };
+        let hint = admin_error_hint_for(false, setup, raw.clone());
+        assert_eq!(hint, raw);
         assert_eq!(
             hint.to_string(),
             "the privileged SMAppService daemon is unreachable (op 'start')"
