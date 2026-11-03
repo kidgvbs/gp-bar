@@ -7,6 +7,18 @@ license = "MIT"
 edition = "2024"
 rust-version = "1.85"
 
+[lib]
+name = "gp_bar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gp-bar"
+path = "src/main.rs"
+
+[[bin]]
+name = "gp-helper"
+path = "src/bin/gp-helper.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -45,6 +57,7 @@ window-vibrancy = "0.8.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc2-app-kit", "WKWebView"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSProcessInfo"] }
+block2 = "=0.6.2"
 
 [profile.release]
 strip = true
