@@ -44,10 +44,25 @@ pub struct Config {
     /// the glass is available. `Some(true)` = auto (see `glass::resolve_effect`).
     #[serde(default)]
     pub liquid_glass: Option<bool>,
+    /// Transport for the privileged operations: [`ELEVATION_SUDO`] (default —
+    /// the v1.2.0 sudo wrapper path, byte-identical) or [`ELEVATION_XPC`] (the
+    /// `gp-helper` SMAppService daemon). An unrecognized value is reported and
+    /// read as [`ELEVATION_SUDO`] (see `Config::elevation`); it never fails
+    /// startup, because a typo must not take the app's privileged path away.
+    #[serde(default = "default_elevation")]
+    pub elevation: String,
 }
+
+/// The two supported privileged transports.
+pub const ELEVATION_SUDO: &str = "sudo";
+pub const ELEVATION_XPC: &str = "xpc";
 
 fn default_true() -> bool {
     true
+}
+
+fn default_elevation() -> String {
+    ELEVATION_SUDO.to_string()
 }
 
 /// Shared charset for every name that reaches the privileged wrapper
@@ -78,6 +93,7 @@ impl Default for Config {
             selected_gateway: None,
             gateway_hosts: std::collections::BTreeMap::new(),
             liquid_glass: None,
+            elevation: default_elevation(),
         }
     }
 }
@@ -127,6 +143,24 @@ fn corrupt_timestamp() -> String {
 }
 
 impl Config {
+    /// The configured transport, normalized: only [`ELEVATION_XPC`] selects
+    /// the SMAppService daemon; the default and any unrecognized value keep
+    /// the sudo path. The warning is emitted here, at use time, because
+    /// `Config::load` runs before the log plugin is attached (its own failure
+    /// branches can only `eprintln`).
+    pub fn elevation(&self) -> &'static str {
+        match self.elevation.as_str() {
+            ELEVATION_XPC => ELEVATION_XPC,
+            ELEVATION_SUDO => ELEVATION_SUDO,
+            other => {
+                log::warn!(
+                    "config: unknown elevation {other:?} (expected \"sudo\" or \"xpc\"); using \"sudo\""
+                );
+                ELEVATION_SUDO
+            }
+        }
+    }
+
     pub fn config_dir() -> PathBuf {
         dirs::config_dir()
             .expect("the user's Application Support directory must be available")
@@ -363,6 +397,36 @@ mod tests {
             .map(|entry| entry.file_name().into_string().unwrap())
             .filter(|name| name.starts_with("config.json.corrupt-"))
             .collect()
+    }
+
+    #[test]
+    fn elevation_defaults_to_sudo() {
+        assert_eq!(Config::default().elevation, ELEVATION_SUDO);
+        // A config file written before the field existed reads as the
+        // default, not as an empty string.
+        let cfg: Config = serde_json::from_str(r#"{"portals":["vpn.example.com"]}"#).unwrap();
+        assert_eq!(cfg.elevation, ELEVATION_SUDO);
+        assert_eq!(cfg.elevation(), ELEVATION_SUDO);
+    }
+
+    #[test]
+    fn elevation_accepts_xpc() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"portals":[],"selected":null,"elevation":"xpc"}"#).unwrap();
+        assert_eq!(cfg.elevation(), ELEVATION_XPC);
+    }
+
+    #[test]
+    fn an_unknown_elevation_falls_back_to_sudo() {
+        // Never fail startup, never disable the privileged path: a typo is
+        // reported and read as the default.
+        for raw in ["", "XPC", "daemon", " sudo", "sudo ", "su do"] {
+            let cfg: Config = serde_json::from_str(&format!(
+                r#"{{"portals":[],"selected":null,"elevation":"{raw}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(cfg.elevation(), ELEVATION_SUDO, "raw={raw:?}");
+        }
     }
 
     #[test]
