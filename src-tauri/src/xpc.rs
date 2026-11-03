@@ -83,9 +83,22 @@ unsafe extern "C" {
     fn xpc_dictionary_set_string(xdict: XpcRaw, key: *const c_char, value: *const c_char);
     fn xpc_dictionary_set_int64(xdict: XpcRaw, key: *const c_char, value: i64);
     fn xpc_dictionary_set_bool(xdict: XpcRaw, key: *const c_char, value: bool);
+    fn xpc_dictionary_set_value(xdict: XpcRaw, key: *const c_char, value: XpcRaw);
     fn xpc_dictionary_get_string(xdict: XpcRaw, key: *const c_char) -> *const c_char;
     fn xpc_dictionary_get_int64(xdict: XpcRaw, key: *const c_char) -> i64;
     fn xpc_dictionary_get_bool(xdict: XpcRaw, key: *const c_char) -> bool;
+    /// Borrowed: "does not grant the caller a reference" (xpc.h). NULL when
+    /// the key is absent.
+    fn xpc_dictionary_get_value(xdict: XpcRaw, key: *const c_char) -> XpcRaw;
+
+    /// `objects == NULL, count == 0` is the empty array (`XPC_RETURNS_RETAINED`).
+    fn xpc_array_create(objects: *const XpcRaw, count: usize) -> XpcRaw;
+    fn xpc_array_set_string(xarray: XpcRaw, index: usize, string: *const c_char);
+    /// Returns 0 when the object is not an array (xpc.h), so a wrong type is
+    /// an empty list rather than a crash.
+    fn xpc_array_get_count(xarray: XpcRaw) -> usize;
+    /// NULL when the element is not a string. The index MUST be `< count`.
+    fn xpc_array_get_string(xarray: XpcRaw, index: usize) -> *const c_char;
     fn xpc_get_type(object: XpcRaw) -> *const c_void;
     fn xpc_release(object: XpcRaw);
 
@@ -139,6 +152,32 @@ impl XpcObject {
     /// Set a boolean value.
     pub fn set_bool(&self, key: &CStr, value: bool) {
         unsafe { xpc_dictionary_set_bool(self.0.as_ptr(), key.as_ptr(), value) };
+    }
+
+    /// Set an array of strings.
+    ///
+    /// Ownership (B8/B9), mirroring [`XpcObject::set_string`]: the array is
+    /// created `+1`, `xpc_dictionary_set_value` retains its own reference,
+    /// and our `XpcObject` drops — releasing exactly our `+1` — at the end of
+    /// this call. Nothing leaks and the dictionary never holds a dead object.
+    /// Elements with an interior NUL are stripped like in `set_string`, never
+    /// panicked on (B7).
+    pub fn set_string_array(&self, key: &CStr, values: &[String]) {
+        let array = unsafe { xpc_array_create(std::ptr::null(), 0) };
+        let Some(array) = XpcObject::from_owned(array) else {
+            // Cannot allocate an array: send nothing rather than a half-built
+            // one. The daemon sees a missing key and fails the arity check.
+            return;
+        };
+        for (index, value) in values.iter().enumerate() {
+            let cleaned = value.replace('\0', "");
+            // Unreachable: NULs are stripped above.
+            let Ok(c_value) = std::ffi::CString::new(cleaned) else {
+                continue;
+            };
+            unsafe { xpc_array_set_string(array.0.as_ptr(), index, c_value.as_ptr()) };
+        }
+        unsafe { xpc_dictionary_set_value(self.0.as_ptr(), key.as_ptr(), array.0.as_ptr()) };
     }
 }
 
@@ -302,6 +341,32 @@ impl<'a> XpcEvent<'a> {
     /// A boolean value from the dictionary (`false` when absent).
     pub fn get_bool(&self, key: &CStr) -> bool {
         unsafe { xpc_dictionary_get_bool(self.raw.as_ptr(), key.as_ptr()) }
+    }
+
+    /// Every string element of an array value (`[]` when the key is absent,
+    /// not an array, or empty). Lossy like [`XpcEvent::get_string`] — a
+    /// non-UTF-8 element cannot panic inside a C callback (B7). Non-string
+    /// elements are skipped, and the count is read from the array itself, so
+    /// the index is always in range.
+    pub fn get_string_array(&self, key: &CStr) -> Vec<String> {
+        let array = unsafe { xpc_dictionary_get_value(self.raw.as_ptr(), key.as_ptr()) };
+        if array.is_null() {
+            return Vec::new();
+        }
+        let count = unsafe { xpc_array_get_count(array) };
+        let mut values = Vec::with_capacity(count.min(64));
+        for index in 0..count {
+            let raw = unsafe { xpc_array_get_string(array, index) };
+            if raw.is_null() {
+                continue;
+            }
+            values.push(
+                unsafe { CStr::from_ptr(raw) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        values
     }
 
     /// The accepted connection, when this event is a connection event.
