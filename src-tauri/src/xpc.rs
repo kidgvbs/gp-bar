@@ -89,7 +89,11 @@ unsafe extern "C" {
     fn xpc_get_type(object: XpcRaw) -> *const c_void;
     fn xpc_release(object: XpcRaw);
 
+    fn xpc_connection_set_target_queue(connection: XpcRaw, queue: XpcRaw);
+
     fn dispatch_get_global_queue(identifier: isize, flags: u64) -> XpcRaw;
+    /// `attr == NULL` is the serial attribute (no concurrent attribute flag).
+    fn dispatch_queue_create(label: *const c_char, attr: XpcRaw) -> XpcRaw;
     /// The idiomatic main loop for a libdispatch-based daemon (B11): parks
     /// the calling thread forever; never returns.
     fn dispatch_main() -> !;
@@ -160,8 +164,9 @@ impl XpcConnection {
     /// handler; see `vpn::call_helper`) and activated. Dropping it is always
     /// safe because it is always resumed first.
     pub fn connect(service: &CStr) -> Option<Self> {
-        let raw =
-            unsafe { xpc_connection_create_mach_service(service.as_ptr(), std::ptr::null_mut(), 0) };
+        let raw = unsafe {
+            xpc_connection_create_mach_service(service.as_ptr(), std::ptr::null_mut(), 0)
+        };
         let conn = Self::from_owned(raw)?;
         conn.set_event_handler(noop_handler());
         conn.resume();
@@ -409,4 +414,32 @@ fn noop_handler() -> HandlerBlock {
 /// loop (B11).
 pub fn run_forever() -> ! {
     unsafe { dispatch_main() }
+}
+
+// -- dispatch queues ----------------------------------------------------------------
+
+/// Create a **serial** dispatch queue (review B5: every handler — listener
+/// accept, peer message, watchdog bookkeeping — is dispatched through one
+/// serial queue, so no two handlers run concurrently).
+///
+/// Never released on purpose: the queue lives exactly as long as the daemon,
+/// and `dispatch_main` never returns, so a `Drop` could not run anyway.
+pub fn serial_queue(label: &CStr) -> XpcRaw {
+    unsafe { dispatch_queue_create(label.as_ptr(), std::ptr::null_mut()) }
+}
+
+impl XpcConnection {
+    /// Route this connection's events onto `queue` (the serial queue). Call
+    /// BEFORE `resume`: the header requires the target queue to be set on an
+    /// inactive connection.
+    pub fn set_target_queue(&self, queue: XpcRaw) {
+        unsafe { xpc_connection_set_target_queue(self.0.as_ptr(), queue) };
+    }
+}
+
+impl XpcPeer<'_> {
+    /// Route this accepted connection's events onto `queue`, before `accept`.
+    pub fn set_target_queue(&self, queue: XpcRaw) {
+        unsafe { xpc_connection_set_target_queue(self.raw.as_ptr(), queue) };
+    }
 }
