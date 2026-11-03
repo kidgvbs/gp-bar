@@ -72,6 +72,34 @@
         <button id="action-btn" class="btn primary">Connect</button>
       </section>
 
+      <!-- System helper (beta): SMAppService daemon registration and transport
+          switch. Hidden when the elevation config is not "xpc", shown by
+          main.ts after reading the current config. -->
+      <section class="helper-block collapsed" id="helper-block">
+        <div class="helper-header">
+          <button class="log-toggle" id="helper-toggle" type="button" title="Toggle system helper">
+            <span class="chevron">&#9656;</span>
+            <span>System helper <em class="beta-tag">beta</em></span>
+          </button>
+          <span id="helper-status" class="helper-status"></span>
+        </div>
+        <div class="helper-body">
+          <div class="helper-row">
+            <span class="helper-label">Transport</span>
+            <select id="helper-elevation" title="Privileged transport">
+              <option value="sudo">sudo wrapper</option>
+              <option value="xpc">SMAppService daemon</option>
+            </select>
+          </div>
+          <div class="helper-row" id="helper-actions">
+            <button id="helper-register" class="btn secondary">Register</button>
+            <button id="helper-unregister" class="btn secondary">Unregister</button>
+            <button id="helper-settings" class="btn secondary">Login Items Settings…</button>
+          </div>
+          <div id="helper-note" class="helper-note hidden"></div>
+        </div>
+      </section>
+
       <section class="log-block collapsed" id="log-block">
         <div class="log-header">
           <button class="log-toggle" id="log-toggle" type="button" title="Toggle activity log">

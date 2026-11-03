@@ -233,6 +233,101 @@ if (configReadError !== null) {
   });
 }
 
+// -- system helper (SMAppService daemon, Fase 3b) ------------------------------
+
+const helperBlock = document.getElementById("helper-block")!;
+const helperToggle = document.getElementById("helper-toggle")!;
+const helperStatus = document.getElementById("helper-status")!;
+const helperElevation = document.getElementById("helper-elevation") as HTMLSelectElement;
+const helperRegister = document.getElementById("helper-register") as HTMLButtonElement;
+const helperUnregister = document.getElementById("helper-unregister") as HTMLButtonElement;
+const helperSettings = document.getElementById("helper-settings") as HTMLButtonElement;
+const helperNote = document.getElementById("helper-note")!;
+const helperActions = document.getElementById("helper-actions")!;
+
+interface HelperOverview {
+  status: number | null;
+  status_name: string;
+  in_bundle: boolean;
+  elevation: string;
+}
+
+async function refreshHelperOverview() {
+  const overview = await invoke<HelperOverview>("get_helper_overview");
+  // Only show the section when the elevation config is "xpc".
+  if (overview.elevation !== "xpc") {
+    helperBlock.classList.add("hidden");
+    return;
+  }
+  helperBlock.classList.remove("hidden");
+  helperElevation.value = overview.elevation;
+  helperStatus.textContent = overview.status_name;
+  // Outside a bundle the register/unregister buttons are not useful.
+  if (!overview.in_bundle) {
+    helperActions.classList.add("hidden");
+    helperNote.classList.remove("hidden");
+    helperNote.textContent =
+      "Not running from an app bundle — daemon registration is unavailable.";
+  } else {
+    helperActions.classList.remove("hidden");
+  }
+}
+
+function showHelperNote(text: string) {
+  helperNote.textContent = text;
+  helperNote.classList.remove("hidden");
+  clearTimeout(cmdErrorTimer);
+  cmdErrorTimer = setTimeout(() => helperNote.classList.add("hidden"), 6000);
+}
+
+helperToggle.addEventListener("click", () => {
+  helperBlock.classList.toggle("collapsed");
+  syncWindowSize();
+});
+
+helperElevation.addEventListener("change", async () => {
+  const value = helperElevation.value;
+  try {
+    await invoke("helper_set_elevation", { value });
+    showHelperNote(`Transport switched to ${value}.`);
+    // Re-fetch to reflect the switch (or hide the section if back to sudo).
+    await refreshHelperOverview();
+  } catch (error) {
+    showCmdError(commandErrorText(error));
+    helperElevation.value = value === "xpc" ? "sudo" : "xpc";
+  }
+});
+
+helperRegister.addEventListener("click", async () => {
+  helperRegister.disabled = true;
+  try {
+    await invoke("helper_register");
+    showHelperNote("Daemon registered.");
+    await refreshHelperOverview();
+  } catch (error) {
+    showCmdError(commandErrorText(error));
+  } finally {
+    helperRegister.disabled = false;
+  }
+});
+
+helperUnregister.addEventListener("click", async () => {
+  helperUnregister.disabled = true;
+  try {
+    await invoke("helper_unregister");
+    showHelperNote("Daemon unregistered.");
+    await refreshHelperOverview();
+  } catch (error) {
+    showCmdError(commandErrorText(error));
+  } finally {
+    helperUnregister.disabled = false;
+  }
+});
+
+helperSettings.addEventListener("click", () => {
+  invoke("open_login_items_settings");
+});
+
 // -- action button in-flight guard ----------------------------------------------
 // The action button changes meaning with the phase: a fast double click would
 // send `connect` and then — once the Connecting event arrives — `cancel`.
@@ -752,6 +847,8 @@ await listen<PortalsConfig>("config-updated", (e) => renderPortals(e.payload));
 await refreshPortals();
 // Residual-DNS banner: first health check at panel load.
 await refreshNetworkHealth();
+// System helper section: show when elevation is "xpc".
+await refreshHelperOverview();
 
 const versions = await invoke<{ app_version: string; gpclient_version: string }>("get_versions");
 versionsEl.textContent = `GP Bar ${versions.app_version} · ${versions.gpclient_version}`;
