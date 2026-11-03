@@ -1689,6 +1689,12 @@ pub async fn gpclient_version(gpclient: &Path) -> String {
 /// system calls. The caller (`call_helper_with_self_heal`) reads the real
 /// status once and passes it along, so `status_line(status)` renders the
 /// same value the heal decision was based on.
+///
+/// macOS-only: `HealAction` lives in the `#[cfg(target_os = "macos")]`
+/// `smapp` module, and this is only ever called from the heal path's own
+/// macOS block — gating it keeps Linux CI from tripping on the `smapp`
+/// path (RECAP §22).
+#[cfg(target_os = "macos")]
 pub fn unreachable_suffix(
     status: isize,
     action: gp_bar::smapp::HealAction,
@@ -1705,20 +1711,18 @@ pub fn unreachable_suffix(
         },
         (HealAction::ReRegister, Some(true)) => {
             // Heal succeeded, but the retry also failed — that means the
-            // re-register alone did not fix the reachability.
-            format!(
-                " — re-registered successfully, but the daemon is still unreachable (status: {})",
-                smapp::status_line(status)
-            )
+            // re-register alone did not fix the reachability. The pre-heal
+            // status is stale here (a reinstall would no longer be NotFound),
+            // so the message must not assert one.
+            " — still unreachable after re-register: toggle the helper off/on in the panel"
+                .to_string()
         }
         (HealAction::ReRegister, _) => {
             " — re-register attempted and failed: toggle the helper off/on in the panel".to_string()
         }
         (HealAction::Reinstall, Some(true)) => {
-            format!(
-                " — reinstalled successfully, but the daemon is still unreachable (status: {})",
-                smapp::status_line(status)
-            )
+            " — still unreachable after reinstall: toggle the helper off/on in the panel"
+                .to_string()
         }
         (HealAction::Reinstall, _) => {
             " — reinstall attempted and failed: toggle the helper off/on in the panel".to_string()
@@ -1729,6 +1733,10 @@ pub fn unreachable_suffix(
 /// Attach a suffix to an `Unreachable` error's `detail` field. When `detail`
 /// is already non-empty the error passes through unchanged (the first
 /// annotation wins — the caller never annotates twice).
+///
+/// macOS-only like its only caller (the heal path's macOS block): on other
+/// targets it would be dead code and `clippy -D warnings` flags it.
+#[cfg(target_os = "macos")]
 fn annotate_unreachable(error: AdminError, suffix: String) -> AdminError {
     if let AdminError::Unreachable { detail, .. } = &error {
         if detail.is_empty() {
@@ -2633,6 +2641,7 @@ An asterisk (*) denotes that a network service is disabled.
     }
 
     /// Every (status, action, heal_ok) triple produces the expected suffix.
+    #[cfg(target_os = "macos")]
     #[test]
     fn unreachable_suffix_matrix() {
         use gp_bar::smapp::{ENABLED, HealAction, NOT_FOUND, NOT_REGISTERED, REQUIRES_APPROVAL};
@@ -2661,14 +2670,10 @@ An asterisk (*) denotes that a network service is disabled.
 
         // ── HealAction::ReRegister ────────────────────────────────────────
         // register succeeded but the retry still timed out / was unreachable.
-        let suf_r1_ok = unreachable_suffix(ENABLED, HealAction::ReRegister, Some(true));
-        assert!(
-            suf_r1_ok.contains("re-registered successfully"),
-            "got: {suf_r1_ok:?}"
-        );
-        assert!(
-            suf_r1_ok.contains("still unreachable"),
-            "got: {suf_r1_ok:?}"
+        // The message must not assert the (stale, pre-heal) status.
+        assert_eq!(
+            unreachable_suffix(ENABLED, HealAction::ReRegister, Some(true)),
+            " — still unreachable after re-register: toggle the helper off/on in the panel"
         );
         // register failed — tell the user to toggle.
         assert_eq!(
@@ -2682,14 +2687,9 @@ An asterisk (*) denotes that a network service is disabled.
         );
 
         // ── HealAction::Reinstall ─────────────────────────────────────────
-        let suf_r2_ok = unreachable_suffix(NOT_FOUND, HealAction::Reinstall, Some(true));
-        assert!(
-            suf_r2_ok.contains("reinstalled successfully"),
-            "got: {suf_r2_ok:?}"
-        );
-        assert!(
-            suf_r2_ok.contains("still unreachable"),
-            "got: {suf_r2_ok:?}"
+        assert_eq!(
+            unreachable_suffix(NOT_FOUND, HealAction::Reinstall, Some(true)),
+            " — still unreachable after reinstall: toggle the helper off/on in the panel"
         );
         assert_eq!(
             unreachable_suffix(NOT_FOUND, HealAction::Reinstall, Some(false)),

@@ -73,8 +73,8 @@
       </section>
 
       <!-- System helper (beta): SMAppService daemon registration and transport
-          switch. Hidden when the elevation config is not "xpc", shown by
-          main.ts after reading the current config. -->
+          switch. Always visible; main.ts gates the individual actions on the
+          current status and whether this run is the bundled app. -->
       <section class="helper-block collapsed" id="helper-block">
         <div class="helper-header">
           <button class="log-toggle" id="helper-toggle" type="button" title="Toggle system helper">

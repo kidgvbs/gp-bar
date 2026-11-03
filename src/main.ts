@@ -243,41 +243,81 @@ const helperRegister = document.getElementById("helper-register") as HTMLButtonE
 const helperUnregister = document.getElementById("helper-unregister") as HTMLButtonElement;
 const helperSettings = document.getElementById("helper-settings") as HTMLButtonElement;
 const helperNote = document.getElementById("helper-note")!;
-const helperActions = document.getElementById("helper-actions")!;
 
 interface HelperOverview {
   status: number | null;
   status_name: string;
   in_bundle: boolean;
+  helper_available: boolean;
   elevation: string;
+}
+
+// Auto-hide timer for the transient helper note (distinct from the shared
+// command-error timer, so a persistent explanation never gets clobbered).
+let helperNoteTimer: ReturnType<typeof setTimeout> | undefined;
+
+function setHelperExplanation(text: string | null) {
+  clearTimeout(helperNoteTimer);
+  if (text === null) {
+    helperNote.classList.add("hidden");
+    helperNote.textContent = "";
+  } else {
+    helperNote.textContent = text;
+    helperNote.classList.remove("hidden");
+  }
 }
 
 async function refreshHelperOverview() {
   const overview = await invoke<HelperOverview>("get_helper_overview");
-  // Only show the section when the elevation config is "xpc".
-  if (overview.elevation !== "xpc") {
-    helperBlock.classList.add("hidden");
-    return;
-  }
+  // The section is always visible: the transport selector and the status
+  // line are the user's way in whatever the current config, so they are
+  // never hidden behind an "xpc only" gate.
   helperBlock.classList.remove("hidden");
   helperElevation.value = overview.elevation;
   helperStatus.textContent = overview.status_name;
-  // Outside a bundle the register/unregister buttons are not useful.
-  if (!overview.in_bundle) {
-    helperActions.classList.add("hidden");
-    helperNote.classList.remove("hidden");
-    helperNote.textContent =
-      "Not running from an app bundle — daemon registration is unavailable.";
+
+  // Daemon management needs the SMAppService machinery (macOS) *and* a real
+  // app bundle. Everything else is a dev build or another platform.
+  const canManage = overview.helper_available && overview.in_bundle;
+  const statusName = overview.status_name;
+  const actionable = statusName === "NotRegistered" || statusName === "NotFound";
+  const needsApproval = statusName === "RequiresApproval";
+  const enabled = statusName === "Enabled";
+
+  // R3 register only for NotRegistered/NotFound; RequiresApproval is
+  // approval territory (open System Settings, never register); Enabled has
+  // nothing to register. Unregister only while enabled.
+  helperRegister.disabled = !(canManage && actionable);
+  helperUnregister.disabled = !(canManage && enabled);
+  helperSettings.disabled = !(canManage && needsApproval);
+
+  // Guidance in priority order. Dev builds and non-macOS cannot manage the
+  // helper at all; RequiresApproval gets direct guidance instead of a
+  // register button.
+  if (!overview.helper_available) {
+    setHelperExplanation("The system helper is not available on this platform.");
+  } else if (!overview.in_bundle) {
+    setHelperExplanation(
+      "Not running from an app bundle — daemon registration is unavailable.",
+    );
+  } else if (needsApproval) {
+    setHelperExplanation(
+      "GP Bar's helper needs your approval — open System Settings → General → Login Items and enable it.",
+    );
+  } else if (overview.elevation !== "xpc") {
+    setHelperExplanation(
+      "Switch the transport to the SMAppService daemon to manage the helper.",
+    );
   } else {
-    helperActions.classList.remove("hidden");
+    setHelperExplanation(null);
   }
 }
 
 function showHelperNote(text: string) {
   helperNote.textContent = text;
   helperNote.classList.remove("hidden");
-  clearTimeout(cmdErrorTimer);
-  cmdErrorTimer = setTimeout(() => helperNote.classList.add("hidden"), 6000);
+  clearTimeout(helperNoteTimer);
+  helperNoteTimer = setTimeout(() => helperNote.classList.add("hidden"), 6000);
 }
 
 helperToggle.addEventListener("click", () => {
@@ -289,36 +329,61 @@ helperElevation.addEventListener("change", async () => {
   const value = helperElevation.value;
   try {
     await invoke("helper_set_elevation", { value });
-    showHelperNote(`Transport switched to ${value}.`);
-    // Re-fetch to reflect the switch (or hide the section if back to sudo).
     await refreshHelperOverview();
+    showHelperNote(`Transport switched to ${value}.`);
   } catch (error) {
     showCmdError(commandErrorText(error));
     helperElevation.value = value === "xpc" ? "sudo" : "xpc";
   }
 });
 
+// The unregister confirmation is inline (the project's own pattern: a native
+// confirm() steals focus and dismisses the panel). First click arms the
+// button for three seconds, the second click actually unregisters.
+let unregisterArmed = false;
+let unregisterConfirmTimer: ReturnType<typeof setTimeout> | undefined;
+
+function resetUnregisterConfirm() {
+  unregisterArmed = false;
+  clearTimeout(unregisterConfirmTimer);
+  helperUnregister.textContent = "Unregister";
+  helperUnregister.classList.remove("confirm");
+}
+
 helperRegister.addEventListener("click", async () => {
+  if (helperRegister.disabled) return;
   helperRegister.disabled = true;
   try {
     await invoke("helper_register");
-    showHelperNote("Daemon registered.");
     await refreshHelperOverview();
+    showHelperNote("Daemon registered.");
   } catch (error) {
     showCmdError(commandErrorText(error));
+    await refreshHelperOverview();
   } finally {
     helperRegister.disabled = false;
   }
 });
 
 helperUnregister.addEventListener("click", async () => {
+  if (helperUnregister.disabled) return;
+  if (!unregisterArmed) {
+    unregisterArmed = true;
+    helperUnregister.textContent = "Confirm?";
+    helperUnregister.classList.add("confirm");
+    clearTimeout(unregisterConfirmTimer);
+    unregisterConfirmTimer = setTimeout(resetUnregisterConfirm, 3000);
+    return;
+  }
+  resetUnregisterConfirm();
   helperUnregister.disabled = true;
   try {
     await invoke("helper_unregister");
-    showHelperNote("Daemon unregistered.");
     await refreshHelperOverview();
+    showHelperNote("Daemon unregistered.");
   } catch (error) {
     showCmdError(commandErrorText(error));
+    await refreshHelperOverview();
   } finally {
     helperUnregister.disabled = false;
   }
@@ -847,7 +912,7 @@ await listen<PortalsConfig>("config-updated", (e) => renderPortals(e.payload));
 await refreshPortals();
 // Residual-DNS banner: first health check at panel load.
 await refreshNetworkHealth();
-// System helper section: show when elevation is "xpc".
+// System helper section: always visible; actions are gated by status.
 await refreshHelperOverview();
 
 const versions = await invoke<{ app_version: string; gpclient_version: string }>("get_versions");

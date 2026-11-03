@@ -620,33 +620,58 @@ async fn repair_network(
 
 /// Overview of the SMAppService daemon for the "System helper (beta)" section.
 ///
-/// Returns `{ status, status_name, in_bundle, elevation }` — a read-only
-/// snapshot the frontend renders without any side effect. Off macOS
-/// everything is absent/false; the panel still renders the section but
-/// shows "not available on this platform".
+/// Returns `{ status, status_name, in_bundle, helper_available, elevation }`
+/// — a read-only snapshot the frontend renders without any side effect.
+/// `helper_available` is whether the SMAppService machinery exists at all
+/// (macOS only); `in_bundle` is whether this run is the bundled app (a dev
+/// build sitting in target/debug cannot register the daemon). Off macOS
+/// both are false and the panel shows "not available on this platform".
 #[tauri::command]
-fn get_helper_overview(state: State<'_, AppContext>) -> serde_json::Value {
+async fn get_helper_overview(app: AppHandle) -> serde_json::Value {
+    // `AppHandle` is an owned handle (no borrow), so this async command can
+    // return a plain value; the elevation is read once here and moved into
+    // the blocking closure / the non-macOS branch.
+    let elevation = app
+        .state::<AppContext>()
+        .config
+        .lock()
+        .unwrap()
+        .elevation()
+        .to_string();
     #[cfg(target_os = "macos")]
-    {
+    // `read_status` is a runtime SMAppService call — keep it off the async
+    // worker, like every other blocking command.
+    let result = tokio::task::spawn_blocking(move || {
         let raw = gp_bar::smapp::read_status();
         let in_bundle = gp_bar::peer::current_bundle_root().is_some();
-        let elevation = state.config.lock().unwrap().elevation();
         serde_json::json!({
             "status": raw,
             "status_name": gp_bar::smapp::decode(raw),
             "in_bundle": in_bundle,
+            "helper_available": true,
             "elevation": elevation,
         })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("get_helper_overview: spawn_blocking failed: {error}");
         serde_json::json!({
             "status": null,
             "status_name": "unavailable",
             "in_bundle": false,
+            "helper_available": false,
             "elevation": "sudo",
         })
-    }
+    });
+    #[cfg(not(target_os = "macos"))]
+    let result = serde_json::json!({
+        "status": null,
+        "status_name": "unavailable",
+        "in_bundle": false,
+        "helper_available": false,
+        "elevation": elevation,
+    });
+    result
 }
 
 /// Change the privileged transport in the config: `"sudo"` (the v1.2.0
@@ -671,13 +696,44 @@ async fn helper_set_elevation(app: AppHandle, value: String) -> Result<(), Strin
 
 /// Register the SMAppService daemon — the explicit R3 gesture from the UI.
 /// The user clicks "Register" in the panel; this calls `SMAppService::register`
-/// and may present the system approval prompt (Touch ID). Off macOS returns
-/// an error immediately.
+/// and may present the system approval prompt (Touch ID), so it runs on the
+/// blocking pool. Off macOS, or outside a bundle (dev build), it errors out.
+///
+/// Returns the final decoded status name (`"Enabled"`) when registration
+/// landed; otherwise an error, with the R2 fallback for a stale bundle path:
+/// `register()` err → re-read status → `NotFound` → `unregister()` (logged,
+/// not fatal) → `register()` once more — the same shape as the path-op R2.
 #[tauri::command]
-fn helper_register() -> Result<(), String> {
+async fn helper_register() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        gp_bar::smapp::register()
+        tokio::task::spawn_blocking(|| {
+            if gp_bar::peer::current_bundle_root().is_none() {
+                return Err("helper registration requires the bundled app".to_string());
+            }
+            match gp_bar::smapp::register() {
+                Ok(()) => register_outcome(),
+                Err(first) => {
+                    // R2 fallback: a stale path leaves the status NotFound
+                    // even after a failed register — unregister + one retry.
+                    if gp_bar::smapp::read_status() == gp_bar::smapp::NOT_FOUND {
+                        if let Err(e) = gp_bar::smapp::unregister() {
+                            log::warn!("helper_register R2 unregister failed: {e}");
+                        }
+                        if let Err(e) = gp_bar::smapp::register() {
+                            return Err(format!(
+                                "re-register failed: {e} (first attempt: {first})"
+                            ));
+                        }
+                        register_outcome()
+                    } else {
+                        Err(first)
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -685,12 +741,32 @@ fn helper_register() -> Result<(), String> {
     }
 }
 
-/// Unregister the SMAppService daemon. Off macOS returns an error immediately.
+/// Read the daemon status after a register attempt and turn it into the
+/// command's `Result`: `Ok("Enabled")` when it landed, otherwise an error
+/// naming the actual status (the register may have shown the prompt but
+/// still not enabled the daemon). macOS-only (calls [`smapp::read_status`]).
+#[cfg(target_os = "macos")]
+fn register_outcome() -> Result<String, String> {
+    let status = gp_bar::smapp::read_status();
+    if status == gp_bar::smapp::ENABLED {
+        Ok(gp_bar::smapp::decode(status))
+    } else {
+        Err(format!(
+            "registration did not enable the daemon (status: {})",
+            gp_bar::smapp::status_line(status)
+        ))
+    }
+}
+
+/// Unregister the SMAppService daemon. Blocks on the daemon call, so it runs
+/// on the blocking pool. Off macOS returns an error immediately.
 #[tauri::command]
-fn helper_unregister() -> Result<(), String> {
+async fn helper_unregister() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        gp_bar::smapp::unregister()
+        tokio::task::spawn_blocking(gp_bar::smapp::unregister)
+            .await
+            .map_err(|error| error.to_string())?
     }
     #[cfg(not(target_os = "macos"))]
     {

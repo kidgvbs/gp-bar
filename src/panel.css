@@ -529,6 +529,13 @@ footer {
   padding: 2px 8px;
 }
 
+/* "Confirm?" state of the helper unregister button (inline confirmation,
+   same pattern as the gateway remove button). */
+#helper-actions .btn.secondary.confirm {
+  background: rgba(255, 69, 58, 0.16);
+  color: #ff453a;
+}
+
 .helper-note {
   font-size: 10px;
   opacity: 0.6;
