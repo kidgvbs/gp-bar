@@ -115,6 +115,11 @@ unsafe extern "C" {
 /// `XPC_CONNECTION_MACH_SERVICE_LISTENER` (connection.h: `1 << 0`).
 const XPC_CONNECTION_MACH_SERVICE_LISTENER: u64 = 1 << 0;
 
+/// `XPC_ARRAY_APPEND` (xpc.h: `((size_t)(-1))`). An array setter's `index`
+/// must lie in `0..N-1` or be this sentinel: a plain `0` on a freshly created
+/// (empty) array is undefined behaviour and traps on current macOS.
+const XPC_ARRAY_APPEND: usize = usize::MAX;
+
 // -- owned object ------------------------------------------------------------------
 
 /// An owned xpc object with a `+1` reference, released on drop.
@@ -156,6 +161,10 @@ impl XpcObject {
 
     /// Set an array of strings.
     ///
+    /// Elements are appended in order (`XPC_ARRAY_APPEND`, never an index: the
+    /// array starts empty, so `0` would be outside its index space and is
+    /// undefined behaviour per xpc.h — it traps on current macOS).
+    ///
     /// Ownership (B8/B9), mirroring [`XpcObject::set_string`]: the array is
     /// created `+1`, `xpc_dictionary_set_value` retains its own reference,
     /// and our `XpcObject` drops — releasing exactly our `+1` — at the end of
@@ -169,13 +178,13 @@ impl XpcObject {
             // one. The daemon sees a missing key and fails the arity check.
             return;
         };
-        for (index, value) in values.iter().enumerate() {
+        for value in values {
             let cleaned = value.replace('\0', "");
             // Unreachable: NULs are stripped above.
             let Ok(c_value) = std::ffi::CString::new(cleaned) else {
                 continue;
             };
-            unsafe { xpc_array_set_string(array.0.as_ptr(), index, c_value.as_ptr()) };
+            unsafe { xpc_array_set_string(array.0.as_ptr(), XPC_ARRAY_APPEND, c_value.as_ptr()) };
         }
         unsafe { xpc_dictionary_set_value(self.0.as_ptr(), key.as_ptr(), array.0.as_ptr()) };
     }
@@ -516,5 +525,62 @@ impl XpcPeer<'_> {
     /// Route this accepted connection's events onto `queue`, before `accept`.
     pub fn set_target_queue(&self, queue: SerialQueue) {
         unsafe { xpc_connection_set_target_queue(self.raw.as_ptr(), queue.0) };
+    }
+}
+
+// -- tests ---------------------------------------------------------------------------
+//
+// No test touches a Mach service, SMAppService or the system at all: these
+// exercise the array contract on locally created xpc objects only. They run on
+// macOS (the module is macOS-only), so the CI mac job proves them.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A borrowed view of a dictionary we own. Private-field access is legal
+    /// here (the test module is a child of the one defining `XpcObject`), so
+    /// the public API gains no raw-pointer accessor for tests.
+    fn borrowed_event(dict: &XpcObject) -> XpcEvent<'_> {
+        // SAFETY: `dict` owns a valid `+1` xpc object and outlives the view
+        // (the caller holds it for the whole test); `XpcEvent` never releases
+        // a borrowed object.
+        unsafe { XpcEvent::from_borrowed(dict.0.as_ptr()) }
+            .expect("an owned dictionary is non-NULL")
+    }
+
+    #[test]
+    fn a_string_value_under_an_array_key_reads_as_an_empty_list() {
+        // Review Fase 2, finding 1, proved empirically: `xpc_array_get_count`
+        // returns 0 for a non-array (xpc.h), so a malformed `args` (a plain
+        // string instead of an array) yields no arguments — no panic, no
+        // spurious element.
+        let dict = XpcObject::dict_new();
+        dict.set_string(c"args", "not-an-array");
+        let event = borrowed_event(&dict);
+        assert_eq!(event.get_string_array(c"args"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_string_array_roundtrips_including_the_empty_string() {
+        let dict = XpcObject::dict_new();
+        dict.set_string_array(c"args", &["a".to_string(), "b".to_string(), String::new()]);
+        let event = borrowed_event(&dict);
+        assert_eq!(
+            event.get_string_array(c"args"),
+            vec!["a".to_string(), "b".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn array_elements_sanitize_interior_nuls_like_set_string() {
+        // Same contract as `set_string`: an interior NUL is stripped before the
+        // value crosses into libxpc (a C string cannot carry one) — never a
+        // panic (B7) and never a silently truncated element. The round-trip
+        // therefore returns the sanitized value.
+        let dict = XpcObject::dict_new();
+        dict.set_string_array(c"args", &["a\0b".to_string()]);
+        let event = borrowed_event(&dict);
+        assert_eq!(event.get_string_array(c"args"), vec!["ab".to_string()]);
     }
 }
