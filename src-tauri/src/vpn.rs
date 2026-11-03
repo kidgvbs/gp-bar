@@ -1444,6 +1444,15 @@ async fn run_admin_xpc(op: &'static str, args: &[&str]) -> Result<String, AdminE
 /// Blocking (both [`call_helper`] and the SMAppService calls are), so the
 /// caller keeps it on the blocking pool. Off macOS there is no SMAppService
 /// and no daemon to heal: the first error stands, no retry.
+///
+/// Time budget honesty: each `call_helper` attempt stays bounded by
+/// `ADMIN_OP_TIMEOUT` (30 s), but the heal path in between is NOT —
+/// `register()` can present the system approval prompt and block on the
+/// human's answer (Touch ID), so a healing op can legitimately take longer
+/// in wall-clock than a plain one. With `Enabled` as the gate this should
+/// be prompt-free in practice (the approval persists — Fase 0), but the
+/// wall-clock bound of the whole op is "two attempts + however long the
+/// human takes".
 fn call_helper_with_self_heal(op: &'static str, args: &[String]) -> Result<String, AdminError> {
     let first = call_helper(op, args);
     if !matches!(&first, Err(AdminError::Unreachable { .. })) {
