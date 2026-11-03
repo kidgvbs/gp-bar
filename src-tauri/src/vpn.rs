@@ -1482,17 +1482,29 @@ fn call_helper_with_self_heal(op: &'static str, args: &[String]) -> Result<Strin
         let status = gp_bar::smapp::read_status();
         let action = gp_bar::smapp::heal_action(status);
         match action {
-            gp_bar::smapp::HealAction::None => first,
+            gp_bar::smapp::HealAction::None => {
+                let suffix = unreachable_suffix(status, action, None);
+                first.map_err(|e| annotate_unreachable(e, suffix))
+            }
             gp_bar::smapp::HealAction::ReRegister => {
                 log::warn!(
                     "daemon unreachable + status {} — re-registering (R1 anomaly D)",
                     gp_bar::smapp::status_line(status)
                 );
                 match gp_bar::smapp::register() {
-                    Ok(()) => call_helper(op, args),
+                    Ok(()) => {
+                        let retry = call_helper(op, args);
+                        if matches!(&retry, Err(AdminError::Unreachable { .. })) {
+                            let suffix = unreachable_suffix(status, action, Some(true));
+                            retry.map_err(|e| annotate_unreachable(e, suffix))
+                        } else {
+                            retry
+                        }
+                    }
                     Err(error) => {
                         log::warn!("self-heal R1 re-register failed: {error}");
-                        first
+                        let suffix = unreachable_suffix(status, action, Some(false));
+                        first.map_err(|e| annotate_unreachable(e, suffix))
                     }
                 }
             }
@@ -1509,10 +1521,19 @@ fn call_helper_with_self_heal(op: &'static str, args: &[String]) -> Result<Strin
                     log::warn!("R2 unregister failed: {e}");
                 }
                 match gp_bar::smapp::register() {
-                    Ok(()) => call_helper(op, args),
+                    Ok(()) => {
+                        let retry = call_helper(op, args);
+                        if matches!(&retry, Err(AdminError::Unreachable { .. })) {
+                            let suffix = unreachable_suffix(status, action, Some(true));
+                            retry.map_err(|e| annotate_unreachable(e, suffix))
+                        } else {
+                            retry
+                        }
+                    }
                     Err(error) => {
                         log::warn!("self-heal R2 register failed: {error}");
-                        first
+                        let suffix = unreachable_suffix(status, action, Some(false));
+                        first.map_err(|e| annotate_unreachable(e, suffix))
                     }
                 }
             }
@@ -1622,15 +1643,8 @@ pub fn admin_error_hint_for(
     // The SMAppService transport never touches the sudo wrapper, so its
     // failures are not a missing one-time setup: relabeling an unreachable
     // daemon as "not installed" would point the user at the wrong fix.
-    // Instead, annotate it with the current SMAppService status so the
-    // user (and support) can see what the system thinks at this moment.
-    if let AdminError::Unreachable { op, mut detail } = error {
-        #[cfg(target_os = "macos")]
-        if detail.is_empty() {
-            let raw = gp_bar::smapp::read_status();
-            detail = format!(" (status: {})", gp_bar::smapp::status_line(raw));
-        }
-        return AdminError::Unreachable { op, detail };
+    if matches!(error, AdminError::Unreachable { .. }) {
+        return error;
     }
     // No wrapper file means the setup is missing, whatever the exact
     // sudo/OS error string says. sudo's stderr is forced to LC_ALL=C by
@@ -1663,6 +1677,67 @@ pub async fn gpclient_version(gpclient: &Path) -> String {
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .unwrap_or_else(|| "not found".to_string())
+}
+
+/// Builds a human-readable suffix to attach to an `Unreachable` error's
+/// `detail` field, based on the SMAppService status and the heal outcome.
+///
+/// `heal_ok`: whether the heal path's `register()` succeeded (`None` when
+/// no heal was attempted — the None branch).
+///
+/// This is a pure function: every input is a caller-supplied value, no
+/// system calls. The caller (`call_helper_with_self_heal`) reads the real
+/// status once and passes it along, so `status_line(status)` renders the
+/// same value the heal decision was based on.
+pub fn unreachable_suffix(
+    status: isize,
+    action: gp_bar::smapp::HealAction,
+    heal_ok: Option<bool>,
+) -> String {
+    use gp_bar::smapp::{self, HealAction};
+    match (action, heal_ok) {
+        (HealAction::None, _) => match status {
+            smapp::NOT_REGISTERED => " — activate the system helper in the panel".to_string(),
+            smapp::REQUIRES_APPROVAL => {
+                " — allow GP Bar in System Settings → General → Login Items".to_string()
+            }
+            _ => format!(" (status: {})", smapp::status_line(status)),
+        },
+        (HealAction::ReRegister, Some(true)) => {
+            // Heal succeeded, but the retry also failed — that means the
+            // re-register alone did not fix the reachability.
+            format!(
+                " — re-registered successfully, but the daemon is still unreachable (status: {})",
+                smapp::status_line(status)
+            )
+        }
+        (HealAction::ReRegister, _) => {
+            " — re-register attempted and failed: toggle the helper off/on in the panel".to_string()
+        }
+        (HealAction::Reinstall, Some(true)) => {
+            format!(
+                " — reinstalled successfully, but the daemon is still unreachable (status: {})",
+                smapp::status_line(status)
+            )
+        }
+        (HealAction::Reinstall, _) => {
+            " — reinstall attempted and failed: toggle the helper off/on in the panel".to_string()
+        }
+    }
+}
+
+/// Attach a suffix to an `Unreachable` error's `detail` field. When `detail`
+/// is already non-empty the error passes through unchanged (the first
+/// annotation wins — the caller never annotates twice).
+fn annotate_unreachable(error: AdminError, suffix: String) -> AdminError {
+    if let AdminError::Unreachable { detail, .. } = &error {
+        if detail.is_empty() {
+            if let AdminError::Unreachable { op, .. } = error {
+                return AdminError::Unreachable { op, detail: suffix };
+            }
+        }
+    }
+    error
 }
 
 #[cfg(test)]
@@ -2555,5 +2630,74 @@ An asterisk (*) denotes that a network service is disabled.
             Some("monitor ufficio".to_string())
         );
         assert_eq!(parse_service_for_device(order, "en9"), None);
+    }
+
+    /// Every (status, action, heal_ok) triple produces the expected suffix.
+    #[test]
+    fn unreachable_suffix_matrix() {
+        use gp_bar::smapp::{ENABLED, HealAction, NOT_FOUND, NOT_REGISTERED, REQUIRES_APPROVAL};
+
+        // ── HealAction::None (no heal attempted) ──────────────────────────
+        // NOT_REGISTERED → the user needs to activate the helper.
+        assert_eq!(
+            unreachable_suffix(NOT_REGISTERED, HealAction::None, None),
+            " — activate the system helper in the panel"
+        );
+        // REQUIRES_APPROVAL → point to System Settings.
+        assert_eq!(
+            unreachable_suffix(REQUIRES_APPROVAL, HealAction::None, None),
+            " — allow GP Bar in System Settings → General → Login Items"
+        );
+        // ENABLED with None action cannot happen in practice (the decision
+        // yields ReRegister), but the builder must handle it: Unknown-style.
+        assert!(unreachable_suffix(ENABLED, HealAction::None, None).starts_with(" (status: "));
+        // Unknown raw → bare status line.
+        let suf_unknown = unreachable_suffix(42, HealAction::None, None);
+        assert!(
+            suf_unknown.starts_with(" (status: "),
+            "got: {suf_unknown:?}"
+        );
+        assert!(suf_unknown.contains("42"), "got: {suf_unknown:?}");
+
+        // ── HealAction::ReRegister ────────────────────────────────────────
+        // register succeeded but the retry still timed out / was unreachable.
+        let suf_r1_ok = unreachable_suffix(ENABLED, HealAction::ReRegister, Some(true));
+        assert!(
+            suf_r1_ok.contains("re-registered successfully"),
+            "got: {suf_r1_ok:?}"
+        );
+        assert!(
+            suf_r1_ok.contains("still unreachable"),
+            "got: {suf_r1_ok:?}"
+        );
+        // register failed — tell the user to toggle.
+        assert_eq!(
+            unreachable_suffix(ENABLED, HealAction::ReRegister, Some(false)),
+            " — re-register attempted and failed: toggle the helper off/on in the panel"
+        );
+        // heal_ok == None is same as failed.
+        assert_eq!(
+            unreachable_suffix(ENABLED, HealAction::ReRegister, None),
+            " — re-register attempted and failed: toggle the helper off/on in the panel"
+        );
+
+        // ── HealAction::Reinstall ─────────────────────────────────────────
+        let suf_r2_ok = unreachable_suffix(NOT_FOUND, HealAction::Reinstall, Some(true));
+        assert!(
+            suf_r2_ok.contains("reinstalled successfully"),
+            "got: {suf_r2_ok:?}"
+        );
+        assert!(
+            suf_r2_ok.contains("still unreachable"),
+            "got: {suf_r2_ok:?}"
+        );
+        assert_eq!(
+            unreachable_suffix(NOT_FOUND, HealAction::Reinstall, Some(false)),
+            " — reinstall attempted and failed: toggle the helper off/on in the panel"
+        );
+        assert_eq!(
+            unreachable_suffix(NOT_FOUND, HealAction::Reinstall, None),
+            " — reinstall attempted and failed: toggle the helper off/on in the panel"
+        );
     }
 }
