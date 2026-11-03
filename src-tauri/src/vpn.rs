@@ -1420,12 +1420,59 @@ async fn run_admin_sudo(op: &'static str, args: &[&str]) -> Result<String, Admin
 async fn run_admin_xpc(op: &'static str, args: &[&str]) -> Result<String, AdminError> {
     // Owned so the blocking task does not borrow the caller's slice.
     let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-    tokio::task::spawn_blocking(move || call_helper(op, &args))
+    tokio::task::spawn_blocking(move || call_helper_with_self_heal(op, &args))
         .await
         .map_err(|error| AdminError::Failed {
             op,
             stderr: format!("helper call task failed: {error}"),
         })?
+}
+
+/// One XPC attempt plus R1 self-healing, for the single recoverable signature:
+/// the daemon is unreachable **while BTM reports the service enabled**
+/// (anomaly D — the job missing from the launchd domain although the
+/// registration claims it is there, RECAP §20/§22).
+///
+/// On that signature only, re-register the daemon and retry [`call_helper`]
+/// exactly ONCE; the retry's result is the op's result. Every other outcome —
+/// a non-`Unreachable` error, a status that is not `Enabled`, a failed
+/// re-register — returns the original error unchanged: `NOT_REGISTERED` /
+/// `REQUIRES_APPROVAL` are R2/R3 territory (Fase 3b), where a bare
+/// re-register would be noise or an unwanted prompt, and a `Failed` proves
+/// the op ran, so re-registering answers the wrong question.
+///
+/// Blocking (both [`call_helper`] and the SMAppService calls are), so the
+/// caller keeps it on the blocking pool. Off macOS there is no SMAppService
+/// and no daemon to heal: the first error stands, no retry.
+fn call_helper_with_self_heal(op: &'static str, args: &[String]) -> Result<String, AdminError> {
+    let first = call_helper(op, args);
+    if !matches!(&first, Err(AdminError::Unreachable { .. })) {
+        return first;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let status = gp_bar::smapp::read_status();
+        if !gp_bar::smapp::should_self_heal(status) {
+            return first;
+        }
+        log::warn!(
+            "daemon unreachable + status {} — re-registering (anomaly D self-heal)",
+            gp_bar::smapp::status_line(status)
+        );
+        match gp_bar::smapp::register() {
+            // The ONE retry: this calls `call_helper` directly, never back
+            // into this function, so no error can ever re-enter the heal.
+            Ok(()) => call_helper(op, args),
+            Err(error) => {
+                log::warn!("self-heal re-register failed: {error}");
+                first
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        first
+    }
 }
 
 #[cfg(target_os = "macos")]
