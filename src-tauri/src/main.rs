@@ -616,6 +616,102 @@ async fn repair_network(
     }
 }
 
+// -- system helper (SMAppService daemon, xpc transport, Fase 3b) ---------------
+
+/// Overview of the SMAppService daemon for the "System helper (beta)" section.
+///
+/// Returns `{ status, status_name, in_bundle, elevation }` — a read-only
+/// snapshot the frontend renders without any side effect. Off macOS
+/// everything is absent/false; the panel still renders the section but
+/// shows "not available on this platform".
+#[tauri::command]
+fn get_helper_overview(state: State<'_, AppContext>) -> serde_json::Value {
+    #[cfg(target_os = "macos")]
+    {
+        let raw = gp_bar::smapp::read_status();
+        let in_bundle = gp_bar::peer::current_bundle_root().is_some();
+        let elevation = state.config.lock().unwrap().elevation();
+        serde_json::json!({
+            "status": raw,
+            "status_name": gp_bar::smapp::decode(raw),
+            "in_bundle": in_bundle,
+            "elevation": elevation,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        serde_json::json!({
+            "status": null,
+            "status_name": "unavailable",
+            "in_bundle": false,
+            "elevation": "sudo",
+        })
+    }
+}
+
+/// Change the privileged transport in the config: `"sudo"` (the v1.2.0
+/// wrapper path) or `"xpc"` (the SMAppService daemon). The frontend
+/// guards — only `"sudo"` ↔ `"xpc"` is reachable, but the command
+/// validates anyway and refuses unknowns.
+#[tauri::command]
+async fn helper_set_elevation(
+    app: AppHandle,
+    value: String,
+) -> Result<(), String> {
+    if value != "sudo" && value != "xpc" {
+        return Err(format!("unknown elevation: {value}"));
+    }
+    tokio::task::spawn_blocking(move || {
+        app.state::<AppContext>().update_config(|cfg| {
+            cfg.elevation = value;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(())
+}
+
+/// Register the SMAppService daemon — the explicit R3 gesture from the UI.
+/// The user clicks "Register" in the panel; this calls `SMAppService::register`
+/// and may present the system approval prompt (Touch ID). Off macOS returns
+/// an error immediately.
+#[tauri::command]
+fn helper_register() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        gp_bar::smapp::register()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("SMAppService is only available on macOS".to_string())
+    }
+}
+
+/// Unregister the SMAppService daemon. Off macOS returns an error immediately.
+#[tauri::command]
+fn helper_unregister() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        gp_bar::smapp::unregister()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("SMAppService is only available on macOS".to_string())
+    }
+}
+
+/// Open System Settings → General → Login Items & Extensions, where the
+/// user can approve the daemon if it's stuck in RequiresApproval.
+/// Off macOS this is a no-op (no settings panel to open).
+#[tauri::command]
+fn open_login_items_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        gp_bar::smapp::open_system_settings();
+    }
+}
+
 // -- shared action logic --------------------------------------------------------
 
 async fn do_connect(
@@ -1364,7 +1460,12 @@ fn main() {
             disconnect,
             reconnect,
             cancel,
-            quit
+            quit,
+            get_helper_overview,
+            helper_set_elevation,
+            helper_register,
+            helper_unregister,
+            open_login_items_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running gp-bar");
