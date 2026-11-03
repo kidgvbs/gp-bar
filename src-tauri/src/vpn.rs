@@ -1304,6 +1304,13 @@ pub enum AdminError {
     /// The helper op did not finish within `ADMIN_OP_TIMEOUT`.
     #[error("admin op '{op}' timed out")]
     Timeout { op: &'static str },
+    /// The SMAppService daemon could not be reached: no connection, or no
+    /// reply within `ADMIN_OP_TIMEOUT`. Kept distinct from `Failed` on
+    /// purpose — "the daemon is not there" is the retryable class (R1 in
+    /// Fase 2 will re-register/wake the job), while `Failed` means the op ran
+    /// and refused.
+    #[error("the privileged SMAppService daemon is unreachable (op '{op}')")]
+    Unreachable { op: &'static str },
     /// The op ran and failed. `stderr` is the wrapper's stderr verbatim —
     /// or, for the rarer shapes (sudo itself could not spawn, a non-zero
     /// exit with no stderr), the same text the old formatting produced.
@@ -1324,7 +1331,38 @@ pub enum AdminError {
 /// non-zero exit are distinct [`AdminError`]s (the last two keep their
 /// old text inside `Failed::stderr`); the caller classifies the raw value
 /// through `admin_error_hint`.
-pub async fn run_admin(op: &'static str, args: &[&str]) -> Result<String, AdminError> {
+pub async fn run_admin(
+    op: &'static str,
+    args: &[&str],
+    elevation: &str,
+) -> Result<String, AdminError> {
+    match transport_for(elevation) {
+        AdminTransport::Sudo => run_admin_sudo(op, args).await,
+        AdminTransport::Xpc => run_admin_xpc(op).await,
+    }
+}
+
+/// Which transport carries a privileged operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminTransport {
+    /// `/usr/bin/sudo -n <wrapper>` — the v1.2.0 path, unchanged.
+    Sudo,
+    /// The `gp-helper` SMAppService daemon, over XPC.
+    Xpc,
+}
+
+/// The routing decision, pure so the flag is testable with no system at all:
+/// only `"xpc"` selects the daemon; the default `"sudo"` and anything
+/// unrecognized keep the wrapper path (the config getter warns separately).
+pub fn transport_for(elevation: &str) -> AdminTransport {
+    match elevation {
+        crate::config::ELEVATION_XPC => AdminTransport::Xpc,
+        _ => AdminTransport::Sudo,
+    }
+}
+
+/// The sudo transport: one `/usr/bin/sudo -n <wrapper>` run, unchanged.
+async fn run_admin_sudo(op: &'static str, args: &[&str]) -> Result<String, AdminError> {
     // LC_ALL/LANG=C: sudo and the wrapper run with stable, non-localized
     // error strings, which the classification matches on.
     let fut = Command::new("/usr/bin/sudo")
@@ -1365,6 +1403,79 @@ pub async fn run_admin(op: &'static str, args: &[&str]) -> Result<String, AdminE
     }
 }
 
+/// The XPC transport: one request to the `gp-helper` daemon.
+///
+/// `recv_timeout` blocks, so the wait runs on the blocking pool: `run_admin`
+/// is awaited from Tauri commands, and parking a runtime worker for up to
+/// `ADMIN_OP_TIMEOUT` would starve the rest of the app.
+///
+/// Transport phase only: the protocol carries the operation name and nothing
+/// else (the daemon refuses every privileged op), so `args` stay on the sudo
+/// path until Fase 3 adds them to the request dictionary.
+async fn run_admin_xpc(op: &'static str) -> Result<String, AdminError> {
+    tokio::task::spawn_blocking(move || call_helper(op))
+        .await
+        .map_err(|error| AdminError::Failed {
+            op,
+            stderr: format!("helper call task failed: {error}"),
+        })?
+}
+
+#[cfg(target_os = "macos")]
+fn call_helper(op: &'static str) -> Result<String, AdminError> {
+    use std::sync::mpsc;
+
+    use gp_bar::proto::{self, HelperReply, ReplyError};
+    use gp_bar::xpc::{HandlerBlock, XpcConnection, XpcEvent, XpcObject};
+
+    // `None` = libxpc could not create the connection: no daemon to talk to.
+    let conn = XpcConnection::connect(proto::SERVICE_C).ok_or(AdminError::Unreachable { op })?;
+
+    let message = XpcObject::dict_new();
+    message.set_string(proto::KEY_OP, op);
+
+    let (tx, rx) = mpsc::channel::<Result<HelperReply, ReplyError>>();
+    let reply_block: HandlerBlock = block2::RcBlock::new(move |raw| {
+        // SAFETY: `raw` is the reply object libxpc passed to this block;
+        // valid for the duration of the invocation, owned by the runtime.
+        let parsed = match unsafe { XpcEvent::from_borrowed(raw) } {
+            Some(event) => HelperReply::from_event(&event),
+            None => Err(ReplyError::Malformed),
+        };
+        // The receiver may already be gone (the timeout won the race).
+        let _ = tx.send(parsed);
+    });
+    conn.send_message_with_reply(&message, reply_block);
+    // `reply_block`, `message` and (on return) `conn` are dropped here; libxpc
+    // holds its own copies until the reply fires, the connection is cancelled
+    // and released, so a timed-out call leaks neither.
+
+    match rx.recv_timeout(ADMIN_OP_TIMEOUT) {
+        Ok(Ok(reply)) => Ok(format!(
+            "{op}: ok (helper uid={}, pid={}, version={})",
+            reply.uid, reply.pid, reply.version
+        )),
+        // A dropped sender and a connection error event are the same fact:
+        // nothing is answering on the other end.
+        Ok(Err(ReplyError::Unreachable)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(AdminError::Unreachable { op })
+        }
+        Ok(Err(ReplyError::Refused(stderr))) => Err(AdminError::Failed { op, stderr }),
+        Ok(Err(ReplyError::Malformed)) => Err(AdminError::Failed {
+            op,
+            stderr: format!("unexpected reply from the privileged helper ({op})"),
+        }),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(AdminError::Timeout { op }),
+    }
+}
+
+/// Every other platform (Linux CI) has no XPC transport: report the daemon as
+/// unreachable rather than pretending the op ran.
+#[cfg(not(target_os = "macos"))]
+fn call_helper(op: &'static str) -> Result<String, AdminError> {
+    Err(AdminError::Unreachable { op })
+}
+
 /// The bundled setup script path inside the running app bundle.
 pub fn setup_script_path(app: &AppHandle) -> PathBuf {
     use tauri::Manager;
@@ -1393,6 +1504,12 @@ pub fn admin_error_hint_for(
     setup_script: &Path,
     error: AdminError,
 ) -> AdminError {
+    // The SMAppService transport never touches the sudo wrapper, so its
+    // failures are not a missing one-time setup: relabeling an unreachable
+    // daemon as "not installed" would point the user at the wrong fix.
+    if matches!(error, AdminError::Unreachable { .. }) {
+        return error;
+    }
     // No wrapper file means the setup is missing, whatever the exact
     // sudo/OS error string says. sudo's stderr is forced to LC_ALL=C by
     // `run_admin`, so the string matches below are stable, but the
@@ -1429,6 +1546,36 @@ pub async fn gpclient_version(gpclient: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_transport_flag_only_switches_on_xpc() {
+        // The default config keeps the v1.2.0 sudo path.
+        assert_eq!(
+            transport_for(Config::default().elevation()),
+            AdminTransport::Sudo
+        );
+        assert_eq!(transport_for("sudo"), AdminTransport::Sudo);
+        // The one value that selects the daemon.
+        assert_eq!(transport_for("xpc"), AdminTransport::Xpc);
+        // Anything unrecognized falls back to sudo, never to the daemon.
+        for raw in ["", "XPC", "daemon", " sudo", "xpc "] {
+            assert_eq!(transport_for(raw), AdminTransport::Sudo, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_never_relabeled_as_missing_setup() {
+        let setup = Path::new("/Applications/GP Bar.app/Contents/Resources/scripts/setup-admin.sh");
+        // Read the two setup markers into one check: an unreachable daemon must
+        // survive the classification even when the sudo wrapper is absent, or
+        // the user would be told to run a setup that is not their problem.
+        let hint = admin_error_hint_for(false, setup, AdminError::Unreachable { op: "start" });
+        assert_eq!(hint, AdminError::Unreachable { op: "start" });
+        assert_eq!(
+            hint.to_string(),
+            "the privileged SMAppService daemon is unreachable (op 'start')"
+        );
+    }
 
     #[test]
     fn admin_errors_map_to_the_setup_hint() {

@@ -366,7 +366,10 @@ async fn cancel(app: AppHandle, state: State<'_, AppContext>) -> Result<(), Acti
     // Interrupt a connecting worker by booting the one-shot launchd job
     // out: launchd terminates it, which runs the worker's own teardown
     // instead of a blind kill.
-    if let Err(error) = vpn::run_admin("cancel", &[]).await {
+    // The transport the user selected (`sudo` by default). Read out of the
+    // guard in the same statement: the guard is released before the await.
+    let elevation = state.config.lock().unwrap().elevation();
+    if let Err(error) = vpn::run_admin("cancel", &[], elevation).await {
         // Not confirmed: the phase stays as it is — the poller reports the
         // truth (the worker may die anyway, the tunnel may yet come up) —
         // and the failure reaches the invoker instead of the old
@@ -598,12 +601,16 @@ async fn get_network_health(state: State<'_, AppContext>) -> Result<vpn::Network
 /// hint is folded in server-side): the frontend receives `{kind, detail}`
 /// and maps it back to the Display texts.
 #[tauri::command]
-async fn repair_network(app: AppHandle) -> Result<String, vpn::AdminError> {
+async fn repair_network(
+    app: AppHandle,
+    state: State<'_, AppContext>,
+) -> Result<String, vpn::AdminError> {
     // Refuses loudly while the VPN is up — see `gp-admin repair`. Serialized
     // with the other privileged ops (see ADMIN_OPS) so its networksetup
     // writes never interleave with a stop's teardown.
     let _guard = vpn::ADMIN_OPS.lock().await;
-    match vpn::run_admin("repair", &[]).await {
+    let elevation = state.config.lock().unwrap().elevation();
+    match vpn::run_admin("repair", &[], elevation).await {
         Ok(message) => Ok(message),
         Err(error) => Err(vpn::admin_error_hint(&vpn::setup_script_path(&app), error)),
     }
@@ -671,7 +678,8 @@ async fn do_connect(
     // No focus bookkeeping around the admin call: the helper is NOPASSWD so
     // no dialog steals the panel's focus mid-operation; popover hide-on-blur
     // (see `on_window_event`) behaves normally during connects.
-    let result = vpn::run_admin("start", &args).await;
+    let elevation = state.config.lock().unwrap().elevation();
+    let result = vpn::run_admin("start", &args, elevation).await;
     match result {
         Ok(_) => {
             // The start is confirmed: the launchd job now exists and belongs
@@ -703,7 +711,8 @@ async fn do_disconnect(app: AppHandle, state: &State<'_, AppContext>) -> Result<
     let _guard = vpn::ADMIN_OPS.lock().await;
     // No focus bookkeeping here either (see `do_connect`): the NOPASSWD
     // helper never raises a dialog, so hide-on-blur stays in effect.
-    let result = vpn::run_admin("stop", &[]).await;
+    let elevation = state.config.lock().unwrap().elevation();
+    let result = vpn::run_admin("stop", &[], elevation).await;
     if let Err(error) = result {
         log::warn!("disconnect failed: {error}");
         let error = vpn::admin_error_hint(&vpn::setup_script_path(&app), error);
